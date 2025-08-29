@@ -13,6 +13,22 @@ logging.getLogger("pdfplumber").setLevel(logging.ERROR)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 logging.getLogger("PyPDF2").setLevel(logging.ERROR)
 
+def check_for_updates(): # Função de atualização
+    try:
+        response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+        response.raise_for_status()
+        latest_version = response.json()["tag_name"].lstrip("v")  # Ex: "1.0.1"
+        if latest_version > APP_VERSION:
+            messagebox.showinfo("Atualização Disponível", f"Uma nova versão ({latest_version}) está disponível! Baixe em: https://github.com/{GITHUB_REPO}/releases/latest")
+            # Ainda em teste, para atualizar automaticamente.
+            # asset_url = response.json()["assets"][0]["browser_download_url"]
+            # with open("novo_app.exe", "wb") as f:
+            #     f.write(requests.get(asset_url).content)
+            # messagebox.showinfo("Atualizado", "Nova versão baixada. Reinicie o app.")
+        else:
+            print("App atualizado.") 
+    except Exception as e:
+        print(f"Erro ao checar updates: {e}") 
 # Regex
 regex_data = re.compile(r"^\s*\d{2}/\d{2}/\d{4}")
 regex_negativo = re.compile(r"[-−–]\s*\d")
@@ -49,7 +65,7 @@ def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
                             "atendidos": 0,
                             "devolucoes": 0,
                             "total_clientes": 0,
-                            "total_vendas": ""   # novo campo
+                            "total_vendas": "" 
                         }
                     continue
 
@@ -61,8 +77,7 @@ def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
                     if regex_negativo.search(linha):
                         resultados[vendedor_atual]["devolucoes"] += 1
 
-                # Detecta linha Totais (apenas o valor de vendas, em R$)
-                # Detecta linha Totais (pega apenas o valor monetário)
+                # Detecta linha Totais
                 if "Totais" in linha and vendedor_atual:
                     match = re.search(r"Totais:\s*([\d\.\,]+)", linha)
                     if match:
@@ -99,23 +114,23 @@ def escolher_pdf():
 root = tk.Tk()
 root.title("Relatório de Clientes por Vendedor")
 
-window_width = 700  # Defina a largura desejada (ajuste conforme necessário)
-window_height = 500  # Defina a altura desejada (ajuste conforme necessário)
+window_width = 750  
+window_height = 500  
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 x_coordinate = (screen_width - window_width) // 2
 y_coordinate = (screen_height - window_height) // 2
 root.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
 
-# Ícone (.ico)
+# Upload do icone
 try:
     root.iconbitmap("icone.ico")
 except Exception as e:
     print("Não consegui carregar ícone:", e)
 
 # Fundo cinza
-bg_color = "#4E4E4E"   # Cinza escuro
-fg_color = "#FA7F2D"   # Laranja
+bg_color = "#4E4E4E"   
+fg_color = "#FA7F2D"  
 root.configure(bg=bg_color)
 
 style = ttk.Style(root)
@@ -156,7 +171,6 @@ progress_bar.pack(pady=5)
 frame_tabela = tk.Frame(root, bg=bg_color)
 frame_tabela.pack(fill="both", expand=True, padx=10, pady=10)
 
-# Tabela com nova coluna "Total Vendas"
 cols = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
 tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=15)
 for col in cols:
@@ -164,28 +178,9 @@ for col in cols:
     tree.column(col, anchor="center", width=150)
 tree.pack(fill="both", expand=True)
 
-# Rodar
 root.mainloop()
 
-APP_VERSION = "1.0.0"  # Atualize isso a cada release
-GITHUB_REPO = "https://github.com/AlleexMartinsT/pdfReader.git"  # Ex: "usuario/meu-app"
+APP_VERSION = "1.0.0"  # Atualiza isso a cada release
+GITHUB_REPO = "AlleexMartinsT/pdfReader" 
 
-def check_for_updates():
-    try:
-        response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
-        response.raise_for_status()
-        latest_version = response.json()["tag_name"].lstrip("v")  # Ex: "1.0.1"
-        if latest_version > APP_VERSION:
-            messagebox.showinfo("Atualização Disponível", f"Uma nova versão ({latest_version}) está disponível! Baixe em: https://github.com/{GITHUB_REPO}/releases/latest")
-            # Opcional: Baixe automaticamente
-            # asset_url = response.json()["assets"][0]["browser_download_url"]
-            # with open("novo_app.exe", "wb") as f:
-            #     f.write(requests.get(asset_url).content)
-            # messagebox.showinfo("Atualizado", "Nova versão baixada. Reinicie o app.")
-        else:
-            print("App atualizado.")  # Ou remova para silencioso
-    except Exception as e:
-        print(f"Erro ao checar updates: {e}")  # Log silencioso
-
-# Chame isso ao iniciar o app
 check_for_updates()

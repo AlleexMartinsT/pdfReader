@@ -4,6 +4,9 @@ import re
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from PIL import Image, ImageTk, ImageEnhance
+import requests
+import tkinter.messagebox as messagebox
+
 
 # Desativa logs chatos
 logging.getLogger("pdfplumber").setLevel(logging.ERROR)
@@ -163,3 +166,26 @@ tree.pack(fill="both", expand=True)
 
 # Rodar
 root.mainloop()
+
+APP_VERSION = "1.0.0"  # Atualize isso a cada release
+GITHUB_REPO = "https://github.com/AlleexMartinsT/pdfReader.git"  # Ex: "usuario/meu-app"
+
+def check_for_updates():
+    try:
+        response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+        response.raise_for_status()
+        latest_version = response.json()["tag_name"].lstrip("v")  # Ex: "1.0.1"
+        if latest_version > APP_VERSION:
+            messagebox.showinfo("Atualização Disponível", f"Uma nova versão ({latest_version}) está disponível! Baixe em: https://github.com/{GITHUB_REPO}/releases/latest")
+            # Opcional: Baixe automaticamente
+            # asset_url = response.json()["assets"][0]["browser_download_url"]
+            # with open("novo_app.exe", "wb") as f:
+            #     f.write(requests.get(asset_url).content)
+            # messagebox.showinfo("Atualizado", "Nova versão baixada. Reinicie o app.")
+        else:
+            print("App atualizado.")  # Ou remova para silencioso
+    except Exception as e:
+        print(f"Erro ao checar updates: {e}")  # Log silencioso
+
+# Chame isso ao iniciar o app
+check_for_updates()

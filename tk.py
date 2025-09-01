@@ -36,11 +36,17 @@ style.configure("Treeview.Heading",
 style.map("Treeview", background=[("selected", "#FF6600")],
                         foreground=[("selected", "black")])
 
-# Botão
+# Botão Selecionar PDF
 btn = tk.Button(root, text="Selecionar PDF", 
                 command=lambda: escolher_pdf(tree, progress_var, progress_bar, root),
                 bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
 btn.pack(pady=10)
+
+# Botão Adicionar mais um PDF
+btn_add_mais = tk.Button(root, text="Adicionar mais um PDF", 
+                         command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root),
+                         bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
+btn_add_mais.pack(pady=5)
 
 # Barra de progresso
 style.configure("custom.Horizontal.TProgressbar",

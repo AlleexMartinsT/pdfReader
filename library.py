@@ -9,6 +9,8 @@ import hashlib
 import shutil
 import versioninfo
 import subprocess
+import json,difflib
+import ctypes
 import tkinter as tk
 import tkinter.messagebox as messagebox
 from tkinter import filedialog, ttk, messagebox

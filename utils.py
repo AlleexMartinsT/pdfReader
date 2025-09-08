@@ -1,5 +1,6 @@
 from library import *
 from globalVar import *
+<<<<<<< HEAD
 
 # Configuração de logging mais leve (somente avisos e erros)
 logging.basicConfig(level=logging.WARNING)
@@ -40,17 +41,36 @@ def _poll_queue(root, tree, progress_var, progress_bar):
         pass
     # agendar próxima rodada de checagem
     root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar))
+=======
+import difflib
+import logging
+
+# Configurar logging para depuração
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 
 def resource_path(relative_path):
     """Retorna o caminho absoluto do recurso, compatível com PyInstaller."""
     if hasattr(sys, '_MEIPASS'):  # Executando empacotado
         base_path = sys._MEIPASS
+<<<<<<< HEAD
     else:
         base_path = os.path.abspath(".")
+=======
+        logger.debug(f"Executável: base_path = {base_path}")
+    else:
+        base_path = os.path.abspath(".")
+        logger.debug(f"Desenvolvimento: base_path = {base_path}")
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     return os.path.join(base_path, relative_path)
 
 def load_mapping(path='mapping.json'):
     full_path = resource_path(path)
+<<<<<<< HEAD
+=======
+    logger.debug(f"Procurando mapping.json em: {full_path}")
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     if not os.path.exists(full_path):
         raise FileNotFoundError(f"Arquivo de mapeamento não encontrado: {full_path}")
     with open(full_path, 'r', encoding='utf-8') as f:
@@ -65,6 +85,10 @@ def save_mapping():
     appdata_dir = os.path.join(os.getenv("APPDATA"), "RelatorioClientes")
     os.makedirs(appdata_dir, exist_ok=True)
     user_json = os.path.join(appdata_dir, "mapping.json")
+<<<<<<< HEAD
+=======
+    logger.debug(f"Salvando mapping em: {user_json}")
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     with open(user_json, "w", encoding="utf-8") as f:
         json.dump(mapping, f, indent=4, ensure_ascii=False)
 
@@ -127,6 +151,7 @@ def canonicalize_name(raw: str) -> str:
     return raw.strip().title()
 
 # --- Funções principais ---
+<<<<<<< HEAD
 
 def extrair_planilha_online():
     import gspread
@@ -240,11 +265,20 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
               
     # Zera estado, incluindo a lista de resultados
     cancel_event.clear()
+=======
+def escolher_pdf(tree, progress_var, progress_bar, root):
+    caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
+    if not caminho:
+        return
+    
+    global resultados_list
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     resultados_list = []
     
     for item in tree.get_children():
         tree.delete(item)
 
+<<<<<<< HEAD
     # Dispara worker
     def worker():
         try:
@@ -296,6 +330,14 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     
     try:
         with pdfplumber.open(caminho) as pdf:
+=======
+    try:
+        logger.debug(f"Tentando abrir PDF: {caminho}")
+        with open(caminho, 'rb') as f:  # Verifica se o arquivo é acessível
+            logger.debug("Arquivo acessível com sucesso")
+        with pdfplumber.open(caminho) as pdf:
+            logger.debug(f"PDF aberto com sucesso. Total de páginas: {len(pdf.pages)}")
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
             if pdf.metadata.get("encrypted", False):
                 messagebox.showerror("Erro", "Este PDF está protegido por senha.")
                 return
@@ -307,6 +349,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         logger.error(f"Exceção ao abrir PDF: {str(e)}")
         return
 
+<<<<<<< HEAD
     # Reset progresso
     cancel_event.clear()
 
@@ -355,6 +398,46 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
 
     poll_queue_add()
     
+=======
+    res = processar_pdf(caminho, progress_var, progress_bar, root)
+    resultados_list.append(res)
+    atualizar_tree(tree)
+    
+    messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
+
+def adicionar_pdf(tree, progress_var, progress_bar, root):
+    if not resultados_list:
+        messagebox.showwarning("Aviso", "Selecione o primeiro PDF antes de adicionar outro.")
+        return
+    
+    caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
+    if not caminho:
+        return
+    
+    try:
+        logger.debug(f"Tentando abrir PDF: {caminho}")
+        with open(caminho, 'rb') as f:  # Verifica se o arquivo é acessível
+            logger.debug("Arquivo acessível com sucesso")
+        with pdfplumber.open(caminho) as pdf:
+            logger.debug(f"PDF aberto com sucesso. Total de páginas: {len(pdf.pages)}")
+            if pdf.metadata.get("encrypted", False):
+                messagebox.showerror("Erro", "Este PDF está protegido por senha.")
+                return
+    except FileNotFoundError as e:
+        messagebox.showerror("Erro", f"Arquivo não encontrado: {e}")
+        return
+    except Exception as e:
+        messagebox.showerror("Erro", f"Não foi possível abrir o PDF: {e}")
+        logger.error(f"Exceção ao abrir PDF: {str(e)}")
+        return
+
+    res = processar_pdf(caminho, progress_var, progress_bar, root)
+    resultados_list.append(res)
+    atualizar_tree(tree)
+    
+    messagebox.showinfo("Concluído", "Segundo PDF adicionado e relatórios mesclados!")
+
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 def atualizar_tree(tree):
     for item in tree.get_children():
         tree.delete(item)
@@ -401,6 +484,7 @@ def mesclar_resultados(resultados_list):
 
     return mesclado
 
+<<<<<<< HEAD
 def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
     """
     Faz TODO o trabalho pesado AQUI, SEM chamar messagebox, progress_bar,
@@ -416,12 +500,19 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
     if cancel_event is None or isinstance(cancel_event, bool):
         cancel_event = threading.Event()
         
+=======
+def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
+    resultados = {}
+    vendedor_atual = None
+
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     def fechar_vendedor():
         nonlocal vendedor_atual
         if vendedor_atual and vendedor_atual in resultados:
             dados = resultados[vendedor_atual]
             dados["total_clientes"] = dados["atendidos"] - dados["devolucoes"]
 
+<<<<<<< HEAD
     with pdfplumber.open(caminho_pdf) as pdf:
         total = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages, start=1):
@@ -431,11 +522,27 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
             try:
                 texto = pagina.extract_text() or ""
                 for linha in texto.splitlines():
+=======
+    try:
+        logger.debug(f"Processando PDF: {caminho_pdf}")
+        with pdfplumber.open(caminho_pdf) as pdf:
+            logger.debug(f"PDF aberto com sucesso. Total de páginas: {len(pdf.pages)}")
+            total_paginas = len(pdf.pages)
+            for i, pagina in enumerate(pdf.pages, start=1):
+                logger.debug(f"Processando página {i}")
+                texto = pagina.extract_text()
+                if not texto:
+                    logger.warning(f"Página {i} sem texto extraível")
+                    continue
+                linhas = texto.splitlines()
+                for linha in linhas:
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
                     if "Vendedor: " in linha:
                         fechar_vendedor()
                         partes = linha.split("Vendedor: ", 1)[1].strip()
                         if partes:
                             palavras = partes.split()
+<<<<<<< HEAD
                             if palavras and palavras[0].isdigit():
                                 vendedor_bruto = " ".join(palavras[1:])
                             else:
@@ -448,6 +555,28 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
                                     "total_clientes": 0,
                                     "total_vendas": ""
                                 }
+=======
+                            if palavras[0].isdigit():
+                                vendedor_bruto = " ".join(palavras[1:])
+                            else:
+                                vendedor_bruto = " ".join(palavras)
+
+                            vendedor_atual = canonicalize_name(vendedor_bruto)
+
+                            # se não estiver no mapping, perguntar ao usuário
+                            if _normalize_key(vendedor_bruto) not in mapping:
+                                if messagebox.askyesno("Novo Vendedor", f"O vendedor '{vendedor_bruto}' não está no mapeamento. Deseja adicioná-lo?"):
+                                    mapping[_normalize_key(vendedor_bruto)] = vendedor_atual
+                                    save_mapping()
+                                    messagebox.showinfo("Sucesso", f"'{vendedor_atual}' adicionado ao mapeamento!")
+
+                            resultados[vendedor_atual] = {
+                                "atendidos": 0,
+                                "devolucoes": 0,
+                                "total_clientes": 0,
+                                "total_vendas": ""
+                            }
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
                         continue
 
                     if regex_data.match(linha):
@@ -458,6 +587,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
                             resultados[vendedor_atual]["devolucoes"] += 1
 
                     if "Totais" in linha and vendedor_atual:
+<<<<<<< HEAD
                         m = re.search(r"Totais:\s*([\d\.\,]+)", linha)
                         if m:
                             resultados[vendedor_atual]["total_vendas"] = m.group(1)
@@ -472,6 +602,27 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
 
         # Garante que o progresso chegue a 100% após o loop
         fechar_vendedor()
+=======
+                        match = re.search(r"Totais:\s*([\d\.\,]+)", linha)
+                        if match:
+                            resultados[vendedor_atual]["total_vendas"] = match.group(1)
+
+                fechar_vendedor()
+                progress = int((i / total_paginas) * 100)
+                progress_var.set(progress)
+                progress_bar.update_idletasks()
+                root.update_idletasks()
+    except pdfplumber.PDFSyntaxError as e:
+        messagebox.showerror("Erro", f"Erro de sintaxe no PDF: {e}. Verifique se o arquivo não está corrompido.")
+        logger.error(f"PDFSyntaxError: {str(e)}")
+    except pdfplumber.PDFTextExtractionNotAllowedError as e:
+        messagebox.showerror("Erro", f"Extração de texto não permitida: {e}. O PDF pode estar protegido.")
+        logger.error(f"PDFTextExtractionNotAllowedError: {str(e)}")
+    except Exception as e:
+        messagebox.showerror("Erro", f"Ocorreu um erro interno ao processar o PDF: {e}")
+        logger.error(f"Exceção geral: {str(e)}")
+    
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     return resultados
 
 def ordenar_coluna(tree, col, reverse):
@@ -505,6 +656,7 @@ def check_for_updates():
             print("App atualizado.")
     except Exception as e:
         print(f"Erro ao checar updates: {e}")
+<<<<<<< HEAD
         messagebox.showerror("Erro na Atualização", f"Ocorreu um erro ao checar atualizações: {e}")
 
 def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
@@ -571,3 +723,6 @@ def exportar_para_excel(tree):
 
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao exportar para Excel: {e}")
+=======
+        messagebox.showerror("Erro na Atualização", f"Ocorreu um erro ao checar atualizações: {e}")
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b

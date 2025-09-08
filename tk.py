@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 from utils import _poll_queue, escolher_pdf_async, adicionar_pdf, ordenar_coluna, cancelar_processamento, carregar_planilha, exportar_para_excel, limpar_tabelas, check_for_updates
+=======
+from utils import *
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 from library import *
 from globalVar import *
 
@@ -6,8 +10,13 @@ from globalVar import *
 root = tk.Tk()
 root.title("Relatório de Clientes por Vendedor")
 
+<<<<<<< HEAD
 window_width = 1050
 window_height = 800
+=======
+window_width = 750
+window_height = 500
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 x_coordinate = (screen_width - window_width) // 2
@@ -19,9 +28,12 @@ bg_color = "#4E4E4E"
 fg_color = "#FA7F2D"
 root.configure(bg=bg_color)
 
+<<<<<<< HEAD
 arquivos_label_var = tk.StringVar(value="Nenhum arquivo carregado ainda")
 progress_var = tk.IntVar(value=0)
 
+=======
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 style = ttk.Style(root)
 style.theme_use("default")
 
@@ -39,12 +51,29 @@ style.configure("Treeview.Heading",
 style.map("Treeview", background=[("selected", "#FF6600")],
                         foreground=[("selected", "black")])
 
+<<<<<<< HEAD
 # Barra de progresso com botão Cancelar
+=======
+# Botão Selecionar PDF
+btn = tk.Button(root, text="Selecionar PDF", 
+                command=lambda: escolher_pdf(tree, progress_var, progress_bar, root),
+                bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
+btn.pack(pady=10)
+
+# Botão Adicionar mais um PDF
+btn_add_mais = tk.Button(root, text="Adicionar mais um PDF", 
+                         command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root),
+                         bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
+btn_add_mais.pack(pady=5)
+
+# Barra de progresso
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 style.configure("custom.Horizontal.TProgressbar",
                 troughcolor=bg_color,
                 background=fg_color,
                 thickness=20)
 
+<<<<<<< HEAD
 frame_progress = tk.Frame(root, bg=bg_color)
 frame_progress.pack(pady=5)
 
@@ -76,11 +105,26 @@ label_arquivos.pack(anchor="w", padx=5, pady=(0,5))
 
 cols = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
 tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=10)
+=======
+progress_var = tk.IntVar()
+progress_bar = ttk.Progressbar(root, variable=progress_var,
+                               maximum=100, length=400,
+                               style="custom.Horizontal.TProgressbar")
+progress_bar.pack(pady=5)
+
+# Frame que vai segurar a tabela
+frame_tabela = tk.Frame(root, bg=bg_color)
+frame_tabela.pack(fill="both", expand=True, padx=10, pady=10)
+
+cols = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
+tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=15)
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 
 for col in cols:
     tree.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree, _col, False))
     tree.column(col, anchor="center", width=150, minwidth=50)
 
+<<<<<<< HEAD
 tree.pack(fill="both", expand=True)
 
 # Frame para segunda tabela (planilha online)
@@ -159,3 +203,6 @@ btn_limpar.pack(pady=5)
 
 check_for_updates()
 root.mainloop()
+=======
+tree.pack(fill="both", expand=True)
+>>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b

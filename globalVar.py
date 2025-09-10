@@ -1,6 +1,6 @@
 from library import *
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "AlleexMartinsT/pdfReader"
 
 regex_data = re.compile(r"^\s*\d{2}/\d{2}/\d{4}")

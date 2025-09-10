@@ -134,21 +134,41 @@ def extrair_planilha_online():
     import pandas as pd
     from oauth2client.service_account import ServiceAccountCredentials
 
+    print("🔎 Iniciando extração da planilha online...")
+
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
     ]
     cred_path = resource_path("credenciais.json")
-    creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
-    client = gspread.authorize(creds)
+    print(f"📂 Usando credenciais em: {cred_path}")
+
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
+        client = gspread.authorize(creds)
+        print("✅ Autenticação concluída com sucesso.")
+    except Exception as e:
+        print(f"❌ Erro na autenticação: {e}")
+        raise
 
     SPREADSHEET_ID = "1eiHbe-NkZ4cM5tMtq2JN574rwa2thR6X7T40EZM_3TA"
+    print(f"📑 Acessando planilha ID: {SPREADSHEET_ID}")
 
-    sheetMVA = client.open_by_key(SPREADSHEET_ID).worksheet("MVA")
-    sheetEH = client.open_by_key(SPREADSHEET_ID).worksheet("EH")
+    try:
+        sheetMVA = client.open_by_key(SPREADSHEET_ID).worksheet("MVA")
+        sheetEH = client.open_by_key(SPREADSHEET_ID).worksheet("EH")
+        print("✅ Abriu abas 'MVA' e 'EH'")
+    except Exception as e:
+        print(f"❌ Erro ao abrir abas: {e}")
+        raise
 
-    valoresMVA = sheetMVA.get_all_values()
-    valoresEH = sheetEH.get_all_values()
+    try:
+        valoresMVA = sheetMVA.get_all_values()
+        valoresEH = sheetEH.get_all_values()
+        print(f"📊 Linhas MVA: {len(valoresMVA)}, EH: {len(valoresEH)}")
+    except Exception as e:
+        print(f"❌ Erro ao buscar valores: {e}")
+        raise
 
     # pega cabeçalho da linha 2
     colsMVA = valoresMVA[1]
@@ -161,6 +181,9 @@ def extrair_planilha_online():
     dfMVA = pd.DataFrame(valoresMVA[2:], columns=colsMVA)
     dfEH = pd.DataFrame(valoresEH[2:], columns=colsEH)
 
+    print(f"✅ DataFrames criados: dfMVA ({dfMVA.shape[0]} linhas, {dfMVA.shape[1]} colunas), "
+          f"dfEH ({dfEH.shape[0]} linhas, {dfEH.shape[1]} colunas)")
+
     return dfMVA, dfEH
 
 def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
@@ -172,6 +195,9 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
             tree_planilha.delete(item)
 
         def worker():
+            progress_bar.config(mode="indeterminate")
+            progress_bar.start(10)  # velocidade
+
             try:
                 dfMVA, dfEH = extrair_planilha_online()
                 df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
@@ -225,6 +251,9 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                 while True:
                     kind, payload = progress_queue.get_nowait()
                     if kind == "progress":
+                        if str(progress_bar["mode"]) == "indeterminate":
+                            progress_bar.stop()
+                            progress_bar.config(mode="determinate")
                         progress_var.set(payload)
                         progress_bar.update_idletasks()
                     elif kind == "done_planilha":

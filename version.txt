@@ -1,13 +1,8 @@
 
 VSVersionInfo(
   ffi=FixedFileInfo(
-<<<<<<< HEAD
-    filevers=(1,0,7, 0),
-    prodvers=(1,0,7, 0),
-=======
-    filevers=(1,0,6, 0),
-    prodvers=(1,0,6, 0),
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
+    filevers=(1,1,0, 0),
+    prodvers=(1,1,0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -22,20 +17,12 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'MVA'),
         StringStruct('FileDescription', 'Relatório de Clientes por Vendedor'),
-<<<<<<< HEAD
-        StringStruct('FileVersion', '1.0.7'),
-=======
-        StringStruct('FileVersion', '1.0.6'),
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
+        StringStruct('FileVersion', '1.1.0'),
         StringStruct('InternalName', 'RelatorioClientes'),
         StringStruct('LegalCopyright', '© 2025 MVA'),
         StringStruct('OriginalFilename', 'RelatorioClientes.exe'),
         StringStruct('ProductName', 'Sistema de Relatórios'),
-<<<<<<< HEAD
-        StringStruct('ProductVersion', '1.0.7')])
-=======
-        StringStruct('ProductVersion', '1.0.6')])
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
+        StringStruct('ProductVersion', '1.1.0')])
       ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

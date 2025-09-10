@@ -22,7 +22,7 @@ root.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
 arquivos_label_var = customtkinter.StringVar(value="Nenhum arquivo carregado ainda")
 progress_var = customtkinter.IntVar(value=0)
 
-customtkinter.set_default_color_theme("basedTheme.json")
+customtkinter.set_default_color_theme("C:/Users/vendas/Desktop/repo-limpo/basedTheme.json")
 
 # ----------------- Barra de progresso com botão Cancelar -----------------
 frame_progress = customtkinter.CTkFrame(root)

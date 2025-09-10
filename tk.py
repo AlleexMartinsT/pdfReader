@@ -1,208 +1,175 @@
-<<<<<<< HEAD
-from utils import _poll_queue, escolher_pdf_async, adicionar_pdf, ordenar_coluna, cancelar_processamento, carregar_planilha, exportar_para_excel, limpar_tabelas, check_for_updates
-=======
-from utils import *
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
+from utils import (
+    _poll_queue, escolher_pdf_async, adicionar_pdf, ordenar_coluna,
+    cancelar_processamento, carregar_planilha_async, exportar_para_excel,
+    limpar_tabelas, check_for_updates
+)
 from library import *
 from globalVar import *
+import customtkinter
 
 # GUI
-root = tk.Tk()
-root.title("Relatório de Clientes por Vendedor")
+root = customtkinter.CTk()
+root.title("Relatório de Vendedor")
 
-<<<<<<< HEAD
 window_width = 1050
 window_height = 800
-=======
-window_width = 750
-window_height = 500
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
 x_coordinate = (screen_width - window_width) // 2
 y_coordinate = (screen_height - window_height) // 2
 root.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
 
-# Fundo cinza
-bg_color = "#4E4E4E"
-fg_color = "#FA7F2D"
-root.configure(bg=bg_color)
+arquivos_label_var = customtkinter.StringVar(value="Nenhum arquivo carregado ainda")
+progress_var = customtkinter.IntVar(value=0)
 
-<<<<<<< HEAD
-arquivos_label_var = tk.StringVar(value="Nenhum arquivo carregado ainda")
-progress_var = tk.IntVar(value=0)
+customtkinter.set_default_color_theme("basedTheme.json")
 
-=======
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
-style = ttk.Style(root)
-style.theme_use("default")
+# ----------------- Barra de progresso com botão Cancelar -----------------
+frame_progress = customtkinter.CTkFrame(root)
+frame_progress.pack(pady=10)
 
-# Estilo tabela
-style.configure("Treeview",
-                background=bg_color,
-                foreground="white",
-                rowheight=25,
-                fieldbackground=bg_color,
-                font=("Segoe UI", 10))
-style.configure("Treeview.Heading",
-                background=bg_color,
-                foreground=fg_color,
-                font=("Segoe UI", 11, "bold"))
-style.map("Treeview", background=[("selected", "#FF6600")],
-                        foreground=[("selected", "black")])
+progress_bar = ttk.Progressbar(
+    frame_progress, variable=progress_var, maximum=100, length=400, style="custom.Horizontal.TProgressbar"
+    ) # progress_bar = customtkinter.CTkProgressBar(frame_progress, width=400, height=17) Um dia eu mexo nisso, muita dor de cabeça.
+progress_var.set(0)
+progress_bar.grid(padx=10, pady=5)
 
-<<<<<<< HEAD
-# Barra de progresso com botão Cancelar
-=======
-# Botão Selecionar PDF
-btn = tk.Button(root, text="Selecionar PDF", 
-                command=lambda: escolher_pdf(tree, progress_var, progress_bar, root),
-                bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
-btn.pack(pady=10)
+btn_cancelar = customtkinter.CTkButton(
+    root,
+    text="Cancelar",
+    command=cancelar_processamento,
+    fg_color="red",
+    hover_color="#a60000",
+    font=("Segoe UI", 12, "bold"),
+    text_color="white"
+)
+btn_cancelar.pack(pady=10)
 
-# Botão Adicionar mais um PDF
-btn_add_mais = tk.Button(root, text="Adicionar mais um PDF", 
-                         command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root),
-                         bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
-btn_add_mais.pack(pady=5)
-
-# Barra de progresso
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
-style.configure("custom.Horizontal.TProgressbar",
-                troughcolor=bg_color,
-                background=fg_color,
-                thickness=20)
-
-<<<<<<< HEAD
-frame_progress = tk.Frame(root, bg=bg_color)
-frame_progress.pack(pady=5)
-
-progress_bar = ttk.Progressbar(root, variable=progress_var,
-                               maximum=100, length=400,
-                               style="custom.Horizontal.TProgressbar")
-progress_bar.pack(padx=5)
-
-# Botão cancelar
-cancelado = tk.BooleanVar(value=False)
-
-def cancelar_extracao():
-    cancelado.set(True)
-    print("❌ Extração cancelada pelo usuário!")
-
-btn_cancelar = tk.Button(root, text="Cancelar",
-                         command=cancelar_processamento,
-                         bg="red", fg="white", font=("Segoe UI", 11, "bold"))
-btn_cancelar.pack(pady=5)
-
-
-# Frame que vai segurar a tabela principal
-frame_tabela = tk.Frame(root, bg=bg_color)
+# ----------------- Frame principal com tabela -----------------
+frame_tabela = customtkinter.CTkFrame(root)
 frame_tabela.pack(fill="both", expand=True, padx=10, pady=10)
 
-label_arquivos = tk.Label(frame_tabela, textvariable=arquivos_label_var,
-                          bg=bg_color, fg="white", font=("Segoe UI", 10, "italic"))
-label_arquivos.pack(anchor="w", padx=5, pady=(0,5))
+label_arquivos = customtkinter.CTkLabel(
+    frame_tabela,
+    textvariable=arquivos_label_var,
+    font=("Segoe UI", 13, "italic"),
+    text_color="white"
+)
+label_arquivos.pack(anchor="w", padx=5, pady=(0, 5))
 
 cols = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
-tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=10)
-=======
-progress_var = tk.IntVar()
-progress_bar = ttk.Progressbar(root, variable=progress_var,
-                               maximum=100, length=400,
-                               style="custom.Horizontal.TProgressbar")
-progress_bar.pack(pady=5)
-
-# Frame que vai segurar a tabela
-frame_tabela = tk.Frame(root, bg=bg_color)
-frame_tabela.pack(fill="both", expand=True, padx=10, pady=10)
-
-cols = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
-tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=15)
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
+tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=10,)
 
 for col in cols:
     tree.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree, _col, False))
     tree.column(col, anchor="center", width=150, minwidth=50)
 
-<<<<<<< HEAD
 tree.pack(fill="both", expand=True)
 
-# Frame para segunda tabela (planilha online)
-frame_planilha = tk.Frame(root, bg=bg_color)
-frame_planilha.pack(fill="both", expand=True, padx=10, pady=20)
+style = ttk.Style()
+style.theme_use("default")
 
+# Corpo da tabela
+style.configure(
+    "Treeview",
+    background="#1e1e1e",   # fundo (dark)
+    foreground="white",     # cor do texto
+    rowheight=28,
+    fieldbackground="#1e1e1e",  # fundo atrás das linhas
+    font=("Segoe UI", 11)   # fonte e tamanho
+)
 
-label_planilha = tk.Label(frame_planilha, text="Planilha Online (MVA + EH)",
-                          bg=bg_color, fg="white", font=("Segoe UI", 10, "italic"))
-label_planilha.pack(anchor="center", padx=3, pady=(0,5))
+# Cabeçalho da tabela
+style.configure(
+    "Treeview.Heading",
+    background="#2d2d2d",   # fundo do cabeçalho
+    foreground="orange",    # cor do texto do cabeçalho
+    font=("Segoe UI", 12, "bold")
+)
 
-cols_planilha = ("Vendedor", "Clientes Atendidos", "Valor Total") # ajusta depois conforme os headers da planilha
+# Cor quando seleciona uma linha
+style.map(
+    "Treeview",
+    background=[("selected", "#ff6600")],
+    foreground=[("selected", "black")]
+)
 
+style.configure(
+    "custom.Horizontal.TProgressbar",
+    troughcolor="#2d2d2d",   # cor do fundo (trilha)
+    background="#59C734",    # cor da barra preenchida
+    thickness=20
+)
+
+# ----------------- Frame da planilha online -----------------
+frame_planilha = customtkinter.CTkFrame(root)
+frame_planilha.pack(fill="both", expand=True, padx=10, pady=5)
+
+label_planilha = customtkinter.CTkLabel(
+    frame_planilha,
+    text="Planilha Online (MVA + EH)",
+    font=("Segoe UI", 13, "italic"),
+    text_color="white"
+)
+label_planilha.pack(anchor="center", padx=3, pady=(0, 5))
+
+cols_planilha = ("Vendedor", "Clientes Atendidos", "Valor Total")
 tree_planilha = ttk.Treeview(frame_planilha, columns=cols_planilha, show="headings", height=5)
 
 for col in cols_planilha:
     tree_planilha.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree_planilha, _col, False))
     tree_planilha.column(col, anchor="center", width=150, minwidth=100)
 
-tree_planilha.pack(fill="y", expand=False) # largura total fixa (em px)
+tree_planilha.pack(fill="y", expand=False)
 
+# ----------------- Polling do progresso -----------------
 _poll_queue(root, tree, progress_var, progress_bar)
 
-# ------------------ JANELA PARA BOTÕES ------------------
-
-janela_botoes = tk.Toplevel(root)
+# ----------------- Janela lateral de botões -----------------
+janela_botoes = customtkinter.CTkToplevel(root)
 janela_botoes.title("Opções")
-janela_botoes.configure(bg=bg_color)
 janela_botoes.geometry(f"250x300+{x_coordinate + window_width + 10}+{y_coordinate}")
 
-btn = tk.Button(janela_botoes, text="Selecionar PDF", 
-                        command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var),
-                        bg=fg_color, fg="black", font=("Segoe UI", 11, "bold"))
-btn.pack(pady=10)
-
-# -----------------------
-
-btn_add_mais = tk.Button(
+btn = customtkinter.CTkButton(
     janela_botoes,
-    text="Adicionar mais um PDF", 
-    command=lambda: adicionar_pdf(tree, progress_var,  progress_bar, root, arquivos_label_var),
-    bg=fg_color, fg="black", font=("Segoe UI", 11, "bold")
+    text="Selecionar PDF",
+    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var),
+    font=("Segoe UI", 12, "bold")
 )
+btn.pack(pady=5)
 
+btn_add_mais = customtkinter.CTkButton(
+    janela_botoes,
+    text="Adicionar mais um PDF",
+    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var),
+    font=("Segoe UI", 12, "bold")
+)
 btn_add_mais.pack(pady=5)
 
-# ----------------------
-
-btn_planilha = tk.Button(
+btn_planilha = customtkinter.CTkButton(
     janela_botoes,
-    text="Extrair dados da planilha online", 
-    command=lambda: carregar_planilha(tree_planilha),
-    bg=fg_color, fg="black", font=("Segoe UI", 11, "bold")
+    text="Extrair dados da planilha online",
+    command=lambda: carregar_planilha_async(tree_planilha, progress_var, progress_bar, root),
+    font=("Segoe UI", 12, "bold")
 )
 btn_planilha.pack(pady=5)
 
-# ----------------------
-
-btn_exportar = tk.Button(
+btn_exportar = customtkinter.CTkButton(
     janela_botoes,
     text="Exportar relatório em Excel",
     command=lambda: exportar_para_excel(tree),
-    bg=fg_color, fg="black", font=("Segoe UI", 11, "bold")
+    font=("Segoe UI", 12, "bold")
 )
 btn_exportar.pack(pady=5)
 
-# ----------------------
-
-btn_limpar = tk.Button(
+btn_limpar = customtkinter.CTkButton(
     janela_botoes,
     text="Limpar Tabelas",
     command=lambda: limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var),
-    bg=fg_color, fg="black", font=("Segoe UI", 11, "bold")
+    font=("Segoe UI", 12, "bold")
 )
 btn_limpar.pack(pady=5)
 
+# ----------------- Checagem de updates + loop principal -----------------
 check_for_updates()
 root.mainloop()
-=======
-tree.pack(fill="both", expand=True)
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b

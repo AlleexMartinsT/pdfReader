@@ -1,6 +1,5 @@
 from library import *
 from globalVar import *
-<<<<<<< HEAD
 
 # Configuração de logging mais leve (somente avisos e erros)
 logging.basicConfig(level=logging.WARNING)
@@ -28,6 +27,7 @@ def _poll_queue(root, tree, progress_var, progress_bar):
                 progress_bar.update_idletasks()
             elif kind == "done":
                 if payload.get("__cancelled__"):
+                    progress_var.set(0)
                     messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
                 else:
                     resultados_list.append(payload)
@@ -41,36 +41,17 @@ def _poll_queue(root, tree, progress_var, progress_bar):
         pass
     # agendar próxima rodada de checagem
     root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar))
-=======
-import difflib
-import logging
-
-# Configurar logging para depuração
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 
 def resource_path(relative_path):
     """Retorna o caminho absoluto do recurso, compatível com PyInstaller."""
     if hasattr(sys, '_MEIPASS'):  # Executando empacotado
         base_path = sys._MEIPASS
-<<<<<<< HEAD
     else:
         base_path = os.path.abspath(".")
-=======
-        logger.debug(f"Executável: base_path = {base_path}")
-    else:
-        base_path = os.path.abspath(".")
-        logger.debug(f"Desenvolvimento: base_path = {base_path}")
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     return os.path.join(base_path, relative_path)
 
 def load_mapping(path='mapping.json'):
     full_path = resource_path(path)
-<<<<<<< HEAD
-=======
-    logger.debug(f"Procurando mapping.json em: {full_path}")
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     if not os.path.exists(full_path):
         raise FileNotFoundError(f"Arquivo de mapeamento não encontrado: {full_path}")
     with open(full_path, 'r', encoding='utf-8') as f:
@@ -85,10 +66,6 @@ def save_mapping():
     appdata_dir = os.path.join(os.getenv("APPDATA"), "RelatorioClientes")
     os.makedirs(appdata_dir, exist_ok=True)
     user_json = os.path.join(appdata_dir, "mapping.json")
-<<<<<<< HEAD
-=======
-    logger.debug(f"Salvando mapping em: {user_json}")
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     with open(user_json, "w", encoding="utf-8") as f:
         json.dump(mapping, f, indent=4, ensure_ascii=False)
 
@@ -151,7 +128,6 @@ def canonicalize_name(raw: str) -> str:
     return raw.strip().title()
 
 # --- Funções principais ---
-<<<<<<< HEAD
 
 def extrair_planilha_online():
     import gspread
@@ -187,56 +163,98 @@ def extrair_planilha_online():
 
     return dfMVA, dfEH
 
-def carregar_planilha(tree_planilha):
+def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
     try:
-        # 🔎 Verificação
-        '''if not arquivosLista or len(arquivosLista) < 2:
-            messagebox.showwarning(
-                "Aviso",
-                "Você precisa carregar pelo menos 2 arquivos PDF antes de extrair os dados da planilha online."
-            )
-            return'''
+        cancel_event.clear()
+        progress_var.set(0)
 
-        dfMVA, dfEH = extrair_planilha_online()
-
-        # Junta as duas planilhas
-        df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
-
-        # limpa tabela
         for item in tree_planilha.get_children():
             tree_planilha.delete(item)
 
-        # Itera vendedores
-        for _, row in df_total.iterrows():
-            vendedor = str(row.iloc[0]).strip()
-            if not vendedor:
-                continue
+        def worker():
+            try:
+                dfMVA, dfEH = extrair_planilha_online()
+                df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
 
-            valores = row[1:]
-            total = 0.0
-            atendidos = 0  # contador de células somadas
+                total_rows = len(df_total)
+                resultados = []
 
-            for v in valores:
-                if pd.isna(v) or str(v).strip() == "":
-                    continue
-                try:
-                    num = str(v).replace("R$", "").replace(".", "").replace(",", ".").strip()
-                    total += float(num)
-                    atendidos += 1  # conta cada célula válida
-                except:
-                    pass
-                
-            if total > 0:
-                tree_planilha.insert(
-                    "",
-                    "end",
-                    values=(vendedor, atendidos, f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                )
+                for i, (_, row) in enumerate(df_total.iterrows(), start=1):
+                    # 🔹 Verifica se foi cancelado
+                    if cancel_event.is_set():
+                        progress_queue.put(("done_planilha", {"__cancelled__": True}))
+                        return
 
-        messagebox.showinfo("Sucesso", "✅ Planilha online carregada com sucesso!")
+                    vendedor = str(row.iloc[0]).strip()
+                    if not vendedor:
+                        continue
+
+                    valores = row[1:]
+                    total = 0.0
+                    atendidos = 0
+
+                    for v in valores:
+                        if pd.isna(v) or str(v).strip() == "":
+                            continue
+                        try:
+                            num = str(v).replace("R$", "").replace(".", "").replace(",", ".").strip()
+                            total += float(num)
+                            atendidos += 1
+                        except:
+                            pass
+
+                    if total > 0:
+                        resultados.append((vendedor, atendidos, total))
+
+                    # 🔹 Atualiza progresso gradualmente
+                    progresso = int(i * 100 / max(1, total_rows))
+                    progress_queue.put(("progress", progresso))
+                    time.sleep(0.01)
+
+                progress_queue.put(("done_planilha", resultados))
+
+            except Exception as e:
+                progress_queue.put(("error", f"Erro ao carregar planilha: {e}"))
+
+        progress_queue = queue.Queue()
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
+        def poll_queue_planilha():
+            try:
+                while True:
+                    kind, payload = progress_queue.get_nowait()
+                    if kind == "progress":
+                        progress_var.set(payload)
+                        progress_bar.update_idletasks()
+                    elif kind == "done_planilha":
+                        if isinstance(payload, dict) and payload.get("__cancelled__"):
+                            progress_var.set(0)
+                            messagebox.showinfo("Cancelado", "❌ Carregamento da planilha foi cancelado.")
+                        else:
+                            for vendedor, atendidos, total in payload:
+                                tree_planilha.insert(
+                                    "",
+                                    "end",
+                                    values=(
+                                        vendedor,
+                                        atendidos,
+                                        f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                    )
+                                )
+                            messagebox.showinfo("Sucesso", "✅ Planilha online carregada com sucesso!")
+                        return
+                    elif kind == "error":
+                        messagebox.showerror("Erro", payload)
+                        return
+            except queue.Empty:
+                pass
+            root.after(10, poll_queue_planilha)
+
+        poll_queue_planilha()
 
     except Exception as e:
-        messagebox.showerror("Erro", f"Erro ao carregar planilha: {e}")
+        messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
 def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var):
     
@@ -265,20 +283,11 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
               
     # Zera estado, incluindo a lista de resultados
     cancel_event.clear()
-=======
-def escolher_pdf(tree, progress_var, progress_bar, root):
-    caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
-    if not caminho:
-        return
-    
-    global resultados_list
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     resultados_list = []
     
     for item in tree.get_children():
         tree.delete(item)
 
-<<<<<<< HEAD
     # Dispara worker
     def worker():
         try:
@@ -289,7 +298,7 @@ def escolher_pdf(tree, progress_var, progress_bar, root):
             )
 
             # força progresso final
-            progress_queue.put(("progress", 100))
+            # progress_queue.put(("progress", 100))
             progress_queue.put(("done", resultados))
         except Exception as e:
             print(f"Erro na thread: {str(e)}")
@@ -304,6 +313,8 @@ def escolher_pdf(tree, progress_var, progress_bar, root):
 def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     
     global arquivosLista
+    local_queue = queue.Queue()
+    
     # Checa se algum PDF ja foi importado antes
     if not resultados_list:
         messagebox.showwarning("Aviso", "Selecione o primeiro PDF antes de adicionar outro.")
@@ -330,14 +341,6 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     
     try:
         with pdfplumber.open(caminho) as pdf:
-=======
-    try:
-        logger.debug(f"Tentando abrir PDF: {caminho}")
-        with open(caminho, 'rb') as f:  # Verifica se o arquivo é acessível
-            logger.debug("Arquivo acessível com sucesso")
-        with pdfplumber.open(caminho) as pdf:
-            logger.debug(f"PDF aberto com sucesso. Total de páginas: {len(pdf.pages)}")
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
             if pdf.metadata.get("encrypted", False):
                 messagebox.showerror("Erro", "Este PDF está protegido por senha.")
                 return
@@ -349,7 +352,6 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         logger.error(f"Exceção ao abrir PDF: {str(e)}")
         return
 
-<<<<<<< HEAD
     # Reset progresso
     cancel_event.clear()
 
@@ -358,32 +360,29 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         try:
             res = processar_pdf_sem_ui(
                 caminho,
-                on_progress=lambda kind, payload: progress_queue.put((kind, payload)),
+                on_progress=lambda kind, payload: local_queue.put((kind, payload)),
                 cancel_event=cancel_event
             )
-
-            # força progresso final
-            # progress_queue.put(("progress", 100))
-            progress_queue.put(("done_add", res))  # use um tipo diferente para não confundir com o primeiro PDF
+            local_queue.put(("done_add", res))
         except Exception as e:
-            logger.error(f"Erro ao processar PDF adicional: {str(e)}")
-            progress_queue.put(("error", str(e)))
+            local_queue.put(("error", str(e)))
 
-    global worker_thread
-    worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
+    threading.Thread(target=worker, daemon=True).start()
 
     # começa a escutar fila
     def poll_queue_add():
         try:
             while True:
-                kind, payload = progress_queue.get_nowait()
+                kind, payload = local_queue.get_nowait()
                 if kind == "progress":
                     progress_var.set(payload)
                     progress_bar.update_idletasks()
                 elif kind == "done_add":
                     if payload.get("__cancelled__"):
+                        progress_var.set(0)
                         messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
+                    elif payload.get("__empty__"):
+                        messagebox.showwarning("Aviso", "Nenhum dado foi encontrado neste PDF.")
                     else:
                         resultados_list.append(payload)
                         atualizar_tree(tree)
@@ -398,46 +397,6 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
 
     poll_queue_add()
     
-=======
-    res = processar_pdf(caminho, progress_var, progress_bar, root)
-    resultados_list.append(res)
-    atualizar_tree(tree)
-    
-    messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
-
-def adicionar_pdf(tree, progress_var, progress_bar, root):
-    if not resultados_list:
-        messagebox.showwarning("Aviso", "Selecione o primeiro PDF antes de adicionar outro.")
-        return
-    
-    caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
-    if not caminho:
-        return
-    
-    try:
-        logger.debug(f"Tentando abrir PDF: {caminho}")
-        with open(caminho, 'rb') as f:  # Verifica se o arquivo é acessível
-            logger.debug("Arquivo acessível com sucesso")
-        with pdfplumber.open(caminho) as pdf:
-            logger.debug(f"PDF aberto com sucesso. Total de páginas: {len(pdf.pages)}")
-            if pdf.metadata.get("encrypted", False):
-                messagebox.showerror("Erro", "Este PDF está protegido por senha.")
-                return
-    except FileNotFoundError as e:
-        messagebox.showerror("Erro", f"Arquivo não encontrado: {e}")
-        return
-    except Exception as e:
-        messagebox.showerror("Erro", f"Não foi possível abrir o PDF: {e}")
-        logger.error(f"Exceção ao abrir PDF: {str(e)}")
-        return
-
-    res = processar_pdf(caminho, progress_var, progress_bar, root)
-    resultados_list.append(res)
-    atualizar_tree(tree)
-    
-    messagebox.showinfo("Concluído", "Segundo PDF adicionado e relatórios mesclados!")
-
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
 def atualizar_tree(tree):
     for item in tree.get_children():
         tree.delete(item)
@@ -484,12 +443,11 @@ def mesclar_resultados(resultados_list):
 
     return mesclado
 
-<<<<<<< HEAD
 def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
     """
     Faz TODO o trabalho pesado AQUI, SEM chamar messagebox, progress_bar,
     root.update_idletasks, etc. Reporta progresso via on_progress(%).
-    Retorna o dict 'resultados' igual ao que você já usa.
+    Retorna o dict 'resultados'
     """
     resultados = {}
     vendedor_atual = None
@@ -500,19 +458,12 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
     if cancel_event is None or isinstance(cancel_event, bool):
         cancel_event = threading.Event()
         
-=======
-def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
-    resultados = {}
-    vendedor_atual = None
-
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
     def fechar_vendedor():
         nonlocal vendedor_atual
         if vendedor_atual and vendedor_atual in resultados:
             dados = resultados[vendedor_atual]
             dados["total_clientes"] = dados["atendidos"] - dados["devolucoes"]
 
-<<<<<<< HEAD
     with pdfplumber.open(caminho_pdf) as pdf:
         total = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages, start=1):
@@ -522,27 +473,11 @@ def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
             try:
                 texto = pagina.extract_text() or ""
                 for linha in texto.splitlines():
-=======
-    try:
-        logger.debug(f"Processando PDF: {caminho_pdf}")
-        with pdfplumber.open(caminho_pdf) as pdf:
-            logger.debug(f"PDF aberto com sucesso. Total de páginas: {len(pdf.pages)}")
-            total_paginas = len(pdf.pages)
-            for i, pagina in enumerate(pdf.pages, start=1):
-                logger.debug(f"Processando página {i}")
-                texto = pagina.extract_text()
-                if not texto:
-                    logger.warning(f"Página {i} sem texto extraível")
-                    continue
-                linhas = texto.splitlines()
-                for linha in linhas:
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
                     if "Vendedor: " in linha:
                         fechar_vendedor()
                         partes = linha.split("Vendedor: ", 1)[1].strip()
                         if partes:
                             palavras = partes.split()
-<<<<<<< HEAD
                             if palavras and palavras[0].isdigit():
                                 vendedor_bruto = " ".join(palavras[1:])
                             else:
@@ -555,28 +490,6 @@ def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
                                     "total_clientes": 0,
                                     "total_vendas": ""
                                 }
-=======
-                            if palavras[0].isdigit():
-                                vendedor_bruto = " ".join(palavras[1:])
-                            else:
-                                vendedor_bruto = " ".join(palavras)
-
-                            vendedor_atual = canonicalize_name(vendedor_bruto)
-
-                            # se não estiver no mapping, perguntar ao usuário
-                            if _normalize_key(vendedor_bruto) not in mapping:
-                                if messagebox.askyesno("Novo Vendedor", f"O vendedor '{vendedor_bruto}' não está no mapeamento. Deseja adicioná-lo?"):
-                                    mapping[_normalize_key(vendedor_bruto)] = vendedor_atual
-                                    save_mapping()
-                                    messagebox.showinfo("Sucesso", f"'{vendedor_atual}' adicionado ao mapeamento!")
-
-                            resultados[vendedor_atual] = {
-                                "atendidos": 0,
-                                "devolucoes": 0,
-                                "total_clientes": 0,
-                                "total_vendas": ""
-                            }
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
                         continue
 
                     if regex_data.match(linha):
@@ -587,7 +500,6 @@ def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
                             resultados[vendedor_atual]["devolucoes"] += 1
 
                     if "Totais" in linha and vendedor_atual:
-<<<<<<< HEAD
                         m = re.search(r"Totais:\s*([\d\.\,]+)", linha)
                         if m:
                             resultados[vendedor_atual]["total_vendas"] = m.group(1)
@@ -602,27 +514,8 @@ def processar_pdf(caminho_pdf, progress_var, progress_bar, root):
 
         # Garante que o progresso chegue a 100% após o loop
         fechar_vendedor()
-=======
-                        match = re.search(r"Totais:\s*([\d\.\,]+)", linha)
-                        if match:
-                            resultados[vendedor_atual]["total_vendas"] = match.group(1)
-
-                fechar_vendedor()
-                progress = int((i / total_paginas) * 100)
-                progress_var.set(progress)
-                progress_bar.update_idletasks()
-                root.update_idletasks()
-    except pdfplumber.PDFSyntaxError as e:
-        messagebox.showerror("Erro", f"Erro de sintaxe no PDF: {e}. Verifique se o arquivo não está corrompido.")
-        logger.error(f"PDFSyntaxError: {str(e)}")
-    except pdfplumber.PDFTextExtractionNotAllowedError as e:
-        messagebox.showerror("Erro", f"Extração de texto não permitida: {e}. O PDF pode estar protegido.")
-        logger.error(f"PDFTextExtractionNotAllowedError: {str(e)}")
-    except Exception as e:
-        messagebox.showerror("Erro", f"Ocorreu um erro interno ao processar o PDF: {e}")
-        logger.error(f"Exceção geral: {str(e)}")
-    
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b
+    if not resultados:
+        return {"__empty__": True}
     return resultados
 
 def ordenar_coluna(tree, col, reverse):
@@ -656,7 +549,6 @@ def check_for_updates():
             print("App atualizado.")
     except Exception as e:
         print(f"Erro ao checar updates: {e}")
-<<<<<<< HEAD
         messagebox.showerror("Erro na Atualização", f"Ocorreu um erro ao checar atualizações: {e}")
 
 def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
@@ -723,6 +615,3 @@ def exportar_para_excel(tree):
 
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao exportar para Excel: {e}")
-=======
-        messagebox.showerror("Erro na Atualização", f"Ocorreu um erro ao checar atualizações: {e}")
->>>>>>> cf7f8728b28fa478141cdeabb5748912ba2d612b

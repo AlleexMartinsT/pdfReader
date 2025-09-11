@@ -1,5 +1,5 @@
 from utils import (
-    _poll_queue, escolher_pdf_async, adicionar_pdf, ordenar_coluna,
+    escolher_pdf_async, adicionar_pdf, ordenar_coluna,
     cancelar_processamento, carregar_planilha_async, exportar_para_excel,
     limpar_tabelas, check_for_updates
 )
@@ -22,7 +22,13 @@ root.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
 arquivos_label_var = customtkinter.StringVar(value="Nenhum arquivo carregado ainda")
 progress_var = customtkinter.IntVar(value=0)
 
-customtkinter.set_default_color_theme("C:/Users/vendas/Desktop/repo-limpo/basedTheme.json")
+if getattr(sys, 'frozen', False):  # rodando como exe
+    base_path = sys._MEIPASS
+else:  # rodando como script
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+theme_path = os.path.join(base_path, "basedTheme.json")
+customtkinter.set_default_color_theme(theme_path)
 
 # ----------------- Barra de progresso com botão Cancelar -----------------
 frame_progress = customtkinter.CTkFrame(root)
@@ -41,7 +47,8 @@ btn_cancelar = customtkinter.CTkButton(
     fg_color="red",
     hover_color="#a60000",
     font=("Segoe UI", 12, "bold"),
-    text_color="white"
+    text_color="white",
+    state="disabled"
 )
 btn_cancelar.pack(pady=10)
 
@@ -121,10 +128,6 @@ for col in cols_planilha:
     tree_planilha.column(col, anchor="center", width=150, minwidth=100)
 
 tree_planilha.pack(fill="y", expand=False)
-
-# ----------------- Polling do progresso -----------------
-_poll_queue(root, tree, progress_var, progress_bar)
-
 # ----------------- Janela lateral de botões -----------------
 janela_botoes = customtkinter.CTkToplevel(root)
 janela_botoes.title("Opções")
@@ -134,7 +137,6 @@ btn = customtkinter.CTkButton(
     janela_botoes,
     text="Selecionar PDF",
     command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var),
-    font=("Segoe UI", 12, "bold")
 )
 btn.pack(pady=5)
 
@@ -142,15 +144,13 @@ btn_add_mais = customtkinter.CTkButton(
     janela_botoes,
     text="Adicionar mais um PDF",
     command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var),
-    font=("Segoe UI", 12, "bold")
 )
 btn_add_mais.pack(pady=5)
 
 btn_planilha = customtkinter.CTkButton(
     janela_botoes,
     text="Extrair dados da planilha online",
-    command=lambda: carregar_planilha_async(tree_planilha, progress_var, progress_bar, root),
-    font=("Segoe UI", 12, "bold")
+    command=lambda: carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arquivos_label_var),
 )
 btn_planilha.pack(pady=5)
 
@@ -158,7 +158,6 @@ btn_exportar = customtkinter.CTkButton(
     janela_botoes,
     text="Exportar relatório em Excel",
     command=lambda: exportar_para_excel(tree),
-    font=("Segoe UI", 12, "bold")
 )
 btn_exportar.pack(pady=5)
 
@@ -166,9 +165,14 @@ btn_limpar = customtkinter.CTkButton(
     janela_botoes,
     text="Limpar Tabelas",
     command=lambda: limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var),
-    font=("Segoe UI", 12, "bold")
 )
 btn_limpar.pack(pady=5)
+
+btn_mesclar_planilhas = customtkinter.CTkButton(
+    janela_botoes,
+    text="Mesclar planilhas",
+    #command=lambda: mesclar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var)
+)
 
 # ----------------- Checagem de updates + loop principal -----------------
 check_for_updates()

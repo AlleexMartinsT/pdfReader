@@ -9,16 +9,19 @@ cancel_event = threading.Event()
 worker_thread = None
 
 def cancelar_processamento():
-    from tk import arquivos_label_var
+    from tk import btn_cancelar
     
     cancel_event.set()
     with progress_queue.mutex:
         progress_queue.queue.clear()
-        arquivos_label_var.set("Nenhum arquivo carregado ainda")
+        btn_cancelar.configure(state="disabled")
     print("Cancelamento solicitado.")
 
-def _poll_queue(root, tree, progress_var, progress_bar):
+def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho):
     """Roda na main thread: consome eventos vindos da thread e atualiza a UI."""
+    
+    from tk import btn_cancelar
+    
     try:
         while True:
             kind, payload = progress_queue.get_nowait()
@@ -26,21 +29,26 @@ def _poll_queue(root, tree, progress_var, progress_bar):
                 progress_var.set(payload)
                 progress_bar.update_idletasks()
             elif kind == "done":
+                btn_cancelar.configure(state="disabled")
                 if payload.get("__cancelled__"):
                     progress_var.set(0)
                     messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
                 else:
+                    arquivosLista.clear()
+                    arquivosLista.append(caminho)
+                    arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
                     resultados_list.append(payload)
                     atualizar_tree(tree)
                     messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
-                return  # para de ficar agendando _poll_queue
+                return 
             elif kind == "error":
+                btn_cancelar.configure(state="disabled")
                 messagebox.showerror("Erro", payload)
                 return
     except queue.Empty:
         pass
     # agendar próxima rodada de checagem
-    root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar))
+    root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
 
 def resource_path(relative_path):
     """Retorna o caminho absoluto do recurso, compatível com PyInstaller."""
@@ -186,7 +194,9 @@ def extrair_planilha_online():
 
     return dfMVA, dfEH
 
-def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
+def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arquivos_label_var):
+    from tk import btn_cancelar
+    
     try:
         cancel_event.clear()
         progress_var.set(0)
@@ -258,6 +268,8 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                         progress_bar.update_idletasks()
                     elif kind == "done_planilha":
                         if isinstance(payload, dict) and payload.get("__cancelled__"):
+                            progress_bar.stop()
+                            progress_bar.config(mode="determinate")
                             progress_var.set(0)
                             messagebox.showinfo("Cancelado", "❌ Carregamento da planilha foi cancelado.")
                         else:
@@ -287,8 +299,9 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
 
 def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var):
     
+    from tk import btn_cancelar
     global arquivosLista,resultados_list,worker_thread
-
+    
     if not isinstance(arquivosLista, list):
         arquivosLista = []
     if arquivosLista and len(arquivosLista) > 1:
@@ -301,15 +314,10 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
     if caminho:
         if caminho in arquivosLista:
             messagebox.showerror("Erro", "Arquivo já importado!")
-            return
-        else:
-            arquivosLista.clear()
-            arquivosLista.append(caminho)
+            return       
     else:
         return
-    
-    arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
-              
+             
     # Zera estado, incluindo a lista de resultados
     cancel_event.clear()
     resultados_list = []
@@ -325,30 +333,30 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
                 on_progress=lambda kind, payload: progress_queue.put((kind, payload)),
                 cancel_event=cancel_event
             )
-
-            # força progresso final
-            # progress_queue.put(("progress", 100))
             progress_queue.put(("done", resultados))
         except Exception as e:
             print(f"Erro na thread: {str(e)}")
             progress_queue.put(("error", str(e)))
-
+    
+    btn_cancelar.configure(state="normal")
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
 
     # Começa a escutar a fila na main thread
-    _poll_queue(root, tree, progress_var, progress_bar)
+    _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho)
 
 def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
-    
+    from tk import btn_cancelar
+     
     global arquivosLista
     local_queue = queue.Queue()
     
     # Checa se algum PDF ja foi importado antes
-    if not resultados_list:
+    
+    if not resultados_list or not arquivosLista:
         messagebox.showwarning("Aviso", "Selecione o primeiro PDF antes de adicionar outro.")
         return
-    
+        
     caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
     progress_var.set(0)
     
@@ -356,17 +364,10 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         return
     
     if caminho not in arquivosLista:
-        arquivosLista.append(caminho)
+        pass
     else:
         messagebox.showerror("Erro", "Arquivo já importado!")
         return
-    
-    atual = arquivos_label_var.get().replace("Arquivo carregado:", "").replace("Arquivos carregados:", "").strip()
-    
-    if atual and atual != "Nenhum arquivo carregado ainda":
-        arquivos_label_var.set(f"Arquivos carregados: {atual}, {os.path.basename(caminho)}")
-    else:
-        arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
     
     try:
         with pdfplumber.open(caminho) as pdf:
@@ -380,7 +381,9 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         messagebox.showerror("Erro", f"Não foi possível abrir o PDF: {e}")
         logger.error(f"Exceção ao abrir PDF: {str(e)}")
         return
-
+    
+    atual = arquivos_label_var.get().replace("Arquivo carregado:", "").replace("Arquivos carregados:", "").strip()
+    
     # Reset progresso
     cancel_event.clear()
 
@@ -396,6 +399,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         except Exception as e:
             local_queue.put(("error", str(e)))
 
+    btn_cancelar.configure(state="normal")
     threading.Thread(target=worker, daemon=True).start()
 
     # começa a escutar fila
@@ -407,17 +411,24 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                     progress_var.set(payload)
                     progress_bar.update_idletasks()
                 elif kind == "done_add":
+                    btn_cancelar.configure(state="disabled")
                     if payload.get("__cancelled__"):
                         progress_var.set(0)
                         messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
                     elif payload.get("__empty__"):
                         messagebox.showwarning("Aviso", "Nenhum dado foi encontrado neste PDF.")
                     else:
+                        if atual and atual != "Nenhum arquivo carregado ainda":
+                            arquivos_label_var.set(f"Arquivos carregados: {atual}, {os.path.basename(caminho)}")
+                        else:
+                            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
+                        arquivosLista.append(caminho)
                         resultados_list.append(payload)
                         atualizar_tree(tree)
                         messagebox.showinfo("Concluído", "PDF adicional processado e mesclado!")
                     return
                 elif kind == "error":
+                    btn_cancelar.configure(state="disabled")
                     messagebox.showerror("Erro", payload)
                     return
         except queue.Empty:

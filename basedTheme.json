@@ -137,14 +137,14 @@
   },
   "CTkFont": {
     "macOS": {
-      "family": "SF Display",
-      "size": 13,
-      "weight": "normal"
+      "family": "Segoe UI",
+      "size": 12,
+      "weight": "bold"
     },
     "Windows": {
-      "family": "Roboto",
+      "family": "Segoe UI",
       "size": 13,
-      "weight": "normal"
+      "weight": "bold"
     },
     "Linux": {
       "family": "Roboto",

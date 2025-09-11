@@ -2,9 +2,7 @@ import pdfplumber
 import tempfile
 import logging
 import re
-import requests
 import os
-import sys  
 import hashlib
 import shutil
 import versioninfo
@@ -15,7 +13,6 @@ import threading
 import tkinter as tk
 import queue
 import tkinter.messagebox as messagebox
-import gspread
 import pandas as pd
 import openpyxl
 import time

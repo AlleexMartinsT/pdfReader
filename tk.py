@@ -3,8 +3,8 @@ from utils import (
     cancelar_processamento, carregar_planilha_async, exportar_para_excel,
     limpar_tabelas, check_for_updates
 )
-from library import *
-from globalVar import *
+from library import ttk
+import sys, os
 import customtkinter
 
 # GUI
@@ -136,7 +136,7 @@ janela_botoes.geometry(f"250x300+{x_coordinate + window_width + 10}+{y_coordinat
 btn = customtkinter.CTkButton(
     janela_botoes,
     text="Selecionar PDF",
-    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var),
+    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar),
 )
 btn.pack(pady=5)
 
@@ -150,7 +150,7 @@ btn_add_mais.pack(pady=5)
 btn_planilha = customtkinter.CTkButton(
     janela_botoes,
     text="Extrair dados da planilha online",
-    command=lambda: carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arquivos_label_var),
+    command=lambda: carregar_planilha_async(tree_planilha, progress_var, progress_bar, root),
 )
 btn_planilha.pack(pady=5)
 
@@ -175,5 +175,5 @@ btn_mesclar_planilhas = customtkinter.CTkButton(
 )
 
 # ----------------- Checagem de updates + loop principal -----------------
-check_for_updates()
+check_for_updates(root)
 root.mainloop()

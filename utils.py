@@ -1,23 +1,21 @@
-from library import *
-from globalVar import *
+from library import queue, threading, os, re, json, time, pdfplumber, logging, messagebox, difflib, filedialog, pd
+from globalVar import arquivosLista, resultados_lista, regex_data, regex_negativo, APP_VERSION, GITHUB_REPO
 
 # Configuração de logging mais leve (somente avisos e erros)
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
-worker_thread = None
 
-def cancelar_processamento():
+def cancelar_processamento(): 
     from tk import btn_cancelar
     
     cancel_event.set()
     with progress_queue.mutex:
         progress_queue.queue.clear()
         btn_cancelar.configure(state="disabled")
-    print("Cancelamento solicitado.")
 
-def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho):
+def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None, caminho=None): 
     """Roda na main thread: consome eventos vindos da thread e atualiza a UI."""
     
     from tk import btn_cancelar
@@ -34,10 +32,12 @@ def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, cami
                     progress_var.set(0)
                     messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
                 else:
+                    for item in tree.get_children():
+                        tree.delete(item)
                     arquivosLista.clear()
                     arquivosLista.append(caminho)
                     arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
-                    resultados_list.append(payload)
+                    resultados_lista.append(payload)
                     atualizar_tree(tree)
                     messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
                 return 
@@ -50,15 +50,18 @@ def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, cami
     # agendar próxima rodada de checagem
     root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
 
-def resource_path(relative_path):
+def resource_path(relative_path): 
+    import sys
+    
     """Retorna o caminho absoluto do recurso, compatível com PyInstaller."""
     if hasattr(sys, '_MEIPASS'):  # Executando empacotado
         base_path = sys._MEIPASS
     else:
-        base_path = os.path.abspath(".")
+        base_path = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
     return os.path.join(base_path, relative_path)
 
-def load_mapping(path='mapping.json'):
+def load_mapping(path='mapping.json'): 
+  
     full_path = resource_path(path)
     if not os.path.exists(full_path):
         raise FileNotFoundError(f"Arquivo de mapeamento não encontrado: {full_path}")
@@ -69,7 +72,7 @@ def load_mapping(path='mapping.json'):
 mapping = load_mapping()
 CANON_BY_VALUE_UPPER = {v.upper(): v for v in mapping.values()}
 
-def save_mapping():
+def save_mapping(): 
     """Salva o mapeamento atualizado no arquivo do usuário."""
     appdata_dir = os.path.join(os.getenv("APPDATA"), "RelatorioClientes")
     os.makedirs(appdata_dir, exist_ok=True)
@@ -139,44 +142,24 @@ def canonicalize_name(raw: str) -> str:
 
 def extrair_planilha_online():
     import gspread
-    import pandas as pd
     from oauth2client.service_account import ServiceAccountCredentials
-
-    print("🔎 Iniciando extração da planilha online...")
-
+    
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
     ]
     cred_path = resource_path("credenciais.json")
-    print(f"📂 Usando credenciais em: {cred_path}")
 
-    try:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
-        client = gspread.authorize(creds)
-        print("✅ Autenticação concluída com sucesso.")
-    except Exception as e:
-        print(f"❌ Erro na autenticação: {e}")
-        raise
+    creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
+    client = gspread.authorize(creds)
 
     SPREADSHEET_ID = "1eiHbe-NkZ4cM5tMtq2JN574rwa2thR6X7T40EZM_3TA"
-    print(f"📑 Acessando planilha ID: {SPREADSHEET_ID}")
 
-    try:
-        sheetMVA = client.open_by_key(SPREADSHEET_ID).worksheet("MVA")
-        sheetEH = client.open_by_key(SPREADSHEET_ID).worksheet("EH")
-        print("✅ Abriu abas 'MVA' e 'EH'")
-    except Exception as e:
-        print(f"❌ Erro ao abrir abas: {e}")
-        raise
+    sheetMVA = client.open_by_key(SPREADSHEET_ID).worksheet("MVA")
+    sheetEH = client.open_by_key(SPREADSHEET_ID).worksheet("EH")
 
-    try:
-        valoresMVA = sheetMVA.get_all_values()
-        valoresEH = sheetEH.get_all_values()
-        print(f"📊 Linhas MVA: {len(valoresMVA)}, EH: {len(valoresEH)}")
-    except Exception as e:
-        print(f"❌ Erro ao buscar valores: {e}")
-        raise
+    valoresMVA = sheetMVA.get_all_values()
+    valoresEH = sheetEH.get_all_values()
 
     # pega cabeçalho da linha 2
     colsMVA = valoresMVA[1]
@@ -189,14 +172,9 @@ def extrair_planilha_online():
     dfMVA = pd.DataFrame(valoresMVA[2:], columns=colsMVA)
     dfEH = pd.DataFrame(valoresEH[2:], columns=colsEH)
 
-    print(f"✅ DataFrames criados: dfMVA ({dfMVA.shape[0]} linhas, {dfMVA.shape[1]} colunas), "
-          f"dfEH ({dfEH.shape[0]} linhas, {dfEH.shape[1]} colunas)")
-
     return dfMVA, dfEH
 
-def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arquivos_label_var):
-    from tk import btn_cancelar
-    
+def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
     try:
         cancel_event.clear()
         progress_var.set(0)
@@ -205,8 +183,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arq
             tree_planilha.delete(item)
 
         def worker():
-            progress_bar.config(mode="indeterminate")
-            progress_bar.start(10)  # velocidade
+            progressQueuePlanilha.put(("ui", {"action": "start_indeterminate"}))
 
             try:
                 dfMVA, dfEH = extrair_planilha_online()
@@ -218,7 +195,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arq
                 for i, (_, row) in enumerate(df_total.iterrows(), start=1):
                     # 🔹 Verifica se foi cancelado
                     if cancel_event.is_set():
-                        progress_queue.put(("done_planilha", {"__cancelled__": True}))
+                        progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
                         return
 
                     vendedor = str(row.iloc[0]).strip()
@@ -244,28 +221,33 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arq
 
                     # 🔹 Atualiza progresso gradualmente
                     progresso = int(i * 100 / max(1, total_rows))
-                    progress_queue.put(("progress", progresso))
+                    progressQueuePlanilha.put(("progress", progresso))
                     time.sleep(0.01)
 
-                progress_queue.put(("done_planilha", resultados))
+                progressQueuePlanilha.put(("done_planilha", resultados))
 
             except Exception as e:
-                progress_queue.put(("error", f"Erro ao carregar planilha: {e}"))
+                progressQueuePlanilha.put(("error", f"Erro ao carregar planilha: {e}"))
 
-        progress_queue = queue.Queue()
+        progressQueuePlanilha = queue.Queue()
         worker_thread = threading.Thread(target=worker, daemon=True)
         worker_thread.start()
 
         def poll_queue_planilha():
             try:
                 while True:
-                    kind, payload = progress_queue.get_nowait()
+                    kind, payload = progressQueuePlanilha.get_nowait()
                     if kind == "progress":
                         if str(progress_bar["mode"]) == "indeterminate":
                             progress_bar.stop()
                             progress_bar.config(mode="determinate")
                         progress_var.set(payload)
                         progress_bar.update_idletasks()
+                    elif kind == "ui":
+                        action = payload.get("action")
+                        if action == "start_indeterminate":
+                            progress_bar.config(mode="indeterminate")
+                            progress_bar.start(10)
                     elif kind == "done_planilha":
                         if isinstance(payload, dict) and payload.get("__cancelled__"):
                             progress_bar.stop()
@@ -297,14 +279,14 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root, arq
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
-def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var):
+def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar):
     
-    from tk import btn_cancelar
-    global arquivosLista,resultados_list,worker_thread
+    global arquivosLista, resultados_lista
+    worker_thread = None
     
     if not isinstance(arquivosLista, list):
         arquivosLista = []
-    if arquivosLista and len(arquivosLista) > 1:
+    if arquivosLista and len(arquivosLista) > 1: # Para acaso tiver usado o botão "Adicionar PDF", então ele vai limpar tudo.
         arquivosLista.clear()
             
         
@@ -320,10 +302,7 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
              
     # Zera estado, incluindo a lista de resultados
     cancel_event.clear()
-    resultados_list = []
-    
-    for item in tree.get_children():
-        tree.delete(item)
+    resultados_lista = []
 
     # Dispara worker
     def worker():
@@ -353,7 +332,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     
     # Checa se algum PDF ja foi importado antes
     
-    if not resultados_list or not arquivosLista:
+    if not resultados_lista or not arquivosLista:
         messagebox.showwarning("Aviso", "Selecione o primeiro PDF antes de adicionar outro.")
         return
         
@@ -363,9 +342,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     if not caminho:
         return
     
-    if caminho not in arquivosLista:
-        pass
-    else:
+    if caminho in arquivosLista:
         messagebox.showerror("Erro", "Arquivo já importado!")
         return
     
@@ -386,6 +363,16 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     
     # Reset progresso
     cancel_event.clear()
+
+    def atualizar_label_arquivos(arquivos_label_var):
+        """Atualiza o label baseado em arquivosLista."""
+        if not arquivosLista:
+            arquivos_label_var.set("Nenhum arquivo carregado ainda")
+        elif len(arquivosLista) == 1:
+            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(arquivosLista[0])}")
+        else:
+            nomes = ", ".join(os.path.basename(p) for p in arquivosLista)
+            arquivos_label_var.set(f"Arquivos carregados: {nomes}")
 
     # Thread worker
     def worker():
@@ -423,7 +410,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                         else:
                             arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
                         arquivosLista.append(caminho)
-                        resultados_list.append(payload)
+                        resultados_lista.append(payload)
                         atualizar_tree(tree)
                         messagebox.showinfo("Concluído", "PDF adicional processado e mesclado!")
                     return
@@ -441,7 +428,7 @@ def atualizar_tree(tree):
     for item in tree.get_children():
         tree.delete(item)
     
-    mesclado = mesclar_resultados(resultados_list)
+    mesclado = mesclar_resultados(resultados_lista)
     
     for vendedor, dados in sorted(mesclado.items()):
         total_vendas_str = ""
@@ -456,11 +443,18 @@ def atualizar_tree(tree):
             total_vendas_str
         ))
 
-def mesclar_resultados(resultados_list):
+def mesclar_resultados(resultados_lista):
     mesclado = {}
-    for res in resultados_list:
+    cache_canon = {}  # 🔹 Cache para memoização de canonicalize_name
+
+    for res in resultados_lista:
         for vend, dados in res.items():
-            canon = canonicalize_name(vend)
+            # Usa o cache para evitar chamadas repetidas a canonicalize_name
+            if vend in cache_canon:
+                canon = cache_canon[vend]
+            else:
+                canon = canonicalize_name(vend)
+                cache_canon[vend] = canon
 
             if canon not in mesclado:
                 mesclado[canon] = {
@@ -477,13 +471,13 @@ def mesclar_resultados(resultados_list):
             tv_str = str(dados.get("total_vendas", ""))
             mesclado[canon]["total_vendas"] += parse_number(tv_str)
 
-    # Recalcula clientes finais
+    # 🔹 Recalcula clientes finais uma vez ao final
     for dados in mesclado.values():
         dados["total_clientes"] = dados["atendidos"] - dados["devolucoes"]
 
     return mesclado
 
-def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
+def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.Event | None = None):
     """
     Faz TODO o trabalho pesado AQUI, SEM chamar messagebox, progress_bar,
     root.update_idletasks, etc. Reporta progresso via on_progress(%).
@@ -495,7 +489,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
     # se não vier nada, cria versões "neutras"
     if on_progress is None:
         on_progress = lambda *args, **kwargs: None
-    if cancel_event is None or isinstance(cancel_event, bool):
+    if cancel_event is None:
         cancel_event = threading.Event()
         
     def fechar_vendedor():
@@ -548,9 +542,8 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event=False):
                 progresso = int(i * 100 / max(1, total))
                 on_progress("progress", progresso)
             except Exception as e:
-                logger.error(f"Erro na página {i}: {str(e)}")
-                on_progress("progress", 100)
-                raise
+                logger.exception(f"Erro na página {i}: {e}")
+                return {"__error__": str(e)}
 
         # Garante que o progresso chegue a 100% após o loop
         fechar_vendedor()
@@ -562,10 +555,12 @@ def ordenar_coluna(tree, col, reverse):
     dados = [(tree.set(k, col), k) for k in tree.get_children('')]
     
     def try_num(v):
+        v = str(v)
         try:
             return float(v.replace(".", "").replace(",", "."))
         except:
             return v.lower()
+        
     dados.sort(key=lambda t: try_num(t[0]), reverse=reverse)
 
     for index, (val, k) in enumerate(dados):
@@ -573,23 +568,43 @@ def ordenar_coluna(tree, col, reverse):
 
     tree.heading(col, command=lambda: ordenar_coluna(tree, col, not reverse))
 
-def check_for_updates():
-    try:
-        response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
-        response.raise_for_status()
-        latest_version = response.json()["tag_name"].lstrip("v")
-        if latest_version > APP_VERSION:
-            if messagebox.askyesno("Atualização Disponível", f"Uma nova versão ({latest_version}) está disponível! Deseja baixar agora?"):
-                asset_url = response.json()["assets"][0]["browser_download_url"]
-                new_file = f"Relatório de Clientes {latest_version}.exe" 
-                with open(new_file, "wb") as f:
-                    f.write(requests.get(asset_url).content)
-                messagebox.showinfo("Atualizado", f"Nova versão baixada como '{new_file}'. Feche o app, substitua o arquivo atual por esse novo e reinicie.")
-        else:
-            print("App atualizado.")
-    except Exception as e:
-        print(f"Erro ao checar updates: {e}")
-        messagebox.showerror("Erro na Atualização", f"Ocorreu um erro ao checar atualizações: {e}")
+def check_for_updates(root):
+    import requests
+    
+    def worker():
+        try:
+            # Checa versão
+            response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            latest_version = data["tag_name"].lstrip("v")
+
+            if latest_version > APP_VERSION:
+                # Mostra diálogo na thread principal usando after()
+                def ask_user():
+                    if messagebox.askyesno("Atualização Disponível",
+                        f"Uma nova versão ({latest_version}) está disponível! Deseja baixar agora?"):
+                        asset_url = data["assets"][0]["browser_download_url"]
+                        new_file = f"Relatório de Clientes {latest_version}.exe"
+                        try:
+                            download = requests.get(asset_url, stream=True, timeout=30)
+                            with open(new_file, "wb") as f:
+                                for chunk in download.iter_content(8192):
+                                    f.write(chunk)
+                            messagebox.showinfo("Atualizado",
+                                f"Nova versão baixada como '{new_file}'. "
+                                "Feche o app, substitua o arquivo atual por esse novo e reinicie.")
+                        except Exception as e:
+                            messagebox.showerror("Erro no Download", f"Ocorreu um erro: {e}")
+                root.after(0, ask_user)  # root é sua janela Tk principal
+            else:
+                print("App atualizado.")
+
+        except Exception as e:
+            root.after(0, lambda: messagebox.showerror("Erro na Atualização",
+                                                       f"Ocorreu um erro ao checar atualizações: {e}"))
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
     # limpa tabela de PDFs
@@ -605,8 +620,8 @@ def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
     progress_var.set(0)
 
     # também limpa lista de resultados
-    from globalVar import resultados_list, arquivosLista
-    resultados_list.clear()
+    from globalVar import resultados_lista, arquivosLista
+    resultados_lista.clear()
     arquivosLista.clear()
 
     messagebox.showinfo("Limpo", "Todas as tabelas foram limpas com sucesso!")
@@ -632,12 +647,15 @@ def exportar_para_excel(tree):
         for col in colunas_numericas:
             if col in df.columns:
                 df[col] = (
-                    df[col]
-                    .astype(str)
-                    .str.replace(".", "", regex=False)
-                    .str.replace(",", ".", regex=False)
-                    .str.extract(r"([\d\.]+)", expand=False)  # pega só números
-                    .astype(float)
+                    pd.to_numeric(
+                        df[col]
+                        .astype(str)
+                        .str.replace(".", "", regex=False)  # remove separador de milhar
+                        .str.replace(",", ".", regex=False) # troca vírgula por ponto
+                        .str.extract(r"([\d\.]+)", expand=False),  # pega só números
+                        errors='coerce'  # valores inválidos viram NaN
+                    )
+                    .fillna(0.0)  # substitui NaN por 0.0 ou outro valor adequado
                 )
 
         # Selecionar local para salvar

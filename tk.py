@@ -1,11 +1,11 @@
 from utils import (
     escolher_pdf_async, adicionar_pdf, ordenar_coluna,
     cancelar_processamento, carregar_planilha_async, exportar_para_excel,
-    limpar_tabelas, check_for_updates
+    limpar_tabelas, check_for_updates, resource_path, mesclar_tabelas
 )
-from library import ttk
-import sys, os
 import customtkinter
+from tkinter import filedialog, ttk, messagebox
+import sys, os
 
 # GUI
 root = customtkinter.CTk()
@@ -22,13 +22,8 @@ root.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
 arquivos_label_var = customtkinter.StringVar(value="Nenhum arquivo carregado ainda")
 progress_var = customtkinter.IntVar(value=0)
 
-if getattr(sys, 'frozen', False):  # rodando como exe
-    base_path = sys._MEIPASS
-else:  # rodando como script
-    base_path = os.path.dirname(os.path.abspath(__file__))
-
-theme_path = os.path.join(base_path, "basedTheme.json")
-customtkinter.set_default_color_theme(theme_path)
+customtkinter.set_default_color_theme(resource_path("basedTheme.json"))
+customtkinter.set_appearance_mode("dark")  # força dark mode no windows
 
 # ----------------- Barra de progresso com botão Cancelar -----------------
 frame_progress = customtkinter.CTkFrame(root)
@@ -45,9 +40,11 @@ btn_cancelar = customtkinter.CTkButton(
     text="Cancelar",
     command=cancelar_processamento,
     fg_color="red",
-    hover_color="#a60000",
-    font=("Segoe UI", 12, "bold"),
-    text_color="white",
+    hover_color="#e66161",
+    font=("Segoe UI", 15, "bold"),
+    text_color="#FFFFFF",
+    text_color_disabled="#1a1818",
+
     state="disabled"
 )
 btn_cancelar.pack(pady=10)
@@ -109,6 +106,7 @@ style.configure(
 )
 
 # ----------------- Frame da planilha online -----------------
+
 frame_planilha = customtkinter.CTkFrame(root)
 frame_planilha.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -136,14 +134,14 @@ janela_botoes.geometry(f"250x300+{x_coordinate + window_width + 10}+{y_coordinat
 btn = customtkinter.CTkButton(
     janela_botoes,
     text="Selecionar PDF",
-    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar),
+    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var),
 )
 btn.pack(pady=5)
 
 btn_add_mais = customtkinter.CTkButton(
     janela_botoes,
     text="Adicionar mais um PDF",
-    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var),
+    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var),    
 )
 btn_add_mais.pack(pady=5)
 
@@ -171,7 +169,7 @@ btn_limpar.pack(pady=5)
 btn_mesclar_planilhas = customtkinter.CTkButton(
     janela_botoes,
     text="Mesclar planilhas",
-    #command=lambda: mesclar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var)
+    command=lambda: mesclar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var, root)
 )
 
 # ----------------- Checagem de updates + loop principal -----------------

@@ -1,6 +1,5 @@
 import os
-import sys
-from library import *
+from library import gerar_versionfile
 
 gerar_versionfile()
 
@@ -13,7 +12,8 @@ hidden_imports = [
 data_files = [
     '--add-data "credenciais.json;."',
     '--add-data "mapping.json;."',
-    '--add-data "basedTheme.json;."'
+    '--add-data "basedTheme.json;."',
+    '--add-data "C:/Users/vendas/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/site-packages/customtkinter;customtkinter/."'
 ]
 
 hidden_imports_str = " ".join(hidden_imports)

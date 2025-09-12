@@ -1,24 +1,31 @@
-from library import queue, threading, os, re, json, time, pdfplumber, logging, messagebox, difflib, filedialog, pd
+from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd
 from globalVar import arquivosLista, resultados_lista, regex_data, regex_negativo, APP_VERSION, GITHUB_REPO
 
 # Configuração de logging mais leve (somente avisos e erros)
-logging.basicConfig(level=logging.ERROR)
-logger = logging.getLogger(__name__)
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
 
-def cancelar_processamento(): 
+def set_btn_cancelar(state="disabled"):
     from tk import btn_cancelar
     
+    btn_cancelar.configure(state=state)
+
+def cancelar_processamento(): 
     cancel_event.set()
-    with progress_queue.mutex:
-        progress_queue.queue.clear()
-        btn_cancelar.configure(state="disabled")
+    while not progress_queue.empty():
+        try:
+            progress_queue.get_nowait()
+        except queue.Empty:
+            break
+    set_btn_cancelar()
+    # 🔹 Reseta barra
+    from tk import progress_var, progress_bar
+    progress_var.set(0)
+    progress_bar.stop()
+    progress_bar.config(mode="determinate")
 
 def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None, caminho=None): 
     """Roda na main thread: consome eventos vindos da thread e atualiza a UI."""
-    
-    from tk import btn_cancelar
     
     try:
         while True:
@@ -27,7 +34,7 @@ def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None,
                 progress_var.set(payload)
                 progress_bar.update_idletasks()
             elif kind == "done":
-                btn_cancelar.configure(state="disabled")
+                set_btn_cancelar()
                 if payload.get("__cancelled__"):
                     progress_var.set(0)
                     messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
@@ -42,7 +49,7 @@ def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None,
                     messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
                 return 
             elif kind == "error":
-                btn_cancelar.configure(state="disabled")
+                set_btn_cancelar()
                 messagebox.showerror("Erro", payload)
                 return
     except queue.Empty:
@@ -90,10 +97,10 @@ def _normalize_key(s: str) -> str:
     return s.strip().upper()
 
 def parse_number(num_str: str) -> float:
-    """Converte string numérica em float, suportando formatos BR e US."""
+    """Converte string numérica em float, suportando formatos BR e US, removendo R$."""
     if not num_str:
         return 0.0
-    num_str = num_str.strip()
+    num_str = str(num_str).strip().replace("R$", "").replace(" ", "")
 
     # Caso brasileiro: 79.833,85
     if "," in num_str and "." in num_str and num_str.rfind(",") > num_str.rfind("."):
@@ -101,7 +108,7 @@ def parse_number(num_str: str) -> float:
         return float(num_str)
 
     # Caso americano: 92,229.51
-    if "," in num_str and "." in num_str and num_str.rfind(".") > num_str.rfind(","):
+    if "," in num_str and "." in num_str and num_str.rfind(".") < num_str.rfind(","):
         num_str = num_str.replace(",", "")
         return float(num_str)
 
@@ -113,6 +120,7 @@ def parse_number(num_str: str) -> float:
     if "." in num_str:
         return float(num_str)
 
+    # Caso números puros
     return float(num_str)
 
 def format_number_br(num: float) -> str:
@@ -222,7 +230,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                     # 🔹 Atualiza progresso gradualmente
                     progresso = int(i * 100 / max(1, total_rows))
                     progressQueuePlanilha.put(("progress", progresso))
-                    time.sleep(0.01)
+                    time.sleep(0.02)
 
                 progressQueuePlanilha.put(("done_planilha", resultados))
 
@@ -279,7 +287,8 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
-def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar):
+def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var):
+    from tkinter import filedialog
     
     global arquivosLista, resultados_lista
     worker_thread = None
@@ -317,7 +326,7 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
             print(f"Erro na thread: {str(e)}")
             progress_queue.put(("error", str(e)))
     
-    btn_cancelar.configure(state="normal")
+    set_btn_cancelar(state="normal")
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
 
@@ -325,7 +334,7 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
     _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho)
 
 def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
-    from tk import btn_cancelar
+    from tkinter import filedialog
      
     global arquivosLista
     local_queue = queue.Queue()
@@ -356,7 +365,6 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         return
     except Exception as e:
         messagebox.showerror("Erro", f"Não foi possível abrir o PDF: {e}")
-        logger.error(f"Exceção ao abrir PDF: {str(e)}")
         return
     
     atual = arquivos_label_var.get().replace("Arquivo carregado:", "").replace("Arquivos carregados:", "").strip()
@@ -386,7 +394,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         except Exception as e:
             local_queue.put(("error", str(e)))
 
-    btn_cancelar.configure(state="normal")
+    set_btn_cancelar(state="normal")
     threading.Thread(target=worker, daemon=True).start()
 
     # começa a escutar fila
@@ -398,7 +406,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                     progress_var.set(payload)
                     progress_bar.update_idletasks()
                 elif kind == "done_add":
-                    btn_cancelar.configure(state="disabled")
+                    set_btn_cancelar()
                     if payload.get("__cancelled__"):
                         progress_var.set(0)
                         messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
@@ -415,7 +423,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                         messagebox.showinfo("Concluído", "PDF adicional processado e mesclado!")
                     return
                 elif kind == "error":
-                    btn_cancelar.configure(state="disabled")
+                    set_btn_cancelar()
                     messagebox.showerror("Erro", payload)
                     return
         except queue.Empty:
@@ -466,7 +474,6 @@ def mesclar_resultados(resultados_lista):
 
             mesclado[canon]["atendidos"]      += dados.get("atendidos", 0)
             mesclado[canon]["devolucoes"]     += dados.get("devolucoes", 0)
-            mesclado[canon]["total_clientes"] += dados.get("total_clientes", 0)
 
             tv_str = str(dados.get("total_vendas", ""))
             mesclado[canon]["total_vendas"] += parse_number(tv_str)
@@ -522,7 +529,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                                     "atendidos": 0,
                                     "devolucoes": 0,
                                     "total_clientes": 0,
-                                    "total_vendas": ""
+                                    "total_vendas": 0.0
                                 }
                         continue
 
@@ -542,7 +549,6 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                 progresso = int(i * 100 / max(1, total))
                 on_progress("progress", progresso)
             except Exception as e:
-                logger.exception(f"Erro na página {i}: {e}")
                 return {"__error__": str(e)}
 
         # Garante que o progresso chegue a 100% após o loop
@@ -627,6 +633,8 @@ def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
     messagebox.showinfo("Limpo", "Todas as tabelas foram limpas com sucesso!")
 
 def exportar_para_excel(tree):
+    from tkinter import filedialog
+    
     try:
         # Pegar os dados da Treeview
         cols = [tree.heading(col)["text"] for col in tree["columns"]]
@@ -642,21 +650,17 @@ def exportar_para_excel(tree):
         # Converter para DataFrame
         df = pd.DataFrame(dados, columns=cols)
         
-         # 🔹 Forçar colunas numéricas (se existirem)
+        # Converter colunas numéricas
         colunas_numericas = ["Atendidos", "Devoluções", "Total Final", "Total Vendas"]
         for col in colunas_numericas:
             if col in df.columns:
-                df[col] = (
-                    pd.to_numeric(
-                        df[col]
-                        .astype(str)
-                        .str.replace(".", "", regex=False)  # remove separador de milhar
-                        .str.replace(",", ".", regex=False) # troca vírgula por ponto
-                        .str.extract(r"([\d\.]+)", expand=False),  # pega só números
-                        errors='coerce'  # valores inválidos viram NaN
-                    )
-                    .fillna(0.0)  # substitui NaN por 0.0 ou outro valor adequado
-                )
+                df[col] = pd.to_numeric(
+                    df[col]
+                    .astype(str)
+                    .str.replace(".", "", regex=False)   # remove separador de milhar
+                    .str.replace(",", ".", regex=False), # vírgula -> ponto
+                    errors="coerce"
+                ).fillna(0.0)
 
         # Selecionar local para salvar
         caminho = filedialog.asksaveasfilename(
@@ -673,3 +677,113 @@ def exportar_para_excel(tree):
 
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao exportar para Excel: {e}")
+
+def mesclar_tabelas(tree, tree_planilha, progress_var, progress_bar, root):
+    """
+    Mescla os valores da planilha online (tree_planilha) na tabela de PDFs (tree).
+    Atualiza a barra de progresso durante o processo.
+    """
+
+     # 🔹 Verifica se alguma tabela está vazia
+    if not tree.get_children():
+        messagebox.showwarning("Aviso", "A tabela de PDFs está vazia. Importe pelo menos um PDF antes de mesclar.")
+        return
+    if not tree_planilha.get_children():
+        messagebox.showwarning("Aviso", "A tabela da planilha está vazia. Carregue a planilha online antes de mesclar.")
+        return
+    
+    merge_queue = queue.Queue()
+
+    # Thread worker para processamento pesado
+    def worker():
+        try:
+            # 1) Extrai dados da Treeview PDFs
+            dados_pdf = {}
+            for item in tree.get_children():
+                vals = tree.item(item)["values"]
+                vendedor = str(vals[0]).strip()
+                atendidos = int(vals[1])
+                devolucoes = int(vals[2])
+                total_clientes = int(vals[3])
+                total_vendas = parse_number(str(vals[4]) if vals[4] else "0")
+                dados_pdf[vendedor] = {
+                    "atendidos": atendidos,
+                    "devolucoes": devolucoes,
+                    "total_clientes": total_clientes,
+                    "total_vendas": total_vendas
+                }
+
+            # 2) Extrai dados da Treeview planilha
+            dados_planilha = {}
+            for idx, item in enumerate(tree_planilha.get_children(), start=1):
+                vals = tree_planilha.item(item)["values"]
+                vendedor = str(vals[0]).strip()
+                atendidos = int(vals[1])
+                total_vendas = parse_number(str(vals[2]) if vals[2] else "0")
+                dados_planilha[vendedor] = {
+                    "atendidos": atendidos,
+                    "total_vendas": total_vendas
+                }
+                # Atualiza progresso baseado na planilha
+                progresso = int(idx * 50 / max(1, len(tree_planilha.get_children())))
+                merge_queue.put(("progress", progresso))
+                time.sleep(0.01)  # suaviza animação da barra
+
+            # 3) Mescla os dados
+            total_vendedores = len(set(dados_pdf.keys()) | set(dados_planilha.keys()))
+            for idx, vendedor in enumerate(set(dados_pdf.keys()) | set(dados_planilha.keys()), start=1):
+                pdf_data = dados_pdf.get(vendedor, {"atendidos":0,"devolucoes":0,"total_clientes":0,"total_vendas":0})
+                plan_data = dados_planilha.get(vendedor, {"atendidos":0,"total_vendas":0})
+
+                merged = {
+                    "atendidos": pdf_data["atendidos"] + plan_data["atendidos"],
+                    "devolucoes": pdf_data.get("devolucoes",0),
+                    "total_clientes": (pdf_data["atendidos"] + plan_data["atendidos"]) - pdf_data.get("devolucoes",0),
+                    "total_vendas": pdf_data["total_vendas"] + plan_data["total_vendas"]
+                }
+
+                dados_pdf[vendedor] = merged
+
+                # Atualiza progresso
+                progresso = 50 + int(idx * 50 / max(1, total_vendedores))
+                merge_queue.put(("progress", progresso))
+                time.sleep(0.01)
+
+            merge_queue.put(("done", dados_pdf))
+        except Exception as e:
+            merge_queue.put(("error", str(e)))
+
+    # Inicia thread
+    threading.Thread(target=worker, daemon=True).start()
+
+    # Poll da fila
+    def poll_merge_queue():
+        try:
+            while True:
+                kind, payload = merge_queue.get_nowait()
+                if kind == "progress":
+                    progress_var.set(payload)
+                    #progress_bar.update_idletasks()
+                elif kind == "done":
+                    # Atualiza Treeview dos PDFs
+                    for item in tree.get_children():
+                        tree.delete(item)
+                    for vendedor, dados in sorted(payload.items()):
+                        tree.insert("", "end", values=(
+                            vendedor,
+                            dados["atendidos"],
+                            dados["devolucoes"],
+                            dados["total_clientes"],
+                            format_number_br(dados["total_vendas"])
+                        ))
+                    progress_var.set(100)
+                    messagebox.showinfo("Concluído", "✅ Mesclagem de tabelas finalizada!")
+                    return
+                elif kind == "error":
+                    messagebox.showerror("Erro", f"Erro na mesclagem: {payload}")
+                    return
+        except queue.Empty:
+            pass
+        root.after(10, poll_merge_queue)
+
+    poll_merge_queue()

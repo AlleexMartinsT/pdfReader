@@ -1,9 +1,15 @@
-from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd
+from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd, hashlib
 from globalVar import arquivosLista, resultados_lista, regex_data, regex_negativo, APP_VERSION, GITHUB_REPO
 
 # Configuração de logging mais leve (somente avisos e erros)
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
+_ULTIMO_MVA = None
+_ULTIMO_EH = None
+ULTIMO_HASH_MESCLAGEM = None
+ULTIMO_ESTADO_PLANILHA = {}
+
+
 
 def set_btn_cancelar(state="disabled"):
     from tk import btn_cancelar
@@ -24,38 +30,42 @@ def cancelar_processamento():
     progress_bar.stop()
     progress_bar.config(mode="determinate")
 
-def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None, caminho=None): 
-    """Roda na main thread: consome eventos vindos da thread e atualiza a UI."""
-    
+def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None, caminho=None):
+    """Consome eventos da fila em intervalos e atualiza a UI sem travar."""
     try:
-        while True:
-            kind, payload = progress_queue.get_nowait()
-            if kind == "progress":
-                progress_var.set(payload)
-                progress_bar.update_idletasks()
-            elif kind == "done":
-                set_btn_cancelar()
-                if payload.get("__cancelled__"):
-                    progress_var.set(0)
-                    messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
-                else:
-                    for item in tree.get_children():
-                        tree.delete(item)
-                    arquivosLista.clear()
-                    arquivosLista.append(caminho)
-                    arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
-                    resultados_lista.append(payload)
-                    atualizar_tree(tree)
-                    messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
-                return 
-            elif kind == "error":
-                set_btn_cancelar()
-                messagebox.showerror("Erro", payload)
-                return
+        kind, payload = progress_queue.get_nowait()
     except queue.Empty:
-        pass
-    # agendar próxima rodada de checagem
-    root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
+        # Agenda a próxima checagem em 50ms (menos carga na CPU/UI)
+        root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
+        return
+
+    if kind == "progress":
+        progress_var.set(payload)
+        progress_bar.update_idletasks()
+
+    elif kind == "done":
+        set_btn_cancelar()
+        if payload.get("__cancelled__"):
+            progress_var.set(0)
+            messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
+        else:
+            for item in tree.get_children():
+                tree.delete(item)
+            arquivosLista.clear()
+            arquivosLista.append(caminho)
+            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
+            resultados_lista.append(payload)
+            atualizar_tree(tree)
+            messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
+        return
+
+    elif kind == "error":
+        set_btn_cancelar()
+        messagebox.showerror("Erro", payload)
+        return
+
+    # Agenda nova checagem
+    root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
 
 def resource_path(relative_path): 
     import sys
@@ -152,6 +162,8 @@ def extrair_planilha_online():
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
     
+    global _ULTIMO_MVA, _ULTIMO_EH  # usar globais para comparar depois
+    
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
@@ -173,32 +185,51 @@ def extrair_planilha_online():
     colsMVA = valoresMVA[1]
     colsEH = valoresEH[1]
 
-    # 🔧 corrige duplicados
+    # corrige duplicados
     colsMVA = [f"col{i}_{c}" if colsMVA.count(c) > 1 else c for i, c in enumerate(colsMVA)]
     colsEH = [f"col{i}_{c}" if colsEH.count(c) > 1 else c for i, c in enumerate(colsEH)]
 
     dfMVA = pd.DataFrame(valoresMVA[2:], columns=colsMVA)
     dfEH = pd.DataFrame(valoresEH[2:], columns=colsEH)
 
+    # 🔎 COMPARAÇÃO com os últimos dados exportados
+    if _ULTIMO_MVA is not None and _ULTIMO_EH is not None:
+        if dfMVA.equals(_ULTIMO_MVA) and dfEH.equals(_ULTIMO_EH):
+            return None
+
+    # Atualiza os globais com os novos dados
+    _ULTIMO_MVA, _ULTIMO_EH = dfMVA.copy(), dfEH.copy()
+
     return dfMVA, dfEH
 
 def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
+    from tk import btn_mesclar_planilhas
+    
     try:
         cancel_event.clear()
         progress_var.set(0)
-
-        for item in tree_planilha.get_children():
-            tree_planilha.delete(item)
 
         def worker():
             progressQueuePlanilha.put(("ui", {"action": "start_indeterminate"}))
 
             try:
-                dfMVA, dfEH = extrair_planilha_online()
-                df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
+                resultado = extrair_planilha_online()
+                if resultado is None:
+                    progress_bar.stop()
+                    progress_bar.config(mode="determinate")
+                    progress_var.set(0)
+                    return messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado")
+                else:
+                    for item in tree_planilha.get_children():
+                        tree_planilha.delete(item)
+                    if btn_mesclar_planilhas == "disabled":
+                        btn_mesclar_planilhas.configure(state="normal")
+                    
+                    dfMVA, dfEH = resultado
+                    df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
 
-                total_rows = len(df_total)
-                resultados = []
+                    total_rows = len(df_total)
+                    resultados = []
 
                 for i, (_, row) in enumerate(df_total.iterrows(), start=1):
                     # 🔹 Verifica se foi cancelado
@@ -289,9 +320,13 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
 
 def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var):
     from tkinter import filedialog
+    from tk import btn_add_mais
     
     global arquivosLista, resultados_lista
     worker_thread = None
+    
+    if btn_add_mais == "disabled":
+        btn_add_mais.configure(state="normal")
     
     if not isinstance(arquivosLista, list):
         arquivosLista = []
@@ -613,20 +648,33 @@ def check_for_updates(root):
     threading.Thread(target=worker, daemon=True).start()
 
 def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
-    # limpa tabela de PDFs
+    
+    global _ULTIMO_EH, _ULTIMO_MVA, ULTIMO_ESTADO_PLANILHA, ULTIMO_HASH_MESCLAGEM
+    
+    # limpa as tabelas
     for item in tree.get_children():
         tree.delete(item)
-
-    # limpa tabela da planilha
     for item in tree_planilha.get_children():
         tree_planilha.delete(item)
 
-    # reseta variáveis
+    # reseta variáveis da UI
     arquivos_label_var.set("Nenhum arquivo carregado ainda")
     progress_var.set(0)
 
+    # 🧹 Limpa histórico da mesclagem
+    _ULTIMO_EH = None      
+    _ULTIMO_MVA = None
+    ULTIMO_HASH_MESCLAGEM = None
+    ULTIMO_ESTADO_PLANILHA = {}    
+    
     # também limpa lista de resultados
     from globalVar import resultados_lista, arquivosLista
+    from tk import btn_add_mais, btn_mesclar_planilhas, btn
+    
+    btn_mesclar_planilhas.configure(state="normal")
+    btn_add_mais.configure(state="normal")
+    btn.configure(state="normal")
+    
     resultados_lista.clear()
     arquivosLista.clear()
 
@@ -678,12 +726,16 @@ def exportar_para_excel(tree):
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao exportar para Excel: {e}")
 
-def mesclar_tabelas(tree, tree_planilha, progress_var, progress_bar, root):
+def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, tree_planilha, ):
     """
     Mescla os valores da planilha online (tree_planilha) na tabela de PDFs (tree).
     Atualiza a barra de progresso durante o processo.
     """
-
+    from tk import btn_mesclar_planilhas, btn_add_mais, btn
+    global ULTIMO_HASH_MESCLAGEM, ULTIMO_ESTADO_PLANILHA
+    
+    btn_mesclar_planilhas.configure(state="enabled")
+    
      # 🔹 Verifica se alguma tabela está vazia
     if not tree.get_children():
         messagebox.showwarning("Aviso", "A tabela de PDFs está vazia. Importe pelo menos um PDF antes de mesclar.")
@@ -691,6 +743,24 @@ def mesclar_tabelas(tree, tree_planilha, progress_var, progress_bar, root):
     if not tree_planilha.get_children():
         messagebox.showwarning("Aviso", "A tabela da planilha está vazia. Carregue a planilha online antes de mesclar.")
         return
+    
+    dados_pdf_snapshot = [tree.item(i)["values"] for i in tree.get_children()]
+    dados_planilha_snapshot = [tree_planilha.item(i)["values"] for i in tree_planilha.get_children()]
+
+    # Serializa e gera hash único
+    snapshot_str = json.dumps({
+        "pdf": dados_pdf_snapshot,
+        "planilha": dados_planilha_snapshot
+    }, sort_keys=True)
+
+    novo_hash = hashlib.md5(snapshot_str.encode()).hexdigest()
+
+    if ULTIMO_HASH_MESCLAGEM == novo_hash:
+        messagebox.showinfo("Aviso", "⚠️ Esses dados já foram mesclados. Nenhuma alteração detectada.")
+        return
+
+    # Se for novo, salva para futuras comparações
+    ULTIMO_HASH_MESCLAGEM = novo_hash
     
     merge_queue = queue.Queue()
 
@@ -720,14 +790,28 @@ def mesclar_tabelas(tree, tree_planilha, progress_var, progress_bar, root):
                 vendedor = str(vals[0]).strip()
                 atendidos = int(vals[1])
                 total_vendas = parse_number(str(vals[2]) if vals[2] else "0")
+
+                # 🔎 Verifica se este vendedor já existia e calcula apenas o incremento
+                ultimo = ULTIMO_ESTADO_PLANILHA.get(vendedor, {"atendidos":0, "total_vendas":0})
+                delta_atendidos = max(0, atendidos - ultimo["atendidos"])
+                delta_vendas = max(0, total_vendas - ultimo["total_vendas"])
+
+                # Se nada mudou, pula para evitar soma duplicada
+                if delta_atendidos == 0 and delta_vendas == 0:
+                    continue
+                
                 dados_planilha[vendedor] = {
-                    "atendidos": atendidos,
-                    "total_vendas": total_vendas
+                    "atendidos": delta_atendidos,
+                    "total_vendas": delta_vendas
                 }
-                # Atualiza progresso baseado na planilha
+
+                # Atualiza o snapshot
+                ULTIMO_ESTADO_PLANILHA[vendedor] = {"atendidos": atendidos, "total_vendas": total_vendas}
+
                 progresso = int(idx * 50 / max(1, len(tree_planilha.get_children())))
                 merge_queue.put(("progress", progresso))
-                time.sleep(0.01)  # suaviza animação da barra
+                time.sleep(0.01)
+
 
             # 3) Mescla os dados
             total_vendedores = len(set(dados_pdf.keys()) | set(dados_planilha.keys()))
@@ -763,8 +847,14 @@ def mesclar_tabelas(tree, tree_planilha, progress_var, progress_bar, root):
                 kind, payload = merge_queue.get_nowait()
                 if kind == "progress":
                     progress_var.set(payload)
-                    #progress_bar.update_idletasks()
+                    progress_bar.update_idletasks()
                 elif kind == "done":
+                    btn_mesclar_planilhas.configure(state="disabled")
+                    btn_add_mais.configure(state="disabled")
+                    btn.configure(state="disabled")
+                    if payload.get("__cancelled__"):
+                        progress_var.set(0)
+                        messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
                     # Atualiza Treeview dos PDFs
                     for item in tree.get_children():
                         tree.delete(item)

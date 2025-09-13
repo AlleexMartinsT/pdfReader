@@ -134,14 +134,14 @@ janela_botoes.geometry(f"250x300+{x_coordinate + window_width + 10}+{y_coordinat
 btn = customtkinter.CTkButton(
     janela_botoes,
     text="Selecionar PDF",
-    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var),
+    command=lambda: escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var), text_color_disabled="#D92525" 
 )
 btn.pack(pady=5)
 
 btn_add_mais = customtkinter.CTkButton(
     janela_botoes,
     text="Adicionar mais um PDF",
-    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var),    
+    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var), text_color_disabled="#D92525"   
 )
 btn_add_mais.pack(pady=5)
 
@@ -169,9 +169,9 @@ btn_limpar.pack(pady=5)
 btn_mesclar_planilhas = customtkinter.CTkButton(
     janela_botoes,
     text="Mesclar planilhas",
-    command=lambda: mesclar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var, root)
+    command=lambda: mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, tree_planilha), text_color_disabled="#D92525"
 )
-
+btn_mesclar_planilhas.pack(pady=5)
 # ----------------- Checagem de updates + loop principal -----------------
 check_for_updates(root)
 root.mainloop()

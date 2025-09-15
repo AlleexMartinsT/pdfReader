@@ -12,6 +12,7 @@ hidden_imports = [
 data_files = [
     '--add-data "credenciais.json;."',
     '--add-data "mapping.json;."',
+    '--add-data "icone.ico;."',
     '--add-data "basedTheme.json;."',
     '--add-data "C:/Users/vendas/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/site-packages/customtkinter;customtkinter/."'
 ]

@@ -1,15 +1,14 @@
 from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd, hashlib
-from globalVar import arquivosLista, resultados_lista, regex_data, regex_negativo, APP_VERSION, GITHUB_REPO
+from globalVar import (
+    arquivosLista, resultados_lista, regex_data, regex_negativo, 
+    APP_VERSION, GITHUB_REPO, _ULTIMO_EH, _ULTIMO_MVA , ULTIMO_HASH_MESCLAGEM,
+    PERIODO_VENDAS
+) 
 
 # Configuração de logging mais leve (somente avisos e erros)
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
-_ULTIMO_MVA = None
-_ULTIMO_EH = None
-ULTIMO_HASH_MESCLAGEM = None
 ULTIMO_ESTADO_PLANILHA = {}
-
-
 
 def set_btn_cancelar(state="disabled"):
     from tk import btn_cancelar
@@ -32,11 +31,12 @@ def cancelar_processamento():
 
 def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None, caminho=None):
     """Consome eventos da fila em intervalos e atualiza a UI sem travar."""
+
     try:
         kind, payload = progress_queue.get_nowait()
     except queue.Empty:
         # Agenda a próxima checagem em 50ms (menos carga na CPU/UI)
-        root.after(10, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
+        root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
         return
 
     if kind == "progress":
@@ -49,22 +49,37 @@ def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None,
             progress_var.set(0)
             messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
         else:
-            for item in tree.get_children():
-                tree.delete(item)
-            arquivosLista.clear()
+            # payload agora é {"resultados": resultados, "origem": origem, "caminho": caminho}
+            resultados = payload.get("resultados")
+            origem = payload.get("origem")
+            caminho = payload.get("caminho")
+
+            # garante que resultados_por_origem exista no globalVar
+            try:
+                from globalVar import resultados_por_origem
+            except Exception:
+                resultados_por_origem = {"MVA": [], "EH": []}
+
+            # armazena por origem
+            if origem not in resultados_por_origem:
+                resultados_por_origem[origem] = []
+            resultados_por_origem[origem].append(resultados)
+
+            # armazena lista global e atualiza a tree
             arquivosLista.append(caminho)
-            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
-            resultados_lista.append(payload)
+            resultados_lista.append(resultados)
+
+            # atualiza a interface (label e tree)
+            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)} ({origem})")
             atualizar_tree(tree)
-            messagebox.showinfo("Concluído", "Processamento finalizado com sucesso!")
-        return
+            messagebox.showinfo("Concluído", f"Processamento finalizado ({origem})!")
 
     elif kind == "error":
         set_btn_cancelar()
         messagebox.showerror("Erro", payload)
         return
 
-    # Agenda nova checagem
+    # Sempre agenda a próxima checagem, exceto se houve erro (onde damos return acima)
     root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
 
 def resource_path(relative_path): 
@@ -318,37 +333,25 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
-def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var):
-    from tkinter import filedialog
-    from tk import btn_add_mais
-    
+def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar, caminho, origem):
+    """
+    Inicia processamento do PDF já com o caminho e a origem (MVA/EH) escolhidos.
+    Não pergunta nada ao usuário — a escolha já veio do tk.py.
+    """
     global arquivosLista, resultados_lista
-    worker_thread = None
-    
-    if btn_add_mais == "disabled":
-        btn_add_mais.configure(state="normal")
-    
-    if not isinstance(arquivosLista, list):
-        arquivosLista = []
-    if arquivosLista and len(arquivosLista) > 1: # Para acaso tiver usado o botão "Adicionar PDF", então ele vai limpar tudo.
-        arquivosLista.clear()
-            
-        
-    caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
-    progress_var.set(0)
-    
-    if caminho:
-        if caminho in arquivosLista:
-            messagebox.showerror("Erro", "Arquivo já importado!")
-            return       
-    else:
-        return
-             
-    # Zera estado, incluindo a lista de resultados
-    cancel_event.clear()
-    resultados_lista = []
 
-    # Dispara worker
+    if not caminho:
+        return
+
+    # evita duplicados
+    if caminho in arquivosLista:
+        messagebox.showerror("Erro", "Arquivo já importado!")
+        return
+
+    cancel_event.clear()
+    progress_var.set(0)
+
+    # worker: roda processar_pdf_sem_ui (sem UI) e envia resultado para a fila com origem
     def worker():
         try:
             resultados = processar_pdf_sem_ui(
@@ -356,33 +359,34 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
                 on_progress=lambda kind, payload: progress_queue.put((kind, payload)),
                 cancel_event=cancel_event
             )
-            progress_queue.put(("done", resultados))
+            # empacota resultado com origem e caminho
+            progress_queue.put(("done", {"resultados": resultados, "origem": origem, "caminho": caminho}))
         except Exception as e:
-            print(f"Erro na thread: {str(e)}")
+
             progress_queue.put(("error", str(e)))
-    
-    set_btn_cancelar(state="normal")
+
+    # habilita botão cancelar (na main thread via chamada)
+    btn_cancelar.configure(state="normal")
+
+    # inicia thread de processamento
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
 
-    # Começa a escutar a fila na main thread
-    _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho)
+    # inicializa o polling (main thread)
+    _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var)
 
 def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     from tkinter import filedialog
-     
-    global arquivosLista
+    
+    global arquivosLista, resultados_lista
     local_queue = queue.Queue()
     
-    # Checa se algum PDF ja foi importado antes
-    
+    # Se nenhum PDF foi carregado ainda, obriga usar "Escolher PDF" primeiro
     if not resultados_lista or not arquivosLista:
-        messagebox.showwarning("Aviso", "Selecione o primeiro PDF antes de adicionar outro.")
+        messagebox.showwarning("Aviso", "Selecione o primeiro PDF (com origem definida) antes de adicionar outro.")
         return
-        
+
     caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
-    progress_var.set(0)
-    
     if not caminho:
         return
     
@@ -395,29 +399,30 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
             if pdf.metadata.get("encrypted", False):
                 messagebox.showerror("Erro", "Este PDF está protegido por senha.")
                 return
-    except FileNotFoundError as e:
-        messagebox.showerror("Erro", f"Arquivo não encontrado: {e}")
-        return
     except Exception as e:
         messagebox.showerror("Erro", f"Não foi possível abrir o PDF: {e}")
         return
-    
-    atual = arquivos_label_var.get().replace("Arquivo carregado:", "").replace("Arquivos carregados:", "").strip()
-    
-    # Reset progresso
+
+    # --- Determina origem automaticamente ---
+    try:
+        from globalVar import resultados_por_origem
+    except Exception:
+        resultados_por_origem = {"MVA": [], "EH": []}
+
+    if resultados_por_origem["MVA"]:
+        origem = "EH"
+    elif resultados_por_origem["EH"]:
+        origem = "MVA"
+    else:
+        origem = "MVA"
+
+    # Atualiza o label imediatamente com a origem atribuída
+    arquivos_label_var.set(
+        f"Carregando: {os.path.basename(caminho)} ({origem})"
+    )
     cancel_event.clear()
+    progress_var.set(0)
 
-    def atualizar_label_arquivos(arquivos_label_var):
-        """Atualiza o label baseado em arquivosLista."""
-        if not arquivosLista:
-            arquivos_label_var.set("Nenhum arquivo carregado ainda")
-        elif len(arquivosLista) == 1:
-            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(arquivosLista[0])}")
-        else:
-            nomes = ", ".join(os.path.basename(p) for p in arquivosLista)
-            arquivos_label_var.set(f"Arquivos carregados: {nomes}")
-
-    # Thread worker
     def worker():
         try:
             res = processar_pdf_sem_ui(
@@ -425,14 +430,14 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                 on_progress=lambda kind, payload: local_queue.put((kind, payload)),
                 cancel_event=cancel_event
             )
-            local_queue.put(("done_add", res))
+            # embala já com a origem
+            local_queue.put(("done_add", {"resultados": res, "origem": origem, "caminho": caminho}))
         except Exception as e:
             local_queue.put(("error", str(e)))
 
     set_btn_cancelar(state="normal")
     threading.Thread(target=worker, daemon=True).start()
 
-    # começa a escutar fila
     def poll_queue_add():
         try:
             while True:
@@ -442,21 +447,41 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                     progress_bar.update_idletasks()
                 elif kind == "done_add":
                     set_btn_cancelar()
-                    if payload.get("__cancelled__"):
+                    resultados = payload["resultados"]
+                    origem = payload["origem"]
+                    caminho = payload["caminho"]
+
+                    if resultados.get("__cancelled__"):
                         progress_var.set(0)
                         messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
-                    elif payload.get("__empty__"):
+                    elif resultados.get("__empty__"):
                         messagebox.showwarning("Aviso", "Nenhum dado foi encontrado neste PDF.")
                     else:
-                        if atual and atual != "Nenhum arquivo carregado ainda":
-                            arquivos_label_var.set(f"Arquivos carregados: {atual}, {os.path.basename(caminho)}")
-                        else:
-                            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)}")
+                        # Armazena os dados
                         arquivosLista.append(caminho)
-                        resultados_lista.append(payload)
+                        resultados_lista.append(resultados)
+                        resultados_por_origem[origem].append((caminho, resultados))  # salva também o caminho para referência
+
+                        # 🔹 Monta o texto do label com todos os arquivos e origens
+                        partes = []
+                        for caminho_salvo in arquivosLista:
+                            nome = os.path.basename(caminho_salvo)
+                            origem_arquivo = "?"
+                            for org, lista in resultados_por_origem.items():
+                                if any(c == caminho_salvo or (isinstance(c, tuple) and c[0] == caminho_salvo) for c in lista):
+                                    origem_arquivo = org
+                                    break
+                            partes.append(f"{nome} ({origem_arquivo})")
+                        if len(partes) == 1:
+                            arquivos_label_var.set(f"Arquivo carregado: {partes[0]}")
+                        else:
+                            arquivos_label_var.set("Arquivos carregados: " + ", ".join(partes))
+
+
                         atualizar_tree(tree)
-                        messagebox.showinfo("Concluído", "PDF adicional processado e mesclado!")
+                        messagebox.showinfo("Concluído", f"PDF adicional processado e atribuído a {origem}!")
                     return
+
                 elif kind == "error":
                     set_btn_cancelar()
                     messagebox.showerror("Erro", payload)
@@ -466,7 +491,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         root.after(10, poll_queue_add)
 
     poll_queue_add()
-    
+  
 def atualizar_tree(tree):
     for item in tree.get_children():
         tree.delete(item)
@@ -545,7 +570,6 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
         for i, pagina in enumerate(pdf.pages, start=1):
             if cancel_event.is_set():
                 return {"__cancelled__": True}
-
             try:
                 texto = pagina.extract_text() or ""
                 for linha in texto.splitlines():
@@ -590,6 +614,9 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
         fechar_vendedor()
     if not resultados:
         return {"__empty__": True}
+    periodo = analisar_periodo_vendas(caminho_pdf)
+    if periodo:
+        print("Período de vendas:", periodo)
     return resultados
 
 def ordenar_coluna(tree, col, reverse):
@@ -679,52 +706,92 @@ def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
     arquivosLista.clear()
 
     messagebox.showinfo("Limpo", "Todas as tabelas foram limpas com sucesso!")
-
-def exportar_para_excel(tree):
+            
+def _exportar_excel(tree):
     from tkinter import filedialog
     
-    try:
-        # Pegar os dados da Treeview
-        cols = [tree.heading(col)["text"] for col in tree["columns"]]
-        dados = []
-        for item in tree.get_children():
-            valores = tree.item(item)["values"]
-            dados.append(valores)
+    # Extrai os dados
+    cols = [tree.heading(col)["text"] for col in tree["columns"]]
+    dados = [tree.item(item)["values"] for item in tree.get_children()]
 
-        if not dados:
-            messagebox.showwarning("Aviso", "Não há dados para exportar.")
-            return
+    if not dados:
+        messagebox.showwarning("Aviso", "Não há dados para exportar.")
+        return
 
-        # Converter para DataFrame
-        df = pd.DataFrame(dados, columns=cols)
-        
-        # Converter colunas numéricas
-        colunas_numericas = ["Atendidos", "Devoluções", "Total Final", "Total Vendas"]
-        for col in colunas_numericas:
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col]
-                    .astype(str)
-                    .str.replace(".", "", regex=False)   # remove separador de milhar
-                    .str.replace(",", ".", regex=False), # vírgula -> ponto
-                    errors="coerce"
-                ).fillna(0.0)
+    df = pd.DataFrame(dados, columns=cols)
 
-        # Selecionar local para salvar
-        caminho = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Arquivo Excel", "*.xlsx")],
-            title="Salvar relatório"
-        )
-        if not caminho:
-            return
+    # Converter colunas numéricas
+    colunas_numericas = ["Atendidos", "Devoluções", "Total Final", "Total Vendas"]
+    for col in colunas_numericas:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str)
+                .str.replace(".", "", regex=False)
+                .str.replace(",", ".", regex=False),
+                errors="coerce"
+            ).fillna(0.0)
 
-        # Salvar em Excel
-        df.to_excel(caminho, index=False, engine="openpyxl")
-        messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
+    caminho = filedialog.asksaveasfilename(
+        defaultextension=".xlsx",
+        filetypes=[("Arquivo Excel", "*.xlsx")],
+        title="Salvar relatório"
+    )
+    
+    if not caminho:
+        return
+    
+    df.to_excel(caminho, index=False, engine="openpyxl")
+    
+    messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
-    except Exception as e:
-        messagebox.showerror("Erro", f"Erro ao exportar para Excel: {e}")
+def _exportar_pdf(tree):
+    
+    from tkinter import filedialog
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    
+    # Extrai os dados
+    cols = [tree.heading(col)["text"] for col in tree["columns"]]
+    dados = [tree.item(item)["values"] for item in tree.get_children()]
+
+    if not dados:
+        messagebox.showwarning("Aviso", "Não há dados para exportar.")
+        return
+
+    caminho = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("Arquivo PDF", "*.pdf")],
+        title="Salvar relatório PDF"
+    )
+    if not caminho:
+        return
+
+    # Criar PDF simples
+    c = canvas.Canvas(caminho, pagesize=A4)
+    largura, altura = A4
+    y = altura - 50
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Relatório de Vendas")
+    y -= 30
+
+    # Cabeçalho
+    c.setFont("Helvetica-Bold", 10)
+    for i, col in enumerate(cols):
+        c.drawString(50 + i * 120, y, col)
+    y -= 20
+
+    # Dados
+    c.setFont("Helvetica", 9)
+    for row in dados:
+        for i, valor in enumerate(row):
+            c.drawString(50 + i * 120, y, str(valor))
+        y -= 20
+        if y < 50:
+            c.showPage()
+            y = altura - 50
+
+    c.save()
+    messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
 def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, tree_planilha, ):
     """
@@ -877,3 +944,40 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, 
         root.after(10, poll_merge_queue)
 
     poll_merge_queue()
+
+def analisar_periodo_vendas(caminho_pdf):
+    """
+    Analisa as datas de vendas em um PDF e retorna o período de vendas.
+    """
+    
+    from datetime import datetime
+    global PERIODO_VENDAS
+    datas = []
+
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            for pagina in pdf.pages:
+                texto = pagina.extract_text() or ""
+                for linha in texto.splitlines():
+                    # Procura datas com regex_data (já importado do globalVar)
+                    if regex_data.match(linha):
+                        data_str = regex_data.match(linha).group()
+                        try:
+                            data = datetime.strptime(data_str, "%d/%m/%Y")
+                            datas.append(data)
+                        except ValueError:
+                            pass
+
+        if not datas:
+            PERIODO_VENDAS = None
+            return None
+
+        primeira = min(datas)
+        ultima = max(datas)
+        PERIODO_VENDAS = f"{primeira.strftime('%d/%m/%Y')} - {ultima.strftime('%d/%m/%Y')}"
+        return PERIODO_VENDAS
+
+    except Exception as e:
+        print(f"Erro ao analisar período de vendas: {e}")
+        PERIODO_VENDAS = None
+        return None

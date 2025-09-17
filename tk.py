@@ -1,8 +1,8 @@
 from utils import (
-    escolher_pdf_async, adicionar_pdf, ordenar_coluna,
-    cancelar_processamento, carregar_planilha_async,
+    source_pdf_async, adicionar_pdf, ordenar_coluna,
+    process_cancel, carregar_planilha_async,
     limpar_tabelas, check_for_updates, resource_path, mesclar_tabelas,
-    _exportar_pdf, _exportar_excel
+    _pdf_export, _excel_export, criar_etiquetas
 )
 import customtkinter
 from tkinter import filedialog, ttk, messagebox
@@ -20,7 +20,7 @@ x_coordinate = (screen_width - window_width) // 2
 y_coordinate = (screen_height - window_height) // 2
 root.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
 
-arquivos_label_var = customtkinter.StringVar(value="Nenhum arquivo carregado ainda")
+label_files_var = customtkinter.StringVar(value="Nenhum arquivo carregado ainda")
 progress_var = customtkinter.IntVar(value=0)
 
 customtkinter.set_default_color_theme(resource_path("basedTheme.json"))
@@ -30,7 +30,7 @@ if hasattr(sys, "_MEIPASS"):
     # Quando empacotado, o ícone está na pasta temporária do PyInstaller
     icon_path = os.path.join(sys._MEIPASS, "icone.ico")
 else:
-    icon_path = "icone.ico"  # Caminho durante o desenvolvimento
+    icon_path = "icone.ico"  # path durante o desenvolvimento
     
 root.iconbitmap(icon_path)
 
@@ -44,10 +44,10 @@ progress_bar = ttk.Progressbar(
 progress_var.set(0)
 progress_bar.grid(padx=10, pady=5)
 
-btn_cancelar = customtkinter.CTkButton(
+btn_cancel = customtkinter.CTkButton(
     root,
     text="Cancelar",
-    command=cancelar_processamento,
+    command=process_cancel,
     fg_color="red",
     hover_color="#e66161",
     font=("Segoe UI", 15, "bold"),
@@ -56,22 +56,22 @@ btn_cancelar = customtkinter.CTkButton(
 
     state="disabled"
 )
-btn_cancelar.pack(pady=10)
+btn_cancel.pack(pady=10)
 
 # ----------------- Frame principal com tabela -----------------
-frame_tabela = customtkinter.CTkFrame(root)
-frame_tabela.pack(fill="both", expand=True, padx=10, pady=10)
+frame_table = customtkinter.CTkFrame(root)
+frame_table.pack(fill="both", expand=True, padx=10, pady=10)
 
-label_arquivos = customtkinter.CTkLabel(
-    frame_tabela,
-    textvariable=arquivos_label_var,
+files_label = customtkinter.CTkLabel(
+    frame_table,
+    textvariable=label_files_var,
     font=("Segoe UI", 13, "italic"),
     text_color="white"
 )
-label_arquivos.pack(anchor="w", padx=5, pady=(0, 5))
+files_label.pack(anchor="w", padx=5, pady=(0, 5))
 
 cols = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
-tree = ttk.Treeview(frame_tabela, columns=cols, show="headings", height=10,)
+tree = ttk.Treeview(frame_table, columns=cols, show="headings", height=10,)
 
 for col in cols:
     tree.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree, _col, False))
@@ -116,120 +116,135 @@ style.configure(
 
 # ----------------- Frame da planilha online -----------------
 
-frame_planilha = customtkinter.CTkFrame(root)
-frame_planilha.pack(fill="both", expand=True, padx=10, pady=5)
+frame_table = customtkinter.CTkFrame(root)
+frame_table.pack(fill="both", expand=True, padx=10, pady=5)
 
-label_planilha = customtkinter.CTkLabel(
-    frame_planilha,
+spreadsheet_label = customtkinter.CTkLabel(
+    frame_table,
     text="Planilha Online (MVA + EH)",
     font=("Segoe UI", 13, "italic"),
     text_color="white"
 )
-label_planilha.pack(anchor="center", padx=3, pady=(0, 5))
+spreadsheet_label.pack(anchor="center", padx=3, pady=(0, 5))
 
-cols_planilha = ("Vendedor", "Clientes Atendidos", "Valor Total")
-tree_planilha = ttk.Treeview(frame_planilha, columns=cols_planilha, show="headings", height=5)
+cols_spreadsheet = ("Vendedor", "Clientes Atendidos", "Valor Total")
+tree_spreadsheet = ttk.Treeview(frame_table, columns=cols_spreadsheet, show="headings", height=5)
 
-for col in cols_planilha:
-    tree_planilha.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree_planilha, _col, False))
-    tree_planilha.column(col, anchor="center", width=150, minwidth=100)
+for col in cols_spreadsheet:
+    tree_spreadsheet.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree_spreadsheet, _col, False))
+    tree_spreadsheet.column(col, anchor="center", width=150, minwidth=100)
 
-tree_planilha.pack(fill="y", expand=False)
+tree_spreadsheet.pack(fill="y", expand=False)
 
-# --- Função para escolher arquivo e origem antes do processamento ---
-def selecionar_pdf_flow():
+# --- Função para source arquivo e origem antes do processamento ---
+
+def pdf_select_flow():
     # 1) Escolhe arquivo
-    caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
-    if not caminho:
+    path = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
+    if not path:
         return
 
-    # 2) Janela modal para escolher origem (MVA ou EH) ANTES de iniciar o processamento
-    escolha = {"origem": None}
-    janela_origem = customtkinter.CTkToplevel(root)
-    janela_origem.title("Origem do PDF")
-    janela_origem.transient(root)
-    janela_origem.grab_set()  # modal
+    # 2) Janela modal para source origem (MVA ou EH) ANTES de iniciar o processamento
+    choice = {"origem": None}
+    source_window = customtkinter.CTkToplevel(root)
+    source_window.title("Origem do PDF")
+    source_window.transient(root)
+    source_window.grab_set()  # modal
     
     # centraliza a janela modal
     width, height = 300, 140
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     x = (sw - width) // 2
     y = (sh - height) // 2
-    janela_origem.geometry(f"{width}x{height}+{x}+{y}")
+    source_window.geometry(f"{width}x{height}+{x}+{y}")
 
-    customtkinter.CTkLabel(janela_origem, text="Este PDF pertence a qual empresa?").pack(pady=(12,6))
+    customtkinter.CTkLabel(source_window, text="Este PDF pertence a qual empresa?").pack(pady=(12,6))
 
-    def escolher(e):
-        escolha["origem"] = e
-        janela_origem.destroy()
+    def source(e):
+        choice["origem"] = e
+        source_window.destroy()
 
-    btn_mva_modal = customtkinter.CTkButton(janela_origem, text="MVA", command=lambda: escolher("MVA"))
+    btn_mva_modal = customtkinter.CTkButton(source_window, text="MVA", command=lambda: source("MVA"))
     btn_mva_modal.pack(pady=6, padx=20, fill="x")
-    btn_eh_modal = customtkinter.CTkButton(janela_origem, text="EH", command=lambda: escolher("EH"), text_color="#F2F2F2", fg_color='#1145AB', hover_color='#4A6FBA')
+    btn_eh_modal = customtkinter.CTkButton(source_window, text="EH", command=lambda: source("EH"), text_color="#F2F2F2", fg_color='#1145AB', hover_color='#4A6FBA')
     btn_eh_modal.pack(pady=6, padx=20, fill="x")
 
-    janela_origem.wait_window()  # espera o usuário escolher
+    source_window.wait_window()  # espera o usuário source
 
-    origem = escolha["origem"]
+    origem = choice["origem"]
     if not origem:
         return
 
-    escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar, caminho, origem)
+    source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, btn_cancel, path, origem)
 
 # ----------------- Janela lateral de botões -----------------
-janela_botoes = customtkinter.CTkToplevel(root)
-janela_botoes.title("Opções")
-janela_botoes.geometry(f"250x300+{x_coordinate + window_width + 10}+{y_coordinate}")
-janela_botoes.iconbitmap(icon_path)
+btn_window = customtkinter.CTkToplevel(root)
+btn_window.title("Opções")
+btn_window.geometry(f"250x300+{x_coordinate + window_width + 10}+{y_coordinate}")
+btn_window.iconbitmap(icon_path)
 
 btn = customtkinter.CTkButton(
-    janela_botoes,
+    btn_window,
     text="Selecionar PDF",
-    command=selecionar_pdf_flow,  # <--- aqui
+    command=pdf_select_flow,  # <--- aqui
     text_color_disabled="#D92525"
 )
 
 btn.pack(pady=5)
 
 btn_add_mais = customtkinter.CTkButton(
-    janela_botoes,
+    btn_window,
     text="Adicionar mais um PDF",
-    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var), text_color_disabled="#D92525"   
+    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var), text_color_disabled="#D92525"   
 )
 btn_add_mais.pack(pady=5)
 
-btn_planilha = customtkinter.CTkButton(
-    janela_botoes,
+btn_spreadsheet = customtkinter.CTkButton(
+    btn_window,
     text="Extrair dados da planilha online",
-    command=lambda: carregar_planilha_async(tree_planilha, progress_var, progress_bar, root),
+    command=lambda: carregar_planilha_async(tree_spreadsheet, progress_var, progress_bar, root),
 )
-btn_planilha.pack(pady=5)
+btn_spreadsheet.pack(pady=5)
 
-btn_exportar = customtkinter.CTkButton(
-    janela_botoes,
+btn_export = customtkinter.CTkButton(
+    btn_window,
     text="Exportar",
-    command=lambda: exportar_dados(tree),
+    command=lambda: data_export(tree),
 )
-btn_exportar.pack(pady=5)
+btn_export.pack(pady=5)
 
-btn_limpar = customtkinter.CTkButton(
-    janela_botoes,
+btn_clear = customtkinter.CTkButton(
+    btn_window,
     text="Limpar Tabelas",
-    command=lambda: limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var),
+    command=lambda: limpar_tabelas(tree, tree_spreadsheet, label_files_var, progress_var),
 )
-btn_limpar.pack(pady=5)
+btn_clear.pack(pady=5)
 
-btn_mesclar_planilhas = customtkinter.CTkButton(
-    janela_botoes,
+btn_merge_spreadsheet = customtkinter.CTkButton(
+    btn_window,
     text="Mesclar planilhas",
-    command=lambda: mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, tree_planilha), text_color_disabled="#D92525"
+    command=lambda: mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tree_spreadsheet), text_color_disabled="#D92525"
 )
-btn_mesclar_planilhas.pack(pady=5)
+btn_merge_spreadsheet.pack(pady=5)
 
+btn_tag = customtkinter.CTkButton(
+    btn_window,
+    text="Criar Etiquetas",
+    command=lambda: criar_etiquetas(),
+    state="disabled",
+    hover_color="#97d8a6",
+    fg_color="#44cc64",
+)
+
+btn_tag.pack(pady=5)
+
+if str(btn_tag.cget("state")) == "disabled":
+    btn_tag.configure(fg_color="#EE9919")
+    
 # ----------------------- Janela de Exportação ---------------------------
-def exportar_dados(tree):
-    janela_export = customtkinter.CTkToplevel(root)
-    janela_export.title("Exportar")
+def data_export(tree):
+    window_export = customtkinter.CTkToplevel(root)
+    window_export.title("Exportar")
 
     # Dimensões desejadas da janela
     export_width = 250
@@ -243,25 +258,25 @@ def exportar_dados(tree):
     x_coordinate = (screen_width - export_width) // 2
     y_coordinate = (screen_height - export_height) // 2
 
-    janela_export.geometry(f"{export_width}x{export_height}+{x_coordinate}+{y_coordinate}")
+    window_export.geometry(f"{export_width}x{export_height}+{x_coordinate}+{y_coordinate}")
 
-    def exportar_excel():
+    def excel_export():
             try:
-                _exportar_excel(tree)
-                janela_export.destroy()
+                _excel_export(tree)
+                window_export.destroy()
             except Exception as e:
                 messagebox.showerror("Erro", f"Erro ao exportar Excel: {e}")
 
-    def exportar_pdf():
+    def pdf_export():
             try:
-                _exportar_pdf(tree)
-                janela_export.destroy()
+                _pdf_export(tree)
+                window_export.destroy()
             except Exception as e:
                 messagebox.showerror("Erro", f"Erro ao exportar PDF: {e}")
                 
-    customtkinter.CTkLabel(janela_export, text="Escolha o formato para exportar:").pack(pady=10)
-    customtkinter.CTkButton(janela_export, text="Excel", command=exportar_excel).pack(pady=5)
-    customtkinter.CTkButton(janela_export, text="PDF", command=exportar_pdf).pack(pady=5)
+    customtkinter.CTkLabel(window_export, text="Escolha o formato para exportar:").pack(pady=10)
+    customtkinter.CTkButton(window_export, text="Excel", command=excel_export).pack(pady=5)
+    customtkinter.CTkButton(window_export, text="PDF", command=pdf_export).pack(pady=5)
 
 # ----------------- Checagem de updates + loop principal -----------------
 check_for_updates(root)

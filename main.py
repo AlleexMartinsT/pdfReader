@@ -1,6 +1,6 @@
 from utils import *
 from library import *
-from globalVar import *
+from global_vars import *
 from tk import *
 
 try:

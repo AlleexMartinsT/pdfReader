@@ -1,6 +1,6 @@
-from globalVar import APP_VERSION
+from global_vars import APP_VERSION
 
-def gerar_versionfile():
+def versionfile_generator():
     template = f"""
 VSVersionInfo(
   ffi=FixedFileInfo(
@@ -35,4 +35,4 @@ VSVersionInfo(
         f.write(template)
 
 if __name__ == "__main__":
-    gerar_versionfile()
+    versionfile_generator()

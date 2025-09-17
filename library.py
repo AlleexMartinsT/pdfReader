@@ -14,4 +14,4 @@ import openpyxl
 import time
 import os
 from PIL import Image, ImageTk, ImageEnhance
-from gerar_versionfile import gerar_versionfile
+from versionfile_generator import versionfile_generator

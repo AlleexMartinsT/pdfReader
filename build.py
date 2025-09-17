@@ -1,7 +1,7 @@
 import os
-from library import gerar_versionfile
+from library import versionfile_generator
 
-gerar_versionfile()
+versionfile_generator()
 
 hidden_imports = [
     "--hidden-import openpyxl",

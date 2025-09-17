@@ -1,42 +1,42 @@
 from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd, hashlib
-from globalVar import (
-    arquivosLista, resultados_lista, regex_data, regex_negativo, 
-    APP_VERSION, GITHUB_REPO, _ULTIMO_EH, _ULTIMO_MVA , ULTIMO_HASH_MESCLAGEM,
-    PERIODO_VENDAS
+from global_vars import (
+    listFiles, list_results, regex_data, regex_negative, 
+    APP_VERSION, GITHUB_REPO, LAST_EH, LAST_MVA , LAST_HASH_MERGE,
+    SALES_PERIOD
 ) 
 
 # Configuração de logging mais leve (somente avisos e erros)
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
-ULTIMO_ESTADO_PLANILHA = {}
+LAST_STATE_SPREADSHEET = {}
 
-def set_btn_cancelar(state="disabled"):
-    from tk import btn_cancelar
+def set_btn_cancel(state="disabled"):
+    from tk import btn_cancel
     
-    btn_cancelar.configure(state=state)
+    btn_cancel.configure(state=state)
 
-def cancelar_processamento(): 
+def process_cancel(): 
     cancel_event.set()
     while not progress_queue.empty():
         try:
             progress_queue.get_nowait()
         except queue.Empty:
             break
-    set_btn_cancelar()
+    set_btn_cancel()
     # 🔹 Reseta barra
     from tk import progress_var, progress_bar
     progress_var.set(0)
     progress_bar.stop()
     progress_bar.config(mode="determinate")
 
-def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None, caminho=None):
+def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, path_var=None):
     """Consome eventos da fila em intervalos e atualiza a UI sem travar."""
 
     try:
         kind, payload = progress_queue.get_nowait()
     except queue.Empty:
         # Agenda a próxima checagem em 50ms (menos carga na CPU/UI)
-        root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
+        root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, label_files_var, path_var))
         return
 
     if kind == "progress":
@@ -44,43 +44,43 @@ def _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var=None,
         progress_bar.update_idletasks()
 
     elif kind == "done":
-        set_btn_cancelar()
+        set_btn_cancel()
         if payload.get("__cancelled__"):
             progress_var.set(0)
             messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
         else:
-            # payload agora é {"resultados": resultados, "origem": origem, "caminho": caminho}
-            resultados = payload.get("resultados")
-            origem = payload.get("origem")
-            caminho = payload.get("caminho")
+            # payload agora é {"results": resultados, "source": origem, "path_var": caminho}
+            results = payload.get("resultados")
+            source = payload.get("origem")
+            path_var = payload.get("caminho")
 
-            # garante que resultados_por_origem exista no globalVar
+            # garante que results_by_source exista no globalVar
             try:
-                from globalVar import resultados_por_origem
+                from global_vars import results_by_source
             except Exception:
-                resultados_por_origem = {"MVA": [], "EH": []}
+                results_by_source = {"MVA": [], "EH": []}
 
             # armazena por origem
-            if origem not in resultados_por_origem:
-                resultados_por_origem[origem] = []
-            resultados_por_origem[origem].append(resultados)
+            if source not in results_by_source:
+                results_by_source[source] = []
+            results_by_source[source].append((path_var, results))
 
             # armazena lista global e atualiza a tree
-            arquivosLista.append(caminho)
-            resultados_lista.append(resultados)
+            listFiles.append(path_var)
+            list_results.append(results)
 
             # atualiza a interface (label e tree)
-            arquivos_label_var.set(f"Arquivo carregado: {os.path.basename(caminho)} ({origem})")
-            atualizar_tree(tree)
-            messagebox.showinfo("Concluído", f"Processamento finalizado ({origem})!")
+            label_files_var.set(f"Arquivo carregado: {os.path.basename(path_var)} ({source})")
+            tree_update(tree)
+            messagebox.showinfo("Concluído", f"Processamento finalizado ({source})!")
 
     elif kind == "error":
-        set_btn_cancelar()
+        set_btn_cancel()
         messagebox.showerror("Erro", payload)
         return
 
     # Sempre agenda a próxima checagem, exceto se houve erro (onde damos return acima)
-    root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var, caminho))
+    root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, label_files_var, path_var))
 
 def resource_path(relative_path): 
     import sys
@@ -173,11 +173,80 @@ def canonicalize_name(raw: str) -> str:
 
 # --- Funções principais ---
 
+def criar_etiquetas():
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from tkinter import filedialog
+    from global_vars import results_by_source
+
+    # precisa ter MVA e EH carregados
+    if not results_by_source["MVA"] or not results_by_source["EH"]:
+        messagebox.showwarning("Aviso", "É necessário carregar os dois PDFs (MVA e EH).")
+        return
+
+    caminho = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("Arquivo PDF", "*.pdf")],
+        title="Salvar etiquetas"
+    )
+    if not caminho:
+        return
+
+    c = canvas.Canvas(caminho, pagesize=A4)
+    largura, altura = A4
+    y = altura - 50
+    c.setFont("Helvetica", 11)
+
+    # junta os vendedores que aparecem em qualquer um dos dois
+    vendedores = set()
+    for _, res in results_by_source["MVA"]:
+        vendedores.update(res.keys())
+    for _, res in results_by_source["EH"]:
+        vendedores.update(res.keys())
+
+    for vendedor in sorted(vendedores):
+        total_mva = 0.0
+        total_eh = 0.0
+        atendidos_mva = 0
+        atendidos_eh = 0
+
+        # soma MVA
+        for _, res in results_by_source["MVA"]:
+            if vendedor in res:
+                total_mva += parse_number(res[vendedor].get("total_vendas", 0))
+                atendidos_mva += res[vendedor].get("atendidos", 0)
+
+        # soma EH
+        for _, res in results_by_source["EH"]:
+            if vendedor in res:
+                total_eh += parse_number(res[vendedor].get("total_vendas", 0))
+                atendidos_eh += res[vendedor].get("atendidos", 0)
+
+        total_final = total_mva + total_eh
+        atendidos_total = atendidos_mva + atendidos_eh
+
+        # imprime no PDF em duas linhas
+        linha1 = f"{vendedor} = {format_number_br(total_mva)} + {format_number_br(total_eh)} = {format_number_br(total_final)}"
+        linha2 = f"Clientes atendidos = {atendidos_mva} + {atendidos_eh} = {atendidos_total}"
+
+        c.drawString(50, y, linha1)
+        y -= 15
+        c.drawString(50, y, linha2)
+        y -= 30
+
+        if y < 50:  # quebra página
+            c.showPage()
+            c.setFont("Helvetica", 11)
+            y = altura - 50
+
+    c.save()
+    messagebox.showinfo("Sucesso", f"✅ Etiquetas geradas em:\n{caminho}")
+
 def extrair_planilha_online():
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
     
-    global _ULTIMO_MVA, _ULTIMO_EH  # usar globais para comparar depois
+    global LAST_MVA, LAST_EH  # usar globais para comparar depois
     
     scope = [
         "https://spreadsheets.google.com/feeds",
@@ -208,17 +277,17 @@ def extrair_planilha_online():
     dfEH = pd.DataFrame(valoresEH[2:], columns=colsEH)
 
     # 🔎 COMPARAÇÃO com os últimos dados exportados
-    if _ULTIMO_MVA is not None and _ULTIMO_EH is not None:
-        if dfMVA.equals(_ULTIMO_MVA) and dfEH.equals(_ULTIMO_EH):
+    if LAST_MVA is not None and LAST_EH is not None:
+        if dfMVA.equals(LAST_MVA) and dfEH.equals(LAST_EH):
             return None
 
     # Atualiza os globais com os novos dados
-    _ULTIMO_MVA, _ULTIMO_EH = dfMVA.copy(), dfEH.copy()
+    LAST_MVA, LAST_EH = dfMVA.copy(), dfEH.copy()
 
     return dfMVA, dfEH
 
 def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
-    from tk import btn_mesclar_planilhas
+    from tk import btn_merge_spreadsheet
     
     try:
         cancel_event.clear()
@@ -237,8 +306,8 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                 else:
                     for item in tree_planilha.get_children():
                         tree_planilha.delete(item)
-                    if btn_mesclar_planilhas == "disabled":
-                        btn_mesclar_planilhas.configure(state="normal")
+                    if btn_merge_spreadsheet == "disabled":
+                        btn_merge_spreadsheet.configure(state="normal")
                     
                     dfMVA, dfEH = resultado
                     df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
@@ -333,18 +402,18 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
-def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_var, btn_cancelar, caminho, origem):
+def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, btn_cancel, caminho, origem):
     """
     Inicia processamento do PDF já com o caminho e a origem (MVA/EH) escolhidos.
     Não pergunta nada ao usuário — a escolha já veio do tk.py.
     """
-    global arquivosLista, resultados_lista
+    global listFiles, list_results
 
     if not caminho:
         return
 
     # evita duplicados
-    if caminho in arquivosLista:
+    if caminho in listFiles:
         messagebox.showerror("Erro", "Arquivo já importado!")
         return
 
@@ -366,23 +435,24 @@ def escolher_pdf_async(tree, progress_var, progress_bar, root, arquivos_label_va
             progress_queue.put(("error", str(e)))
 
     # habilita botão cancelar (na main thread via chamada)
-    btn_cancelar.configure(state="normal")
+    btn_cancel.configure(state="normal")
 
     # inicia thread de processamento
     worker_thread = threading.Thread(target=worker, daemon=True)
     worker_thread.start()
 
     # inicializa o polling (main thread)
-    _poll_queue(root, tree, progress_var, progress_bar, arquivos_label_var)
+    _poll_queue(root, tree, progress_var, progress_bar, label_files_var)
 
-def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
+def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
     from tkinter import filedialog
+    from tk import btn_tag
     
-    global arquivosLista, resultados_lista
+    global listFiles, list_results
     local_queue = queue.Queue()
     
     # Se nenhum PDF foi carregado ainda, obriga usar "Escolher PDF" primeiro
-    if not resultados_lista or not arquivosLista:
+    if not list_results or not listFiles:
         messagebox.showwarning("Aviso", "Selecione o primeiro PDF (com origem definida) antes de adicionar outro.")
         return
 
@@ -390,7 +460,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
     if not caminho:
         return
     
-    if caminho in arquivosLista:
+    if caminho in listFiles:
         messagebox.showerror("Erro", "Arquivo já importado!")
         return
     
@@ -405,19 +475,19 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
 
     # --- Determina origem automaticamente ---
     try:
-        from globalVar import resultados_por_origem
+        from global_vars import results_by_source
     except Exception:
-        resultados_por_origem = {"MVA": [], "EH": []}
+        results_by_source = {"MVA": [], "EH": []}
 
-    if resultados_por_origem["MVA"]:
+    if results_by_source["MVA"]:
         origem = "EH"
-    elif resultados_por_origem["EH"]:
+    elif results_by_source["EH"]:
         origem = "MVA"
     else:
         origem = "MVA"
 
     # Atualiza o label imediatamente com a origem atribuída
-    arquivos_label_var.set(
+    label_files_var.set(
         f"Carregando: {os.path.basename(caminho)} ({origem})"
     )
     cancel_event.clear()
@@ -435,7 +505,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
         except Exception as e:
             local_queue.put(("error", str(e)))
 
-    set_btn_cancelar(state="normal")
+    set_btn_cancel(state="normal")
     threading.Thread(target=worker, daemon=True).start()
 
     def poll_queue_add():
@@ -446,7 +516,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                     progress_var.set(payload)
                     progress_bar.update_idletasks()
                 elif kind == "done_add":
-                    set_btn_cancelar()
+                    set_btn_cancel()
                     resultados = payload["resultados"]
                     origem = payload["origem"]
                     caminho = payload["caminho"]
@@ -458,32 +528,33 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
                         messagebox.showwarning("Aviso", "Nenhum dado foi encontrado neste PDF.")
                     else:
                         # Armazena os dados
-                        arquivosLista.append(caminho)
-                        resultados_lista.append(resultados)
-                        resultados_por_origem[origem].append((caminho, resultados))  # salva também o caminho para referência
+                        listFiles.append(caminho)
+                        list_results.append(resultados)
+                        results_by_source[origem].append((caminho, resultados))  # salva também o caminho para referência
 
                         # 🔹 Monta o texto do label com todos os arquivos e origens
                         partes = []
-                        for caminho_salvo in arquivosLista:
+                        for caminho_salvo in listFiles:
                             nome = os.path.basename(caminho_salvo)
                             origem_arquivo = "?"
-                            for org, lista in resultados_por_origem.items():
+                            for org, lista in results_by_source.items():
                                 if any(c == caminho_salvo or (isinstance(c, tuple) and c[0] == caminho_salvo) for c in lista):
                                     origem_arquivo = org
                                     break
                             partes.append(f"{nome} ({origem_arquivo})")
                         if len(partes) == 1:
-                            arquivos_label_var.set(f"Arquivo carregado: {partes[0]}")
+                            label_files_var.set(f"Arquivo carregado: {partes[0]}")
                         else:
-                            arquivos_label_var.set("Arquivos carregados: " + ", ".join(partes))
+                            label_files_var.set("Arquivos carregados: " + ", ".join(partes))
 
 
-                        atualizar_tree(tree)
+                        tree_update(tree)
+                        btn_tag.configure(state="normal", fg_color="#44cc64")
                         messagebox.showinfo("Concluído", f"PDF adicional processado e atribuído a {origem}!")
                     return
 
                 elif kind == "error":
-                    set_btn_cancelar()
+                    set_btn_cancel()
                     messagebox.showerror("Erro", payload)
                     return
         except queue.Empty:
@@ -492,16 +563,19 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, arquivos_label_var):
 
     poll_queue_add()
   
-def atualizar_tree(tree):
+def tree_update(tree):
     for item in tree.get_children():
         tree.delete(item)
     
-    mesclado = mesclar_resultados(resultados_lista)
+    mesclado = mesclar_resultados(list_results)
     
     for vendedor, dados in sorted(mesclado.items()):
         total_vendas_str = ""
+        print(dados["total_vendas"])
         if dados["total_vendas"] > 0:
             total_vendas_str = format_number_br(dados["total_vendas"])
+        else:
+            total_vendas_str = format_number_br(abs(dados["total_vendas"]))   
 
         tree.insert("", "end", values=(
             vendedor,
@@ -511,11 +585,11 @@ def atualizar_tree(tree):
             total_vendas_str
         ))
 
-def mesclar_resultados(resultados_lista):
+def mesclar_resultados(list_results):
     mesclado = {}
     cache_canon = {}  # 🔹 Cache para memoização de canonicalize_name
 
-    for res in resultados_lista:
+    for res in list_results:
         for vend, dados in res.items():
             # Usa o cache para evitar chamadas repetidas a canonicalize_name
             if vend in cache_canon:
@@ -596,7 +670,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                         if not vendedor_atual:
                             continue
                         resultados[vendedor_atual]["atendidos"] += 1
-                        if regex_negativo.search(linha):
+                        if regex_negative.search(linha):
                             resultados[vendedor_atual]["devolucoes"] += 1
 
                     if "Totais" in linha and vendedor_atual:
@@ -614,7 +688,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
         fechar_vendedor()
     if not resultados:
         return {"__empty__": True}
-    periodo = analisar_periodo_vendas(caminho_pdf)
+    periodo = analisar_SALES_PERIOD(caminho_pdf)
     if periodo:
         print("Período de vendas:", periodo)
     return resultados
@@ -674,10 +748,10 @@ def check_for_updates(root):
 
     threading.Thread(target=worker, daemon=True).start()
 
-def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
+def limpar_tabelas(tree, tree_planilha, label_files_var, progress_var):
     
-    global _ULTIMO_EH, _ULTIMO_MVA, ULTIMO_ESTADO_PLANILHA, ULTIMO_HASH_MESCLAGEM
-    
+    global LAST_EH, LAST_MVA, LAST_STATE_SPREADSHEET, LAST_HASH_MERGE
+
     # limpa as tabelas
     for item in tree.get_children():
         tree.delete(item)
@@ -685,29 +759,30 @@ def limpar_tabelas(tree, tree_planilha, arquivos_label_var, progress_var):
         tree_planilha.delete(item)
 
     # reseta variáveis da UI
-    arquivos_label_var.set("Nenhum arquivo carregado ainda")
+    label_files_var.set("Nenhum arquivo carregado ainda")
     progress_var.set(0)
 
     # 🧹 Limpa histórico da mesclagem
-    _ULTIMO_EH = None      
-    _ULTIMO_MVA = None
-    ULTIMO_HASH_MESCLAGEM = None
-    ULTIMO_ESTADO_PLANILHA = {}    
+    LAST_EH = None      
+    LAST_MVA = None
+    LAST_HASH_MERGE = None
+    LAST_STATE_SPREADSHEET = {}    
     
     # também limpa lista de resultados
-    from globalVar import resultados_lista, arquivosLista
-    from tk import btn_add_mais, btn_mesclar_planilhas, btn
+    from global_vars import list_results, listFiles
+    from tk import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
     
-    btn_mesclar_planilhas.configure(state="normal")
+    btn_merge_spreadsheet.configure(state="normal")
     btn_add_mais.configure(state="normal")
     btn.configure(state="normal")
+    btn_tag.configure(state="disabled", fg_color="#EE9919", text_color_disabled="gray45")
     
-    resultados_lista.clear()
-    arquivosLista.clear()
+    list_results.clear()
+    listFiles.clear()
 
     messagebox.showinfo("Limpo", "Todas as tabelas foram limpas com sucesso!")
             
-def _exportar_excel(tree):
+def _excel_export(tree):
     from tkinter import filedialog
     
     # Extrai os dados
@@ -744,7 +819,7 @@ def _exportar_excel(tree):
     
     messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
-def _exportar_pdf(tree):
+def _pdf_export(tree):
     
     from tkinter import filedialog
     from reportlab.lib.pagesizes import A4
@@ -793,15 +868,15 @@ def _exportar_pdf(tree):
     c.save()
     messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
-def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, tree_planilha, ):
+def mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tree_planilha, ):
     """
     Mescla os valores da planilha online (tree_planilha) na tabela de PDFs (tree).
     Atualiza a barra de progresso durante o processo.
     """
-    from tk import btn_mesclar_planilhas, btn_add_mais, btn
-    global ULTIMO_HASH_MESCLAGEM, ULTIMO_ESTADO_PLANILHA
+    from tk import btn_merge_spreadsheet, btn_add_mais, btn
+    global LAST_HASH_MERGE, LAST_STATE_SPREADSHEET
     
-    btn_mesclar_planilhas.configure(state="enabled")
+    btn_merge_spreadsheet.configure(state="enabled")
     
      # 🔹 Verifica se alguma tabela está vazia
     if not tree.get_children():
@@ -822,12 +897,12 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, 
 
     novo_hash = hashlib.md5(snapshot_str.encode()).hexdigest()
 
-    if ULTIMO_HASH_MESCLAGEM == novo_hash:
+    if LAST_HASH_MERGE == novo_hash:
         messagebox.showinfo("Aviso", "⚠️ Esses dados já foram mesclados. Nenhuma alteração detectada.")
         return
 
     # Se for novo, salva para futuras comparações
-    ULTIMO_HASH_MESCLAGEM = novo_hash
+    LAST_HASH_MERGE = novo_hash
     
     merge_queue = queue.Queue()
 
@@ -859,7 +934,7 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, 
                 total_vendas = parse_number(str(vals[2]) if vals[2] else "0")
 
                 # 🔎 Verifica se este vendedor já existia e calcula apenas o incremento
-                ultimo = ULTIMO_ESTADO_PLANILHA.get(vendedor, {"atendidos":0, "total_vendas":0})
+                ultimo = LAST_STATE_SPREADSHEET.get(vendedor, {"atendidos":0, "total_vendas":0})
                 delta_atendidos = max(0, atendidos - ultimo["atendidos"])
                 delta_vendas = max(0, total_vendas - ultimo["total_vendas"])
 
@@ -873,7 +948,7 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, 
                 }
 
                 # Atualiza o snapshot
-                ULTIMO_ESTADO_PLANILHA[vendedor] = {"atendidos": atendidos, "total_vendas": total_vendas}
+                LAST_STATE_SPREADSHEET[vendedor] = {"atendidos": atendidos, "total_vendas": total_vendas}
 
                 progresso = int(idx * 50 / max(1, len(tree_planilha.get_children())))
                 merge_queue.put(("progress", progresso))
@@ -916,7 +991,7 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, 
                     progress_var.set(payload)
                     progress_bar.update_idletasks()
                 elif kind == "done":
-                    btn_mesclar_planilhas.configure(state="disabled")
+                    btn_merge_spreadsheet.configure(state="disabled")
                     btn_add_mais.configure(state="disabled")
                     btn.configure(state="disabled")
                     if payload.get("__cancelled__"):
@@ -945,13 +1020,13 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, arquivos_label_var, 
 
     poll_merge_queue()
 
-def analisar_periodo_vendas(caminho_pdf):
+def analisar_SALES_PERIOD(caminho_pdf):
     """
     Analisa as datas de vendas em um PDF e retorna o período de vendas.
     """
     
     from datetime import datetime
-    global PERIODO_VENDAS
+    global SALES_PERIOD
     datas = []
 
     try:
@@ -969,15 +1044,15 @@ def analisar_periodo_vendas(caminho_pdf):
                             pass
 
         if not datas:
-            PERIODO_VENDAS = None
+            SALES_PERIOD = None
             return None
 
         primeira = min(datas)
         ultima = max(datas)
-        PERIODO_VENDAS = f"{primeira.strftime('%d/%m/%Y')} - {ultima.strftime('%d/%m/%Y')}"
-        return PERIODO_VENDAS
+        SALES_PERIOD = f"{primeira.strftime('%d/%m/%Y')} - {ultima.strftime('%d/%m/%Y')}"
+        return SALES_PERIOD
 
     except Exception as e:
         print(f"Erro ao analisar período de vendas: {e}")
-        PERIODO_VENDAS = None
+        SALES_PERIOD = None
         return None

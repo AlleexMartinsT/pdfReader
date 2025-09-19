@@ -205,29 +205,30 @@ def criar_etiquetas():
         vendedores.update(res.keys())
 
     for vendedor in sorted(vendedores):
-        total_mva = 0.0
-        total_eh = 0.0
-        atendidos_mva = 0
-        atendidos_eh = 0
+        total_mva = total_eh = 0.0
+        atendidos_mva = atendidos_eh = 0
+        clientes_mva = clientes_eh = 0
 
         # soma MVA
         for _, res in results_by_source["MVA"]:
             if vendedor in res:
                 total_mva += parse_number(res[vendedor].get("total_vendas", 0))
                 atendidos_mva += res[vendedor].get("atendidos", 0)
+                clientes_mva += res[vendedor].get("total_clientes", 0)
 
         # soma EH
         for _, res in results_by_source["EH"]:
             if vendedor in res:
                 total_eh += parse_number(res[vendedor].get("total_vendas", 0))
                 atendidos_eh += res[vendedor].get("atendidos", 0)
+                clientes_eh += res[vendedor].get("total_clientes", 0)
 
         total_final = total_mva + total_eh
-        atendidos_total = atendidos_mva + atendidos_eh
+        clientes_total = clientes_mva + clientes_eh
 
         # imprime no PDF em duas linhas
         linha1 = f"{vendedor} = {format_number_br(total_mva)} + {format_number_br(total_eh)} = {format_number_br(total_final)}"
-        linha2 = f"Clientes atendidos = {atendidos_mva} + {atendidos_eh} = {atendidos_total}"
+        linha2 = f"Clientes atendidos = {clientes_mva} + {clientes_eh} = {clientes_total}"
 
         c.drawString(50, y, linha1)
         y -= 15
@@ -571,7 +572,6 @@ def tree_update(tree):
     
     for vendedor, dados in sorted(mesclado.items()):
         total_vendas_str = ""
-        print(dados["total_vendas"])
         if dados["total_vendas"] > 0:
             total_vendas_str = format_number_br(dados["total_vendas"])
         else:

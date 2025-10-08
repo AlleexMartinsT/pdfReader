@@ -11,7 +11,7 @@ cancel_event = threading.Event()
 LAST_STATE_SPREADSHEET = {}
 
 def set_btn_cancel(state="disabled"):
-    from tk import btn_cancel
+    from tk_vendas import btn_cancel
     
     btn_cancel.configure(state=state)
 
@@ -24,14 +24,14 @@ def process_cancel():
             break
     set_btn_cancel()
     # 🔹 Reseta barra
-    from tk import progress_var, progress_bar
+    from tk_vendas import progress_var, progress_bar
     progress_var.set(0)
     progress_bar.stop()
     progress_bar.config(mode="determinate")
 
 def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, path_var=None):
     """Consome eventos da fila em intervalos e atualiza a UI sem travar."""
-
+    
     try:
         kind, payload = progress_queue.get_nowait()
     except queue.Empty:
@@ -73,6 +73,8 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
             label_files_var.set(f"Arquivo carregado: {os.path.basename(path_var)} ({source})")
             tree_update(tree)
             messagebox.showinfo("Concluído", f"Processamento finalizado ({source})!")
+            for vendedor in results.keys():
+                registrar_vendedor_db(vendedor)
 
     elif kind == "error":
         set_btn_cancel()
@@ -246,9 +248,9 @@ def criar_etiquetas():
 def extrair_planilha_online():
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
-    
+
     global LAST_MVA, LAST_EH  # usar globais para comparar depois
-    
+
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
@@ -277,19 +279,63 @@ def extrair_planilha_online():
     dfMVA = pd.DataFrame(valoresMVA[2:], columns=colsMVA)
     dfEH = pd.DataFrame(valoresEH[2:], columns=colsEH)
 
-    # 🔎 COMPARAÇÃO com os últimos dados exportados
+    # 🔎 COMPARAÇÃO com os últimos dados exportados (mantém compatibilidade)
     if LAST_MVA is not None and LAST_EH is not None:
-        if dfMVA.equals(LAST_MVA) and dfEH.equals(LAST_EH):
-            return None
+        try:
+            if dfMVA.equals(LAST_MVA) and dfEH.equals(LAST_EH):
+                return None
+        except Exception:
+            # se ocorrer qualquer erro de comparação, continua (não bloqueia)
+            pass
 
-    # Atualiza os globais com os novos dados
+    # Atualiza os globais com os novos dados (mantém comportamento anterior)
     LAST_MVA, LAST_EH = dfMVA.copy(), dfEH.copy()
 
-    return dfMVA, dfEH
+    # --- Agregação por vendedor (soma MVA + EH) ---
+    agregados = {}
+
+    # concatena ambas as abas para processar de forma uniforme
+    df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
+
+    for _, row in df_total.iterrows():
+        vendedor_raw = str(row.iloc[0]).strip()
+        if not vendedor_raw or vendedor_raw.lower() in ["nan", "none", ""]:
+            continue
+
+        vendedor = canonicalize_name(vendedor_raw)
+
+        if vendedor not in agregados:
+            agregados[vendedor] = {"atendidos": 0, "total_vendas": 0.0}
+
+        atend_row = 0
+        total_row = 0.0
+
+        # percorre o resto das colunas da linha somando valores numéricos
+        for v in row.iloc[1:]:
+            if pd.isna(v) or str(v).strip() == "":
+                continue
+            try:
+                num = parse_number(str(v))
+                total_row += num
+                atend_row += 1
+            except Exception:
+                # ignora conteúdos não numéricos
+                continue
+
+        agregados[vendedor]["atendidos"] += atend_row
+        agregados[vendedor]["total_vendas"] += total_row
+
+    # transforma em DataFrame ordenado
+    df_agg = pd.DataFrame(
+        [(v, d["atendidos"], d["total_vendas"]) for v, d in agregados.items()],
+        columns=["vendedor", "atendidos", "total_vendas"]
+    ).sort_values("vendedor").reset_index(drop=True)
+
+    return dfMVA, dfEH, df_agg
 
 def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
-    from tk import btn_merge_spreadsheet
-    
+    from tk_vendas import btn_merge_spreadsheet
+
     try:
         cancel_event.clear()
         progress_var.set(0)
@@ -309,46 +355,36 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                         tree_planilha.delete(item)
                     if btn_merge_spreadsheet == "disabled":
                         btn_merge_spreadsheet.configure(state="normal")
-                    
-                    dfMVA, dfEH = resultado
-                    df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
 
-                    total_rows = len(df_total)
+                    # agora extrai também o DataFrame agregado
+                    dfMVA, dfEH, df_agg = resultado
+
+                    total_rows = len(df_agg)
                     resultados = []
 
-                for i, (_, row) in enumerate(df_total.iterrows(), start=1):
-                    # 🔹 Verifica se foi cancelado
-                    if cancel_event.is_set():
-                        progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
-                        return
+                    # percorre o df_agg (já somado por vendedor)
+                    for i, (_, row) in enumerate(df_agg.iterrows(), start=1):
+                        # 🔹 Verifica se foi cancelado
+                        if cancel_event.is_set():
+                            progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
+                            return
 
-                    vendedor = str(row.iloc[0]).strip()
-                    if not vendedor:
-                        continue
-
-                    valores = row[1:]
-                    total = 0.0
-                    atendidos = 0
-
-                    for v in valores:
-                        if pd.isna(v) or str(v).strip() == "":
+                        vendedor = str(row["vendedor"]).strip()
+                        if not vendedor:
                             continue
-                        try:
-                            num = str(v).replace("R$", "").replace(".", "").replace(",", ".").strip()
-                            total += float(num)
-                            atendidos += 1
-                        except:
-                            pass
 
-                    if total > 0:
-                        resultados.append((vendedor, atendidos, total))
+                        atendidos = int(row["atendidos"]) if not pd.isna(row["atendidos"]) else 0
+                        total = float(row["total_vendas"]) if not pd.isna(row["total_vendas"]) else 0.0
 
-                    # 🔹 Atualiza progresso gradualmente
-                    progresso = int(i * 100 / max(1, total_rows))
-                    progressQueuePlanilha.put(("progress", progresso))
-                    time.sleep(0.02)
+                        if atendidos > 0 or total > 0:
+                            resultados.append((vendedor, atendidos, total))
 
-                progressQueuePlanilha.put(("done_planilha", resultados))
+                        # 🔹 Atualiza progresso gradualmente
+                        progresso = int(i * 100 / max(1, total_rows))
+                        progressQueuePlanilha.put(("progress", progresso))
+                        time.sleep(0.02)
+
+                    progressQueuePlanilha.put(("done_planilha", resultados))
 
             except Exception as e:
                 progressQueuePlanilha.put(("error", f"Erro ao carregar planilha: {e}"))
@@ -447,7 +483,7 @@ def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, bt
 
 def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
     from tkinter import filedialog
-    from tk import btn_tag
+    from tk_vendas import btn_tag
     
     global listFiles, list_results
     local_queue = queue.Queue()
@@ -489,7 +525,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
 
     # Atualiza o label imediatamente com a origem atribuída
     label_files_var.set(
-        f"Carregando: {os.path.basename(caminho)} ({origem})"
+        f"Carregando: {os.path.basename(caminho)}({origem})"
     )
     cancel_event.clear()
     progress_var.set(0)
@@ -688,9 +724,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
         fechar_vendedor()
     if not resultados:
         return {"__empty__": True}
-    periodo = analisar_SALES_PERIOD(caminho_pdf)
-    if periodo:
-        print("Período de vendas:", periodo)
+    
     return resultados
 
 def ordenar_coluna(tree, col, reverse):
@@ -770,7 +804,7 @@ def limpar_tabelas(tree, tree_planilha, label_files_var, progress_var):
     
     # também limpa lista de resultados
     from global_vars import list_results, listFiles
-    from tk import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
+    from tk_vendas import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
     
     btn_merge_spreadsheet.configure(state="normal")
     btn_add_mais.configure(state="normal")
@@ -873,7 +907,7 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tre
     Mescla os valores da planilha online (tree_planilha) na tabela de PDFs (tree).
     Atualiza a barra de progresso durante o processo.
     """
-    from tk import btn_merge_spreadsheet, btn_add_mais, btn
+    from tk_vendas import btn_merge_spreadsheet, btn_add_mais, btn
     global LAST_HASH_MERGE, LAST_STATE_SPREADSHEET
     
     btn_merge_spreadsheet.configure(state="enabled")
@@ -1056,3 +1090,106 @@ def analisar_SALES_PERIOD(caminho_pdf):
         print(f"Erro ao analisar período de vendas: {e}")
         SALES_PERIOD = None
         return None
+
+# ----------------- Conexão com Supabase -----------------
+
+from supabase import create_client
+import json
+
+_supabase = None
+
+def get_supabase():
+    global _supabase
+    if _supabase is None:
+        try:
+            cred_path = resource_path(os.path.join("data", "credentials.json"))
+            with open(cred_path, "r", encoding="utf-8") as f:
+                creds = json.load(f)
+
+            url = creds["SUPABASE_URL"]
+            key = creds["SUPABASE_KEY"]
+            _supabase = create_client(url, key)
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Erro", f"Erro ao conectar ao Supabase: {e}")
+            raise
+    return _supabase
+
+def listar_vendedores_db():
+    """Retorna a lista de vendedores cadastrados no Supabase."""
+    try:
+        supabase = get_supabase()
+        data = supabase.table("vendedores").select("nome").order("nome").execute()
+        return [v["nome"] for v in data.data] if data and hasattr(data, "data") else []
+    except Exception as e:
+        from tkinter import messagebox
+        messagebox.showerror("Erro", f"Erro ao listar vendedores: {e}")
+        return []
+
+def registrar_vendedor_db(nome: str):
+    """Registra um vendedor no banco (evita duplicados)."""
+    try:
+        supabase = get_supabase()
+        existe = supabase.table("vendedores").select("id").eq("nome", nome).execute()
+        if not existe.data:
+            supabase.table("vendedores").insert({"nome": nome}).execute()
+    except Exception as e:
+        from tkinter import messagebox
+        messagebox.showerror("Erro", f"Erro ao registrar vendedor: {e}")
+
+def excluir_ultimo_feedback(vendedor: str):
+    """Exclui o último feedback de um vendedor"""
+    try:
+        supabase = get_supabase()
+        # pega o último registro
+        data = supabase.table("feedbacks").select("*").eq("vendedor", vendedor).order("created_at", desc=True).limit(1).execute()
+        if data.data:
+            fid = data.data[0]["id"]
+            supabase.table("feedbacks").delete().eq("id", fid).execute()
+            return True
+        return False
+    except Exception as e:
+        messagebox.showerror("Erro", f"Erro ao excluir feedback: {e}")
+        return False
+
+def atualizar_ultimo_feedback(vendedor: str, novo_texto: str):
+    """Atualiza o último feedback de um vendedor"""
+    try:
+        supabase = get_supabase()
+        data = supabase.table("feedbacks").select("*").eq("vendedor", vendedor).order("created_at", desc=True).limit(1).execute()
+        if data.data:
+            fid = data.data[0]["id"]
+            supabase.table("feedbacks").update({"feedback": novo_texto}).eq("id", fid).execute()
+            return True
+        return False
+    except Exception as e:
+        messagebox.showerror("Erro", f"Erro ao editar feedback: {e}")
+        return False
+
+def salvar_feedback_db(vendedor: str, texto: str):
+    from datetime import datetime
+    """Salva o feedback de um vendedor no Supabase."""
+    try:
+        supabase = get_supabase()
+        agora = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        data, count = supabase.table("feedbacks").insert({
+            "vendedor": vendedor,
+            "feedback": texto,
+            "created_at": agora   # sobrescreve no formato desejado
+        }).execute()
+        return True
+    except Exception as e:
+        from tkinter import messagebox
+        messagebox.showerror("Erro", f"Erro ao salvar feedback no banco: {e}")
+        return False
+
+def carregar_feedbacks_db(vendedor: str):
+    """Carrega todos os feedbacks de um vendedor do Supabase."""
+    try:
+        supabase = get_supabase()
+        data = supabase.table("feedbacks").select("*").eq("vendedor", vendedor).order("created_at").execute()
+        return data.data if data and hasattr(data, "data") else []
+    except Exception as e:
+        from tkinter import messagebox
+        messagebox.showerror("Erro", f"Erro ao carregar feedbacks: {e}")
+        return []

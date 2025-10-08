@@ -1,7 +1,7 @@
 from utils import *
 from library import *
 from global_vars import *
-from tk import *
+from tk_vendas import *
 
 try:
     root.iconbitmap("icone.ico")

@@ -6,5 +6,6 @@ mapping.json
 # Build / distribuição
 dist/
 build/
+data/
 *.exe
 *.spec

@@ -10,7 +10,7 @@ hidden_imports = [
 ]
 
 data_files = [
-    '--add-data "credenciais.json;."',
+    '--add-data "data;data"',
     '--add-data "mapping.json;."',
     '--add-data "icone.ico;."',
     '--add-data "basedTheme.json;."',

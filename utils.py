@@ -255,7 +255,7 @@ def extrair_planilha_online():
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
     ]
-    cred_path = resource_path("credenciais.json")
+    cred_path = resource_path(os.path.join("data", "credenciaisAPI.json"))
 
     creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
     client = gspread.authorize(creds)
@@ -1102,7 +1102,7 @@ def get_supabase():
     global _supabase
     if _supabase is None:
         try:
-            cred_path = resource_path(os.path.join("data", "credentials.json"))
+            cred_path = resource_path(os.path.join("data", "credenciaisDB.json"))
             with open(cred_path, "r", encoding="utf-8") as f:
                 creds = json.load(f)
 

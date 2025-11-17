@@ -1,4 +1,4 @@
-from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd, hashlib
+from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd
 from global_vars import (
     listFiles, list_results, regex_data, regex_negative, 
     APP_VERSION, GITHUB_REPO, LAST_EH, LAST_MVA , LAST_HASH_MERGE,
@@ -439,6 +439,105 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
     except Exception as e:
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
+def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_bar, root):
+    """Carrega as planilhas online (MVA e EH) em paralelo, cada uma no seu Treeview."""
+    import threading, queue, time
+    from tkinter import messagebox
+    global cancel_event
+    from tk_vendas import btn_merge_spreadsheet
+
+    try:
+        cancel_event.clear()
+        progress_var.set(0)
+        progressQueuePlanilha = queue.Queue()
+
+        def worker():
+            progressQueuePlanilha.put(("ui", {"action": "start_indeterminate"}))
+            try:
+                resultado = extrair_planilha_online()
+                if resultado is None:
+                    progress_bar.stop()
+                    progress_bar.config(mode="determinate")
+                    progress_var.set(0)
+                    return messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado")
+
+                dfMVA, dfEH, _ = resultado  # ignoramos o df_agg por enquanto
+
+                # limpa tabelas antes de preencher
+                for tree in (tree_mva, tree_eh):
+                    for item in tree.get_children():
+                        tree.delete(item)
+
+                if btn_merge_spreadsheet == "disabled":
+                    btn_merge_spreadsheet.configure(state="normal")
+
+                # Preenche as duas tabelas
+                def fill_tree(df, tree):
+                    total_rows = len(df)
+                    for i, (_, row) in enumerate(df.iterrows(), start=1):
+                        if cancel_event.is_set():
+                            progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
+                            return
+                        vendedor = str(row.iloc[0]).strip()
+                        if not vendedor:
+                            continue
+                        atendidos = len([v for v in row.iloc[1:] if str(v).strip() != ""])
+                        total = 0.0
+                        for v in row.iloc[1:]:
+                            try:
+                                total += float(str(v).replace(",", "."))
+                            except Exception:
+                                pass
+                        if atendidos > 0 or total > 0:
+                            tree.insert("", "end", values=(vendedor, atendidos, f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")))
+                        progresso = int(i * 50 / max(1, total_rows))  # 50% pra cada tabela
+                        progressQueuePlanilha.put(("progress", progresso))
+
+                fill_tree(dfMVA, tree_mva)
+                fill_tree(dfEH, tree_eh)
+
+                progressQueuePlanilha.put(("done_planilha", "ok"))
+
+            except Exception as e:
+                progressQueuePlanilha.put(("error", f"Erro ao carregar planilhas: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll_queue():
+            try:
+                while True:
+                    kind, payload = progressQueuePlanilha.get_nowait()
+                    if kind == "progress":
+                        if str(progress_bar["mode"]) == "indeterminate":
+                            progress_bar.stop()
+                            progress_bar.config(mode="determinate")
+                        progress_var.set(payload)
+                        progress_bar.update_idletasks()
+                    elif kind == "ui":
+                        if payload.get("action") == "start_indeterminate":
+                            progress_bar.config(mode="indeterminate")
+                            progress_bar.start(10)
+                    elif kind == "done_planilha":
+                        progress_bar.stop()
+                        progress_bar.config(mode="determinate")
+                        progress_var.set(100 if payload == "ok" else 0)
+                        if isinstance(payload, dict) and payload.get("__cancelled__"):
+                            messagebox.showinfo("Cancelado", "❌ Carregamento da planilha foi cancelado.")
+                        else:
+                            messagebox.showinfo("Sucesso", "✅ Planilhas online carregadas com sucesso!")
+                        return
+                    elif kind == "error":
+                        messagebox.showerror("Erro", payload)
+                        return
+            except queue.Empty:
+                pass
+            root.after(10, poll_queue)
+
+        poll_queue()
+
+    except Exception as e:
+        messagebox.showerror("Erro", f"Erro ao iniciar carregamento das planilhas: {e}")
+
 def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, btn_cancel, caminho, origem):
     """
     Inicia processamento do PDF já com o caminho e a origem (MVA/EH) escolhidos.
@@ -483,7 +582,7 @@ def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, bt
 
 def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
     from tkinter import filedialog
-    from tk_vendas import btn_tag
+    from tk_vendas import btn_tag, btn_add_mais
     
     global listFiles, list_results
     local_queue = queue.Queue()
@@ -587,6 +686,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
 
                         tree_update(tree)
                         btn_tag.configure(state="normal", fg_color="#44cc64")
+                        btn_add_mais.configure(state="disabled", fg_color="#EE9919", text_color_disabled="#D92525")
                         messagebox.showinfo("Concluído", f"PDF adicional processado e atribuído a {origem}!")
                     return
 
@@ -902,48 +1002,88 @@ def _pdf_export(tree):
     c.save()
     messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
-def mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tree_planilha, ):
+def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var):
+    """Limpa todas as tabelas (PDF + MVA + EH) e reseta os indicadores."""
+    from tkinter import messagebox
+    
+    global LAST_EH, LAST_MVA, LAST_STATE_SPREADSHEET, LAST_HASH_MERGE
+
+
+    confirm = messagebox.askyesno("Confirmação", "Deseja realmente limpar todas as tabelas?")
+    if not confirm:
+        return
+
+    for t in (tree, tree_mva, tree_eh):
+        for item in t.get_children():
+            t.delete(item)
+            
+        # 🧹 Limpa histórico da mesclagem
+    LAST_EH = None      
+    LAST_MVA = None
+    LAST_HASH_MERGE = None
+    LAST_STATE_SPREADSHEET = {}    
+    
+    # também limpa lista de resultados
+    from global_vars import list_results, listFiles
+    from tk_vendas import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
+    
+    btn_merge_spreadsheet.configure(state="normal")
+    btn_add_mais.configure(state="normal")
+    btn.configure(state="normal")
+    btn_tag.configure(state="disabled", fg_color="#EE9919", text_color_disabled="gray45")
+    
+    list_results.clear()
+    listFiles.clear()
+
+    label_files_var.set("Nenhum arquivo selecionado")
+    progress_var.set(0)
+    messagebox.showinfo("Limpeza concluída", "🧹 Todas as tabelas foram limpas com sucesso.")
+
+def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_var,
+                           tree_mva, tree_eh):
     """
-    Mescla os valores da planilha online (tree_planilha) na tabela de PDFs (tree).
-    Atualiza a barra de progresso durante o processo.
+    Mescla os valores das planilhas online (MVA e EH) com a tabela de PDFs (tree).
+    Soma os dados das duas planilhas e atualiza a barra de progresso.
     """
     from tk_vendas import btn_merge_spreadsheet, btn_add_mais, btn
     global LAST_HASH_MERGE, LAST_STATE_SPREADSHEET
-    
+
+    import threading, queue, time, json, hashlib
+    from tkinter import messagebox
+
     btn_merge_spreadsheet.configure(state="enabled")
-    
-     # 🔹 Verifica se alguma tabela está vazia
+
+    # 🔹 Verifica se alguma tabela está vazia
     if not tree.get_children():
         messagebox.showwarning("Aviso", "A tabela de PDFs está vazia. Importe pelo menos um PDF antes de mesclar.")
         return
-    if not tree_planilha.get_children():
-        messagebox.showwarning("Aviso", "A tabela da planilha está vazia. Carregue a planilha online antes de mesclar.")
+    if not tree_mva.get_children() and not tree_eh.get_children():
+        messagebox.showwarning("Aviso", "As tabelas online estão vazias. Carregue as planilhas MVA e EH antes de mesclar.")
         return
-    
-    dados_pdf_snapshot = [tree.item(i)["values"] for i in tree.get_children()]
-    dados_planilha_snapshot = [tree_planilha.item(i)["values"] for i in tree_planilha.get_children()]
 
-    # Serializa e gera hash único
+    # Snapshot dos dados atuais (pra detectar duplicações)
+    dados_pdf_snapshot = [tree.item(i)["values"] for i in tree.get_children()]
+    dados_mva_snapshot = [tree_mva.item(i)["values"] for i in tree_mva.get_children()]
+    dados_eh_snapshot = [tree_eh.item(i)["values"] for i in tree_eh.get_children()]
+
     snapshot_str = json.dumps({
         "pdf": dados_pdf_snapshot,
-        "planilha": dados_planilha_snapshot
+        "mva": dados_mva_snapshot,
+        "eh": dados_eh_snapshot
     }, sort_keys=True)
 
     novo_hash = hashlib.md5(snapshot_str.encode()).hexdigest()
-
     if LAST_HASH_MERGE == novo_hash:
         messagebox.showinfo("Aviso", "⚠️ Esses dados já foram mesclados. Nenhuma alteração detectada.")
         return
 
-    # Se for novo, salva para futuras comparações
     LAST_HASH_MERGE = novo_hash
-    
     merge_queue = queue.Queue()
 
-    # Thread worker para processamento pesado
+    # ------------------ THREAD WORKER ------------------
     def worker():
         try:
-            # 1) Extrai dados da Treeview PDFs
+            # 1️⃣ Extrai dados da tabela de PDFs
             dados_pdf = {}
             for item in tree.get_children():
                 vals = tree.item(item)["values"]
@@ -959,64 +1099,78 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tre
                     "total_vendas": total_vendas
                 }
 
-            # 2) Extrai dados da Treeview planilha
-            dados_planilha = {}
-            for idx, item in enumerate(tree_planilha.get_children(), start=1):
-                vals = tree_planilha.item(item)["values"]
-                vendedor = str(vals[0]).strip()
-                atendidos = int(vals[1])
-                total_vendas = parse_number(str(vals[2]) if vals[2] else "0")
+            # 2️⃣ Extrai dados das planilhas MVA e EH
+            def extrair_dados(tree_view):
+                dados = {}
+                for item in tree_view.get_children():
+                    vals = tree_view.item(item)["values"]
+                    vendedor = str(vals[0]).strip()
+                    atendidos = int(vals[1])
+                    total_vendas = parse_number(str(vals[2]) if vals[2] else "0")
+                    if vendedor:
+                        if vendedor not in dados:
+                            dados[vendedor] = {"atendidos": 0, "total_vendas": 0.0}
+                        dados[vendedor]["atendidos"] += atendidos
+                        dados[vendedor]["total_vendas"] += total_vendas
+                return dados
 
-                # 🔎 Verifica se este vendedor já existia e calcula apenas o incremento
-                ultimo = LAST_STATE_SPREADSHEET.get(vendedor, {"atendidos":0, "total_vendas":0})
-                delta_atendidos = max(0, atendidos - ultimo["atendidos"])
-                delta_vendas = max(0, total_vendas - ultimo["total_vendas"])
+            dados_mva = extrair_dados(tree_mva)
+            dados_eh = extrair_dados(tree_eh)
 
-                # Se nada mudou, pula para evitar soma duplicada
+            # 3️⃣ Soma os dois (MVA + EH)
+            dados_planilha_total = {}
+            for vendedor in set(dados_mva.keys()) | set(dados_eh.keys()):
+                m = dados_mva.get(vendedor, {"atendidos": 0, "total_vendas": 0.0})
+                e = dados_eh.get(vendedor, {"atendidos": 0, "total_vendas": 0.0})
+                dados_planilha_total[vendedor] = {
+                    "atendidos": m["atendidos"] + e["atendidos"],
+                    "total_vendas": m["total_vendas"] + e["total_vendas"]
+                }
+
+            # 4️⃣ Aplica controle de duplicação incremental (igual ao código original)
+            novos_planilha = {}
+            for idx, (vendedor, dados) in enumerate(dados_planilha_total.items(), start=1):
+                ultimo = LAST_STATE_SPREADSHEET.get(vendedor, {"atendidos": 0, "total_vendas": 0.0})
+                delta_atendidos = max(0, dados["atendidos"] - ultimo["atendidos"])
+                delta_vendas = max(0, dados["total_vendas"] - ultimo["total_vendas"])
                 if delta_atendidos == 0 and delta_vendas == 0:
                     continue
-                
-                dados_planilha[vendedor] = {
+
+                novos_planilha[vendedor] = {
                     "atendidos": delta_atendidos,
                     "total_vendas": delta_vendas
                 }
-
-                # Atualiza o snapshot
-                LAST_STATE_SPREADSHEET[vendedor] = {"atendidos": atendidos, "total_vendas": total_vendas}
-
-                progresso = int(idx * 50 / max(1, len(tree_planilha.get_children())))
+                LAST_STATE_SPREADSHEET[vendedor] = dados
+                progresso = int(idx * 40 / max(1, len(dados_planilha_total)))
                 merge_queue.put(("progress", progresso))
                 time.sleep(0.01)
 
-
-            # 3) Mescla os dados
-            total_vendedores = len(set(dados_pdf.keys()) | set(dados_planilha.keys()))
-            for idx, vendedor in enumerate(set(dados_pdf.keys()) | set(dados_planilha.keys()), start=1):
-                pdf_data = dados_pdf.get(vendedor, {"atendidos":0,"devolucoes":0,"total_clientes":0,"total_vendas":0})
-                plan_data = dados_planilha.get(vendedor, {"atendidos":0,"total_vendas":0})
+            # 5️⃣ Mescla tudo
+            total_vendedores = len(set(dados_pdf.keys()) | set(novos_planilha.keys()))
+            for idx, vendedor in enumerate(set(dados_pdf.keys()) | set(novos_planilha.keys()), start=1):
+                pdf_data = dados_pdf.get(vendedor, {"atendidos": 0, "devolucoes": 0, "total_clientes": 0, "total_vendas": 0})
+                plan_data = novos_planilha.get(vendedor, {"atendidos": 0, "total_vendas": 0})
 
                 merged = {
                     "atendidos": pdf_data["atendidos"] + plan_data["atendidos"],
-                    "devolucoes": pdf_data.get("devolucoes",0),
-                    "total_clientes": (pdf_data["atendidos"] + plan_data["atendidos"]) - pdf_data.get("devolucoes",0),
+                    "devolucoes": pdf_data["devolucoes"],
+                    "total_clientes": (pdf_data["atendidos"] + plan_data["atendidos"]) - pdf_data["devolucoes"],
                     "total_vendas": pdf_data["total_vendas"] + plan_data["total_vendas"]
                 }
-
                 dados_pdf[vendedor] = merged
 
-                # Atualiza progresso
-                progresso = 50 + int(idx * 50 / max(1, total_vendedores))
+                progresso = 40 + int(idx * 60 / max(1, total_vendedores))
                 merge_queue.put(("progress", progresso))
                 time.sleep(0.01)
 
             merge_queue.put(("done", dados_pdf))
+
         except Exception as e:
             merge_queue.put(("error", str(e)))
 
-    # Inicia thread
     threading.Thread(target=worker, daemon=True).start()
 
-    # Poll da fila
+    # ------------------ POLL QUEUE ------------------
     def poll_merge_queue():
         try:
             while True:
@@ -1028,12 +1182,10 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tre
                     btn_merge_spreadsheet.configure(state="disabled")
                     btn_add_mais.configure(state="disabled")
                     btn.configure(state="disabled")
-                    if payload.get("__cancelled__"):
-                        progress_var.set(0)
-                        messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
-                    # Atualiza Treeview dos PDFs
+
                     for item in tree.get_children():
                         tree.delete(item)
+
                     for vendedor, dados in sorted(payload.items()):
                         tree.insert("", "end", values=(
                             vendedor,
@@ -1043,7 +1195,7 @@ def mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tre
                             format_number_br(dados["total_vendas"])
                         ))
                     progress_var.set(100)
-                    messagebox.showinfo("Concluído", "✅ Mesclagem de tabelas finalizada!")
+                    messagebox.showinfo("Concluído", "✅ Mesclagem das tabelas (PDF + MVA + EH) finalizada!")
                     return
                 elif kind == "error":
                     messagebox.showerror("Erro", f"Erro na mesclagem: {payload}")

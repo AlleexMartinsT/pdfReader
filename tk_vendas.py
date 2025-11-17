@@ -1,9 +1,9 @@
 from utils import (
     source_pdf_async, adicionar_pdf, ordenar_coluna,
-    process_cancel, carregar_planilha_async,
-    limpar_tabelas, check_for_updates, resource_path, mesclar_tabelas,
+    process_cancel, carregar_planilhas_duplas_async,
+    limpar_tabelas_duplas, check_for_updates, resource_path, mesclar_tabelas_duplas,
     _pdf_export, _excel_export, criar_etiquetas, salvar_feedback_db,
-    carregar_feedbacks_db, excluir_ultimo_feedback, atualizar_ultimo_feedback
+    carregar_feedbacks_db, excluir_ultimo_feedback, atualizar_ultimo_feedback,
 )
 import customtkinter
 from tkinter import filedialog, ttk, messagebox
@@ -338,27 +338,51 @@ def abrir_feedback():
     # inicia atualização periódica
     atualizar_lista_vendedores()
 
-# ----------------- Frame da planilha online -----------------
+# ----------------- Frame da planilha online (MVA e EH lado a lado) -----------------
 
-frame_table = customtkinter.CTkFrame(root)
-frame_table.pack(fill="both", expand=True, padx=10, pady=5)
+frame_online = customtkinter.CTkFrame(root)
+frame_online.pack(fill="both", expand=True, padx=10, pady=5)
 
-spreadsheet_label = customtkinter.CTkLabel(
-    frame_table,
-    text="Planilha Online (MVA + EH)",
+# Frame esquerdo (MVA)
+frame_mva = customtkinter.CTkFrame(frame_online)
+frame_mva.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
+spreadsheet_label_mva = customtkinter.CTkLabel(
+    frame_mva,
+    text="Planilha Online - MVA",
     font=("Segoe UI", 13, "italic"),
     text_color="white"
 )
-spreadsheet_label.pack(anchor="center", padx=3, pady=(0, 5))
+spreadsheet_label_mva.pack(anchor="center", padx=3, pady=(0, 5))
 
 cols_spreadsheet = ("Vendedor", "Clientes Atendidos", "Valor Total")
-tree_spreadsheet = ttk.Treeview(frame_table, columns=cols_spreadsheet, show="headings", height=5)
+tree_spreadsheet_mva = ttk.Treeview(frame_mva, columns=cols_spreadsheet, show="headings", height=5)
 
 for col in cols_spreadsheet:
-    tree_spreadsheet.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree_spreadsheet, _col, False))
-    tree_spreadsheet.column(col, anchor="center", width=150, minwidth=100)
+    tree_spreadsheet_mva.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree_spreadsheet_mva, _col, False))
+    tree_spreadsheet_mva.column(col, anchor="center", width=150, minwidth=100)
 
-tree_spreadsheet.pack(fill="y", expand=False)
+tree_spreadsheet_mva.pack(fill="both", expand=True)
+
+# Frame direito (EH)
+frame_eh = customtkinter.CTkFrame(frame_online)
+frame_eh.pack(side="left", fill="both", expand=True, padx=(5, 0))
+
+spreadsheet_label_eh = customtkinter.CTkLabel(
+    frame_eh,
+    text="Planilha Online - EH",
+    font=("Segoe UI", 13, "italic"),
+    text_color="white"
+)
+spreadsheet_label_eh.pack(anchor="center", padx=3, pady=(0, 5))
+
+tree_spreadsheet_eh = ttk.Treeview(frame_eh, columns=cols_spreadsheet, show="headings", height=5)
+
+for col in cols_spreadsheet:
+    tree_spreadsheet_eh.heading(col, text=col, command=lambda _col=col: ordenar_coluna(tree_spreadsheet_eh, _col, False))
+    tree_spreadsheet_eh.column(col, anchor="center", width=150, minwidth=100)
+
+tree_spreadsheet_eh.pack(fill="both", expand=True)
 
 # --- Função para source arquivo e origem antes do processamento ---
 
@@ -422,14 +446,16 @@ btn_add_mais = customtkinter.CTkButton(
     btn_window,
     text="Adicionar mais um PDF", 
     font=("Segoe UI", 11, "bold"),
-    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var) ,text_color_disabled="#D92525"   
+    command=lambda: adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var), text_color_disabled="#D92525"   
 )
 btn_add_mais.pack(pady=5)
 
 btn_spreadsheet = customtkinter.CTkButton(
     btn_window,
     text="Planilha online",
-    command=lambda: carregar_planilha_async(tree_spreadsheet, progress_var, progress_bar, root),
+    command=lambda: carregar_planilhas_duplas_async(
+        tree_spreadsheet_mva, tree_spreadsheet_eh, progress_var, progress_bar, root
+    ),
 )
 btn_spreadsheet.pack(pady=5)
 
@@ -443,14 +469,29 @@ btn_export.pack(pady=5)
 btn_clear = customtkinter.CTkButton(
     btn_window,
     text="Limpar Tabelas",
-    command=lambda: limpar_tabelas(tree, tree_spreadsheet, label_files_var, progress_var),
+    command=lambda: limpar_tabelas_duplas(
+        tree, 
+        tree_spreadsheet_mva, 
+        tree_spreadsheet_eh, 
+        label_files_var, 
+        progress_var
+    ),
 )
 btn_clear.pack(pady=5)
 
 btn_merge_spreadsheet = customtkinter.CTkButton(
     btn_window,
-    text="Mesclar planilhas",
-    command=lambda: mesclar_tabelas(tree, progress_var, progress_bar, root, label_files_var, tree_spreadsheet), text_color_disabled="#D92525"
+    text="Mesclar Planilhas",
+    command=lambda: mesclar_tabelas_duplas(
+        tree,
+        progress_var,
+        progress_bar,
+        root,
+        label_files_var,
+        tree_spreadsheet_mva,
+        tree_spreadsheet_eh
+    ),
+    text_color_disabled="#D92525"
 )
 btn_merge_spreadsheet.pack(pady=5)
 

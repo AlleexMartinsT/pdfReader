@@ -6,7 +6,9 @@ versionfile_generator()
 hidden_imports = [
     "--hidden-import openpyxl",
     "--hidden-import gspread",
-    "--hidden-import customtkinter"
+    "--hidden-import customtkinter",
+    "--hidden-import pdfplumber",
+    "--hidden-import pandas",
 ]
 
 data_files = [

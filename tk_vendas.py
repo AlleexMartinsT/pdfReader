@@ -6,6 +6,7 @@ from utils import (
     carregar_feedbacks_db, excluir_ultimo_feedback, atualizar_ultimo_feedback,
 )
 import customtkinter
+from library import Image, ImageTk
 from tkinter import filedialog, ttk, messagebox
 import sys, os
 
@@ -35,6 +36,9 @@ else:
     icon_path = "icone.ico"  # path durante o desenvolvimento
     
 root.iconbitmap(icon_path)
+pdf_img = Image.open(resource_path("pdf_icon.png")).resize((26, 26))
+pdf_icon = ImageTk.PhotoImage(pdf_img)
+
 
 # ----------------- Barra de progresso com botão Cancelar -----------------
 frame_progress = customtkinter.CTkFrame(root)
@@ -338,6 +342,53 @@ def abrir_feedback():
     # inicia atualização periódica
     atualizar_lista_vendedores()
 
+# ---------------- Função Exportar ------------------
+
+def exportar_planilha_pdf(tree, titulo):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from tkinter import filedialog, messagebox
+
+    rows = [tree.item(i)["values"] for i in tree.get_children()]
+    cols = [tree.heading(col)["text"] for col in tree["columns"]]
+
+    if not rows:
+        messagebox.showwarning("Aviso", "Não há dados para exportar.")
+        return
+
+    caminho = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("PDF", "*.pdf")],
+        title=f"Exportar {titulo}"
+    )
+    if not caminho:
+        return
+
+    c = canvas.Canvas(caminho, pagesize=A4)
+    largura, altura = A4
+    y = altura - 40
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, y, titulo)
+    y -= 30
+
+    c.setFont("Helvetica-Bold", 10)
+    for i, col in enumerate(cols):
+        c.drawString(50 + i*150, y, col)
+    y -= 20
+
+    c.setFont("Helvetica", 9)
+    for row in rows:
+        for i, val in enumerate(row):
+            c.drawString(50 + i*150, y, str(val))
+        y -= 18
+        if y < 40:
+            c.showPage()
+            y = altura - 40
+            c.setFont("Helvetica", 9)
+
+    c.save()
+    messagebox.showinfo("Sucesso", f"PDF salvo em:\n{caminho}")
 # ----------------- Frame da planilha online (MVA e EH lado a lado) -----------------
 
 frame_online = customtkinter.CTkFrame(root)
@@ -347,13 +398,33 @@ frame_online.pack(fill="both", expand=True, padx=10, pady=5)
 frame_mva = customtkinter.CTkFrame(frame_online)
 frame_mva.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
+frame_mva_top = customtkinter.CTkFrame(frame_mva, fg_color="transparent")
+frame_mva_top.pack(fill="x")
+
+# --- Configura grid para centralizar ---
+frame_mva_top.grid_columnconfigure(0, weight=1)   # espaço esquerdo
+frame_mva_top.grid_columnconfigure(3, weight=1)   # espaço direito
+
 spreadsheet_label_mva = customtkinter.CTkLabel(
-    frame_mva,
+    frame_mva_top,
     text="Planilha Online - MVA",
     font=("Segoe UI", 13, "italic"),
     text_color="white"
 )
-spreadsheet_label_mva.pack(anchor="center", padx=3, pady=(0, 5))
+spreadsheet_label_mva.grid(row=0, column=1, padx=(0,5))
+
+btn_export_mva = customtkinter.CTkButton(
+    frame_mva_top,
+    text="",
+    width=30,
+    height=30,
+    image=pdf_icon,
+    command=lambda: exportar_planilha_pdf(tree_spreadsheet_mva, "Planilha MVA"),
+    fg_color="transparent",
+    hover_color="#3b3b3b"
+)
+
+btn_export_mva.grid(row=0, column=2, padx=6)
 
 cols_spreadsheet = ("Vendedor", "Clientes Atendidos", "Valor Total")
 tree_spreadsheet_mva = ttk.Treeview(frame_mva, columns=cols_spreadsheet, show="headings", height=5)
@@ -368,13 +439,31 @@ tree_spreadsheet_mva.pack(fill="both", expand=True)
 frame_eh = customtkinter.CTkFrame(frame_online)
 frame_eh.pack(side="left", fill="both", expand=True, padx=(5, 0))
 
+frame_eh_top = customtkinter.CTkFrame(frame_eh, fg_color="transparent")
+frame_eh_top.pack(fill="x")
+
+frame_eh_top.grid_columnconfigure(0, weight=1)   # espaço esquerdo
+frame_eh_top.grid_columnconfigure(3, weight=1)   # espaço direito
+
 spreadsheet_label_eh = customtkinter.CTkLabel(
-    frame_eh,
+    frame_eh_top,
     text="Planilha Online - EH",
     font=("Segoe UI", 13, "italic"),
     text_color="white"
 )
-spreadsheet_label_eh.pack(anchor="center", padx=3, pady=(0, 5))
+spreadsheet_label_eh.grid(row=0, column=1, padx=(0,5))
+
+btn_export_eh = customtkinter.CTkButton(
+    frame_eh_top,
+    text="",
+    width=30,
+    height=30,
+    image=pdf_icon,
+    command=lambda: exportar_planilha_pdf(tree_spreadsheet_eh, "Planilha EH"),
+    fg_color="transparent",
+    hover_color="#3b3b3b"
+)
+btn_export_eh.grid(row=0, column=2, padx=6)
 
 tree_spreadsheet_eh = ttk.Treeview(frame_eh, columns=cols_spreadsheet, show="headings", height=5)
 
@@ -432,6 +521,7 @@ btn_window.title("Opções")
 btn_window.geometry(f"250x320+{x_coordinate + window_width + 10}+{y_coordinate}")
 btn_window.resizable(False, False)
 btn_window.iconbitmap(icon_path)
+
 
 btn = customtkinter.CTkButton(
     btn_window,

@@ -516,12 +516,40 @@ def pdf_select_flow():
     btn.configure(state="disabled")
 
 # ----------------- Janela lateral de botões -----------------
+
 btn_window = customtkinter.CTkToplevel(root)
 btn_window.title("Opções")
 btn_window.geometry(f"250x320+{x_coordinate + window_width + 10}+{y_coordinate}")
 btn_window.resizable(False, False)
 btn_window.iconbitmap(icon_path)
 
+def impedir_fechamento():
+    pass  
+
+btn_window.protocol("WM_DELETE_WINDOW", impedir_fechamento)
+
+_syncing = False
+
+def sync_on_minimize(event):
+    global _syncing
+    if _syncing:
+        return
+
+    _syncing = True
+    try:
+        # Se a principal foi minimizada
+        if root.state() == "iconic":
+            btn_window.iconify()
+
+        # Se a lateral foi minimizada
+        elif btn_window.state() == "iconic":
+            root.iconify()
+
+    finally:
+        _syncing = False
+
+root.bind("<Unmap>", sync_on_minimize)
+btn_window.bind("<Unmap>", sync_on_minimize)
 
 btn = customtkinter.CTkButton(
     btn_window,

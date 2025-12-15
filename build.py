@@ -15,6 +15,7 @@ data_files = [
     '--add-data "data;data"',
     '--add-data "mapping.json;."',
     '--add-data "icone.ico;."',
+    '--add-data "pdf_icon.png;."',
     '--add-data "basedTheme.json;."',
     '--add-data "C:/Users/vendas/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/site-packages/customtkinter;customtkinter/."'
 ]

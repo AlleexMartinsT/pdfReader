@@ -906,6 +906,10 @@ def limpar_tabelas(tree, tree_planilha, label_files_var, progress_var):
     from global_vars import list_results, listFiles
     from tk_vendas import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
     
+    from global_vars import results_by_source
+    results_by_source["MVA"].clear()
+    results_by_source["EH"].clear()
+
     btn_merge_spreadsheet.configure(state="normal")
     btn_add_mais.configure(state="normal")
     btn.configure(state="normal")
@@ -1026,6 +1030,10 @@ def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var
     # também limpa lista de resultados
     from global_vars import list_results, listFiles
     from tk_vendas import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
+    from global_vars import results_by_source
+    results_by_source["MVA"].clear()
+    results_by_source["EH"].clear()
+
     
     btn_merge_spreadsheet.configure(state="normal")
     btn_add_mais.configure(state="normal")

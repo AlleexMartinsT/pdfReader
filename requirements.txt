@@ -6,8 +6,6 @@ certifi==2025.11.12
 cffi==2.0.0
 charset-normalizer==3.4.4
 cryptography==46.0.3
-customtkinter==5.2.2
-darkdetect==0.8.0
 deprecation==2.1.0
 et_xmlfile==2.0.0
 google-auth==2.41.1
@@ -45,6 +43,7 @@ pyinstaller-hooks-contrib==2025.9
 PyJWT==2.10.1
 pyparsing==3.2.5
 pypdfium2==5.0.0
+PySide6==6.8.1
 python-dateutil==2.9.0.post0
 pytz==2025.2
 pywin32-ctypes==0.2.3

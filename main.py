@@ -1,11 +1,5 @@
-from utils import *
-from library import *
-from global_vars import *
-from tk_vendas import *
+from qt_vendas import run_app
 
-try:
-    root.iconbitmap("icone.ico")
-except Exception as e:
-    print("Não consegui carregar ícone:", e)
-    
-        
+
+if __name__ == "__main__":
+    run_app()

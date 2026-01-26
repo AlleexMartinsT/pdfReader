@@ -1,28 +1,63 @@
 import os
-from library import versionfile_generator
+import sys
+import subprocess
+import re
+import zipfile
+from pathlib import Path
+from versionfile_generator import versionfile_generator
 
 versionfile_generator()
 
 hidden_imports = [
-    "--hidden-import openpyxl",
-    "--hidden-import gspread",
-    "--hidden-import customtkinter",
-    "--hidden-import pdfplumber",
-    "--hidden-import pandas",
+    "openpyxl",
+    "gspread",
+    "pdfplumber",
+    "pandas",
 ]
 
 data_files = [
-    '--add-data "data;data"',
-    '--add-data "mapping.json;."',
-    '--add-data "icone.ico;."',
-    '--add-data "pdf_icon.png;."',
-    '--add-data "basedTheme.json;."',
-    '--add-data "C:/Users/vendas/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/LocalCache/local-packages/Python313/site-packages/customtkinter;customtkinter/."'
+    "data;data",
+    "mapping.json;.",
+    "icone.ico;.",
+    "pdf_icon.png;.",
 ]
 
-hidden_imports_str = " ".join(hidden_imports)
-data_files_str = " ".join(data_files)
+args = [
+    sys.executable,
+    "-m",
+    "PyInstaller",
+    "--onedir",
+    "--noconfirm",
+    "--noconsole",
+    "--icon=icone.ico",
+    "--name",
+    "Relatorio de Clientes",
+    "--version-file",
+    "version.txt",
+    "--collect-all",
+    "PySide6",
+]
 
-cmd = f'python -m PyInstaller {hidden_imports_str} {data_files_str} --onefile --noconfirm  --noconsole --icon=icone.ico --name "Relatorio de Clientes" --version-file version.txt main.py'
+for module in hidden_imports:
+    args.extend(["--hidden-import", module])
 
-os.system(cmd)
+for item in data_files:
+    args.extend(["--add-data", item])
+
+args.append("main.py")
+
+subprocess.run(args, check=True)
+
+with open("global_vars.py", "r", encoding="utf-8") as f:
+    match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', f.read())
+    if not match:
+        raise RuntimeError("APP_VERSION não encontrado em global_vars.py")
+    app_version = match.group(1)
+
+dist_dir = Path("dist") / "Relatorio de Clientes"
+zip_path = Path("dist") / f"RelatorioClientes-{app_version}.zip"
+if dist_dir.exists():
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in dist_dir.rglob("*"):
+            if file_path.is_file():
+                zf.write(file_path, file_path.relative_to(dist_dir))

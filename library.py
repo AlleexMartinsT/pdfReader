@@ -1,4 +1,3 @@
-import pdfplumber
 import tempfile
 import re
 import hashlib
@@ -8,10 +7,6 @@ import json,difflib
 import ctypes
 import threading
 import queue
-import tkinter.messagebox as messagebox
-import pandas as pd
-import openpyxl
-import time
+from ui_dialogs import messagebox
 import os
-from PIL import Image, ImageTk, ImageEnhance
-from versionfile_generator import versionfile_generator
+from PIL import Image, ImageEnhance

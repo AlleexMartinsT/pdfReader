@@ -1,4 +1,10 @@
-from library import queue, threading, os, re, json, time, pdfplumber, messagebox, difflib, pd
+import os
+import re
+import json
+import threading
+import queue
+import difflib
+from ui_dialogs import filedialog, messagebox
 from global_vars import (
     listFiles, list_results, regex_data, regex_negative, 
     APP_VERSION, GITHUB_REPO, LAST_EH, LAST_MVA , LAST_HASH_MERGE,
@@ -10,10 +16,36 @@ progress_queue = queue.Queue()
 cancel_event = threading.Event()
 LAST_STATE_SPREADSHEET = {}
 
+_UI_REFS = {
+    "btn_cancel": None,
+    "progress_var": None,
+    "progress_bar": None,
+    "progress_var_online": None,
+    "progress_bar_online": None,
+    "btn_tag": None,
+    "btn_add_mais": None,
+    "btn_merge_spreadsheet": None,
+    "btn_select_pdf": None,
+}
+
+
+def _get_pd():
+    import pandas as pd
+    return pd
+
+
+def _get_pdfplumber():
+    import pdfplumber
+    return pdfplumber
+
+
+def set_ui_refs(**kwargs):
+    _UI_REFS.update({k: v for k, v in kwargs.items() if k in _UI_REFS})
+
 def set_btn_cancel(state="disabled"):
-    from tk_vendas import btn_cancel
-    
-    btn_cancel.configure(state=state)
+    btn_cancel = _UI_REFS.get("btn_cancel")
+    if btn_cancel:
+        btn_cancel.configure(state=state)
 
 def process_cancel(): 
     cancel_event.set()
@@ -24,10 +56,20 @@ def process_cancel():
             break
     set_btn_cancel()
     # 🔹 Reseta barra
-    from tk_vendas import progress_var, progress_bar
-    progress_var.set(0)
-    progress_bar.stop()
-    progress_bar.config(mode="determinate")
+    progress_var = _UI_REFS.get("progress_var")
+    progress_bar = _UI_REFS.get("progress_bar")
+    progress_var_online = _UI_REFS.get("progress_var_online")
+    progress_bar_online = _UI_REFS.get("progress_bar_online")
+    if progress_var:
+        progress_var.set(0)
+    if progress_bar:
+        progress_bar.stop()
+        progress_bar.config(mode="determinate")
+    if progress_var_online:
+        progress_var_online.set(0)
+    if progress_bar_online:
+        progress_bar_online.stop()
+        progress_bar_online.config(mode="determinate")
 
 def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, path_var=None):
     """Consome eventos da fila em intervalos e atualiza a UI sem travar."""
@@ -45,36 +87,48 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
 
     elif kind == "done":
         set_btn_cancel()
-        if payload.get("__cancelled__"):
+        # payload agora ? {"results": resultados, "source": origem, "path_var": caminho}
+        results = payload.get("resultados")
+        source = payload.get("origem")
+        path_var = payload.get("caminho")
+
+        if not isinstance(results, dict):
+            messagebox.showerror("Erro", "Resultado inv?lido do processamento.")
+            return
+
+        if results.get("__cancelled__"):
             progress_var.set(0)
             messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
-        else:
-            # payload agora é {"results": resultados, "source": origem, "path_var": caminho}
-            results = payload.get("resultados")
-            source = payload.get("origem")
-            path_var = payload.get("caminho")
+            return
+        if results.get("__empty__"):
+            progress_var.set(0)
+            messagebox.showwarning("Aviso", "Nenhum dado foi encontrado neste PDF.")
+            return
+        if results.get("__error__"):
+            messagebox.showerror("Erro", results.get("__error__"))
+            return
 
-            # garante que results_by_source exista no globalVar
-            try:
-                from global_vars import results_by_source
-            except Exception:
-                results_by_source = {"MVA": [], "EH": []}
+        # garante que results_by_source exista no globalVar
+        try:
+            from global_vars import results_by_source
+        except Exception:
+            results_by_source = {"MVA": [], "EH": []}
 
-            # armazena por origem
-            if source not in results_by_source:
-                results_by_source[source] = []
-            results_by_source[source].append((path_var, results))
+        # armazena por origem
+        if source not in results_by_source:
+            results_by_source[source] = []
+        results_by_source[source].append((path_var, results))
 
-            # armazena lista global e atualiza a tree
-            listFiles.append(path_var)
-            list_results.append(results)
+        # armazena lista global e atualiza a tree
+        listFiles.append(path_var)
+        list_results.append(results)
 
-            # atualiza a interface (label e tree)
-            label_files_var.set(f"Arquivo carregado: {os.path.basename(path_var)} ({source})")
-            tree_update(tree)
-            messagebox.showinfo("Concluído", f"Processamento finalizado ({source})!")
-            for vendedor in results.keys():
-                registrar_vendedor_db(vendedor)
+        # atualiza a interface (label e tree)
+        label_files_var.set(f"Arquivo carregado: {os.path.basename(path_var)} ({source})")
+        tree_update(tree)
+        messagebox.showinfo("Conclu?do", f"Processamento finalizado ({source})!")
+        for vendedor in results.keys():
+            registrar_vendedor_db(vendedor)
 
     elif kind == "error":
         set_btn_cancel()
@@ -103,8 +157,15 @@ def load_mapping(path='mapping.json'):
         mp = json.load(f)
     return {k.strip().upper(): v.strip() for (k, v) in mp.items()}
 
-mapping = load_mapping()
-CANON_BY_VALUE_UPPER = {v.upper(): v for v in mapping.values()}
+mapping = None
+CANON_BY_VALUE_UPPER = None
+
+
+def _ensure_mapping_loaded():
+    global mapping, CANON_BY_VALUE_UPPER
+    if mapping is None:
+        mapping = load_mapping()
+        CANON_BY_VALUE_UPPER = {v.upper(): v for v in mapping.values()}
 
 def save_mapping(): 
     """Salva o mapeamento atualizado no arquivo do usuário."""
@@ -124,37 +185,38 @@ def _normalize_key(s: str) -> str:
     return s.strip().upper()
 
 def parse_number(num_str: str) -> float:
-    """Converte string numérica em float, suportando formatos BR e US, removendo R$."""
-    if not num_str:
+    """Converte string numerica em float, suportando formatos BR e US, removendo R$."""
+    if num_str is None:
         return 0.0
-    num_str = str(num_str).strip().replace("R$", "").replace(" ", "")
-
-    # Caso brasileiro: 79.833,85
-    if "," in num_str and "." in num_str and num_str.rfind(",") > num_str.rfind("."):
-        num_str = num_str.replace(".", "").replace(",", ".")
+    if isinstance(num_str, (int, float)):
         return float(num_str)
 
-    # Caso americano: 92,229.51
-    if "," in num_str and "." in num_str and num_str.rfind(".") < num_str.rfind(","):
-        num_str = num_str.replace(",", "")
-        return float(num_str)
+    s = str(num_str).strip()
+    if not s:
+        return 0.0
 
-    # Caso só vírgula (310,75)
-    if "," in num_str:
-        return float(num_str.replace(",", "."))
+    s = s.replace("R$", "").replace(" ", "").replace(" ", "")
+    last_comma = s.rfind(",")
+    last_dot = s.rfind(".")
 
-    # Caso só ponto (310.75)
-    if "." in num_str:
-        return float(num_str)
+    if last_comma != -1 and last_dot != -1:
+        if last_comma > last_dot:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+        return float(s)
 
-    # Caso números puros
-    return float(num_str)
+    if last_comma != -1:
+        return float(s.replace(",", "."))
+
+    return float(s)
 
 def format_number_br(num: float) -> str:
     """Formata número no padrão brasileiro com duas casas decimais."""
     return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def canonicalize_name(raw: str) -> str:
+    _ensure_mapping_loaded()
     key = _normalize_key(raw)
 
     # 1) se existe como abreviação no mapping
@@ -178,7 +240,6 @@ def canonicalize_name(raw: str) -> str:
 def criar_etiquetas():
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
-    from tkinter import filedialog
     from global_vars import results_by_source
 
     # precisa ter MVA e EH carregados
@@ -192,7 +253,7 @@ def criar_etiquetas():
         title="Salvar etiquetas"
     )
     if not caminho:
-        return
+        return False
 
     c = canvas.Canvas(caminho, pagesize=A4)
     largura, altura = A4
@@ -248,6 +309,7 @@ def criar_etiquetas():
 def extrair_planilha_online():
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
+    pd = _get_pd()
 
     global LAST_MVA, LAST_EH  # usar globais para comparar depois
 
@@ -293,16 +355,21 @@ def extrair_planilha_online():
 
     # --- Agregação por vendedor (soma MVA + EH) ---
     agregados = {}
+    canon_cache = {}
 
     # concatena ambas as abas para processar de forma uniforme
     df_total = pd.concat([dfMVA, dfEH], ignore_index=True)
 
-    for _, row in df_total.iterrows():
-        vendedor_raw = str(row.iloc[0]).strip()
+    for row in df_total.itertuples(index=False):
+        vendedor_raw = str(row[0]).strip()
         if not vendedor_raw or vendedor_raw.lower() in ["nan", "none", ""]:
             continue
 
-        vendedor = canonicalize_name(vendedor_raw)
+        if vendedor_raw in canon_cache:
+            vendedor = canon_cache[vendedor_raw]
+        else:
+            vendedor = canonicalize_name(vendedor_raw)
+            canon_cache[vendedor_raw] = vendedor
 
         if vendedor not in agregados:
             agregados[vendedor] = {"atendidos": 0, "total_vendas": 0.0}
@@ -311,7 +378,7 @@ def extrair_planilha_online():
         total_row = 0.0
 
         # percorre o resto das colunas da linha somando valores numéricos
-        for v in row.iloc[1:]:
+        for v in row[1:]:
             if pd.isna(v) or str(v).strip() == "":
                 continue
             try:
@@ -334,26 +401,28 @@ def extrair_planilha_online():
     return dfMVA, dfEH, df_agg
 
 def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
-    from tk_vendas import btn_merge_spreadsheet
+    btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
+    pd = _get_pd()
 
     try:
         cancel_event.clear()
         progress_var.set(0)
+        set_btn_cancel(state="normal")
 
         def worker():
             progressQueuePlanilha.put(("ui", {"action": "start_indeterminate"}))
-
             try:
                 resultado = extrair_planilha_online()
                 if resultado is None:
                     progress_bar.stop()
                     progress_bar.config(mode="determinate")
                     progress_var.set(0)
+                    set_btn_cancel()
                     return messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado")
                 else:
                     for item in tree_planilha.get_children():
                         tree_planilha.delete(item)
-                    if btn_merge_spreadsheet == "disabled":
+                    if btn_merge_spreadsheet:
                         btn_merge_spreadsheet.configure(state="normal")
 
                     # agora extrai também o DataFrame agregado
@@ -363,18 +432,18 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                     resultados = []
 
                     # percorre o df_agg (já somado por vendedor)
-                    for i, (_, row) in enumerate(df_agg.iterrows(), start=1):
+                    for i, row in enumerate(df_agg.itertuples(index=False, name=None), start=1):
                         # 🔹 Verifica se foi cancelado
                         if cancel_event.is_set():
                             progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
                             return
 
-                        vendedor = str(row["vendedor"]).strip()
+                        vendedor = str(row[0]).strip()
                         if not vendedor:
                             continue
 
-                        atendidos = int(row["atendidos"]) if not pd.isna(row["atendidos"]) else 0
-                        total = float(row["total_vendas"]) if not pd.isna(row["total_vendas"]) else 0.0
+                        atendidos = int(row[1]) if not pd.isna(row[1]) else 0
+                        total = float(row[2]) if not pd.isna(row[2]) else 0.0
 
                         if atendidos > 0 or total > 0:
                             resultados.append((vendedor, atendidos, total))
@@ -382,7 +451,6 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                         # 🔹 Atualiza progresso gradualmente
                         progresso = int(i * 100 / max(1, total_rows))
                         progressQueuePlanilha.put(("progress", progresso))
-                        time.sleep(0.02)
 
                     progressQueuePlanilha.put(("done_planilha", resultados))
 
@@ -395,7 +463,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
 
         def poll_queue_planilha():
             try:
-                while True:
+                for _ in range(50):
                     kind, payload = progressQueuePlanilha.get_nowait()
                     if kind == "progress":
                         if str(progress_bar["mode"]) == "indeterminate":
@@ -409,6 +477,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                             progress_bar.config(mode="indeterminate")
                             progress_bar.start(10)
                     elif kind == "done_planilha":
+                        set_btn_cancel()
                         if isinstance(payload, dict) and payload.get("__cancelled__"):
                             progress_bar.stop()
                             progress_bar.config(mode="determinate")
@@ -428,6 +497,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                             messagebox.showinfo("Sucesso", "✅ Planilha online carregada com sucesso!")
                         return
                     elif kind == "error":
+                        set_btn_cancel()
                         messagebox.showerror("Erro", payload)
                         return
             except queue.Empty:
@@ -437,18 +507,20 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
         poll_queue_planilha()
 
     except Exception as e:
+        set_btn_cancel()
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento da planilha: {e}")
 
 def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_bar, root):
     """Carrega as planilhas online (MVA e EH) em paralelo, cada uma no seu Treeview."""
-    import threading, queue, time
-    from tkinter import messagebox
+    import threading, queue
+    pd = _get_pd()
     global cancel_event
-    from tk_vendas import btn_merge_spreadsheet
+    btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
 
     try:
         cancel_event.clear()
         progress_var.set(0)
+        set_btn_cancel(state="normal")
         progressQueuePlanilha = queue.Queue()
 
         def worker():
@@ -459,6 +531,7 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                     progress_bar.stop()
                     progress_bar.config(mode="determinate")
                     progress_var.set(0)
+                    set_btn_cancel()
                     return messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado")
 
                 dfMVA, dfEH, _ = resultado  # ignoramos o df_agg por enquanto
@@ -468,22 +541,23 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                     for item in tree.get_children():
                         tree.delete(item)
 
-                if btn_merge_spreadsheet == "disabled":
+                if btn_merge_spreadsheet:
                     btn_merge_spreadsheet.configure(state="normal")
 
                 # Preenche as duas tabelas
                 def fill_tree(df, tree):
                     total_rows = len(df)
-                    for i, (_, row) in enumerate(df.iterrows(), start=1):
+                    for i, row in enumerate(df.itertuples(index=False, name=None), start=1):
                         if cancel_event.is_set():
                             progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
                             return
-                        vendedor = str(row.iloc[0]).strip()
+                        vendedor = str(row[0]).strip()
                         if not vendedor:
                             continue
-                        atendidos = len([v for v in row.iloc[1:] if str(v).strip() != ""])
+                        valores = row[1:]
+                        atendidos = sum(1 for v in valores if str(v).strip() != "")
                         total = 0.0
-                        for v in row.iloc[1:]:
+                        for v in valores:
                             try:
                                 total += float(str(v).replace(",", "."))
                             except Exception:
@@ -505,7 +579,7 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
 
         def poll_queue():
             try:
-                while True:
+                for _ in range(50):
                     kind, payload = progressQueuePlanilha.get_nowait()
                     if kind == "progress":
                         if str(progress_bar["mode"]) == "indeterminate":
@@ -518,6 +592,7 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                             progress_bar.config(mode="indeterminate")
                             progress_bar.start(10)
                     elif kind == "done_planilha":
+                        set_btn_cancel()
                         progress_bar.stop()
                         progress_bar.config(mode="determinate")
                         progress_var.set(100 if payload == "ok" else 0)
@@ -527,6 +602,7 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                             messagebox.showinfo("Sucesso", "✅ Planilhas online carregadas com sucesso!")
                         return
                     elif kind == "error":
+                        set_btn_cancel()
                         messagebox.showerror("Erro", payload)
                         return
             except queue.Empty:
@@ -536,6 +612,7 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
         poll_queue()
 
     except Exception as e:
+        set_btn_cancel()
         messagebox.showerror("Erro", f"Erro ao iniciar carregamento das planilhas: {e}")
 
 def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, btn_cancel, caminho, origem):
@@ -546,7 +623,7 @@ def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, bt
     global listFiles, list_results
 
     if not caminho:
-        return
+        return False
 
     # evita duplicados
     if caminho in listFiles:
@@ -581,8 +658,8 @@ def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, bt
     _poll_queue(root, tree, progress_var, progress_bar, label_files_var)
 
 def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
-    from tkinter import filedialog
-    from tk_vendas import btn_tag, btn_add_mais
+    btn_tag = _UI_REFS.get("btn_tag")
+    btn_add_mais = _UI_REFS.get("btn_add_mais")
     
     global listFiles, list_results
     local_queue = queue.Queue()
@@ -594,13 +671,14 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
 
     caminho = filedialog.askopenfilename(filetypes=[("Arquivos PDF", "*.pdf")])
     if not caminho:
-        return
+        return False
     
     if caminho in listFiles:
         messagebox.showerror("Erro", "Arquivo já importado!")
         return
     
     try:
+        pdfplumber = _get_pdfplumber()
         with pdfplumber.open(caminho) as pdf:
             if pdf.metadata.get("encrypted", False):
                 messagebox.showerror("Erro", "Este PDF está protegido por senha.")
@@ -646,7 +724,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
 
     def poll_queue_add():
         try:
-            while True:
+            for _ in range(50):
                 kind, payload = local_queue.get_nowait()
                 if kind == "progress":
                     progress_var.set(payload)
@@ -685,8 +763,10 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
 
 
                         tree_update(tree)
-                        btn_tag.configure(state="normal", fg_color="#44cc64")
-                        btn_add_mais.configure(state="disabled", fg_color="#EE9919", text_color_disabled="#D92525")
+                        if btn_tag:
+                            btn_tag.configure(state="normal", fg_color="#44cc64")
+                        if btn_add_mais:
+                            btn_add_mais.configure(state="disabled", fg_color="#EE9919", text_color_disabled="#D92525")
                         messagebox.showinfo("Concluído", f"PDF adicional processado e atribuído a {origem}!")
                     return
 
@@ -762,6 +842,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
     """
     resultados = {}
     vendedor_atual = None
+    canon_cache = {}
 
     # se não vier nada, cria versões "neutras"
     if on_progress is None:
@@ -775,6 +856,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
             dados = resultados[vendedor_atual]
             dados["total_clientes"] = dados["atendidos"] - dados["devolucoes"]
 
+    pdfplumber = _get_pdfplumber()
     with pdfplumber.open(caminho_pdf) as pdf:
         total = len(pdf.pages)
         for i, pagina in enumerate(pdf.pages, start=1):
@@ -792,7 +874,11 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                                 vendedor_bruto = " ".join(palavras[1:])
                             else:
                                 vendedor_bruto = " ".join(palavras)
-                            vendedor_atual = canonicalize_name(vendedor_bruto)
+                            if vendedor_bruto in canon_cache:
+                                vendedor_atual = canon_cache[vendedor_bruto]
+                            else:
+                                vendedor_atual = canonicalize_name(vendedor_bruto)
+                                canon_cache[vendedor_bruto] = vendedor_atual
                             if vendedor_atual not in resultados:
                                 resultados[vendedor_atual] = {
                                     "atendidos": 0,
@@ -828,7 +914,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
     return resultados
 
 def ordenar_coluna(tree, col, reverse):
-    dados = [(tree.set(k, col), k) for k in tree.get_children('')]
+    dados = [(tree.set(k, col), k) for k in tree.get_children()]
     
     def try_num(v):
         v = str(v)
@@ -846,39 +932,81 @@ def ordenar_coluna(tree, col, reverse):
 
 def check_for_updates(root):
     import requests
-    
+    import zipfile
+    import shutil
+    import subprocess
+    import sys
+
     def worker():
         try:
-            # Checa versão
+            # Checa versao
             response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=10)
             response.raise_for_status()
             data = response.json()
             latest_version = data["tag_name"].lstrip("v")
 
             if latest_version > APP_VERSION:
-                # Mostra diálogo na thread principal usando after()
+                # Mostra dialogo na thread principal usando after()
                 def ask_user():
-                    if messagebox.askyesno("Atualização Disponível",
-                        f"Uma nova versão ({latest_version}) está disponível! Deseja baixar agora?"):
-                        asset_url = data["assets"][0]["browser_download_url"]
-                        new_file = f"Relatório de Clientes {latest_version}.exe"
+                    if messagebox.askyesno("Atualizacao Disponivel",
+                        f"Uma nova versao ({latest_version}) esta disponivel! Deseja baixar agora?"):
+                        assets = data.get("assets", [])
+                        zip_asset = None
+                        for asset in assets:
+                            name = asset.get("name", "").lower()
+                            if name.endswith(".zip"):
+                                zip_asset = asset
+                                break
+                        if not zip_asset:
+                            messagebox.showerror("Erro", "Nenhum arquivo .zip encontrado na release.")
+                            return
+
+                        asset_url = zip_asset["browser_download_url"]
+                        base_dir = os.path.join(os.getenv("LOCALAPPDATA", "."), "RelatorioClientes")
+                        os.makedirs(base_dir, exist_ok=True)
+                        zip_path = os.path.join(base_dir, f"RelatorioClientes-{latest_version}.zip")
+                        extract_dir = os.path.join(base_dir, f"app-{latest_version}")
                         try:
                             download = requests.get(asset_url, stream=True, timeout=30)
-                            with open(new_file, "wb") as f:
+                            with open(zip_path, "wb") as f:
                                 for chunk in download.iter_content(8192):
                                     f.write(chunk)
+                            if os.path.exists(extract_dir):
+                                shutil.rmtree(extract_dir, ignore_errors=True)
+                            with zipfile.ZipFile(zip_path, "r") as zf:
+                                zf.extractall(extract_dir)
+
+                            exe_path = os.path.join(extract_dir, "Relatorio de Clientes.exe")
+                            if not os.path.exists(exe_path):
+                                for root_dir, _dirs, files in os.walk(extract_dir):
+                                    for fname in files:
+                                        if fname.lower().endswith(".exe"):
+                                            exe_path = os.path.join(root_dir, fname)
+                                            break
+                                    if os.path.exists(exe_path):
+                                        break
+
+                            if not os.path.exists(exe_path):
+                                messagebox.showerror("Erro", "Nao foi possivel localizar o executavel na atualizacao.")
+                                return
+
                             messagebox.showinfo("Atualizado",
-                                f"Nova versão baixada como '{new_file}'. "
-                                "Feche o app, substitua o arquivo atual por esse novo e reinicie.")
+                                "Nova versao baixada e extraida. O aplicativo sera reiniciado.")
+                            try:
+                                subprocess.Popen([exe_path])
+                            except Exception as e:
+                                messagebox.showerror("Erro", f"Falha ao iniciar nova versao: {e}")
+                                return
+                            sys.exit(0)
                         except Exception as e:
                             messagebox.showerror("Erro no Download", f"Ocorreu um erro: {e}")
-                root.after(0, ask_user)  # root é sua janela Tk principal
+                root.after(0, ask_user)  # root e sua janela principal
             else:
                 print("App atualizado.")
 
         except Exception as e:
-            root.after(0, lambda: messagebox.showerror("Erro na Atualização",
-                                                       f"Ocorreu um erro ao checar atualizações: {e}"))
+            root.after(0, lambda: messagebox.showerror("Erro na Atualizacao",
+                                                       f"Ocorreu um erro ao checar atualizacoes: {e}"))
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -904,16 +1032,23 @@ def limpar_tabelas(tree, tree_planilha, label_files_var, progress_var):
     
     # também limpa lista de resultados
     from global_vars import list_results, listFiles
-    from tk_vendas import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
-    
+    btn_add_mais = _UI_REFS.get("btn_add_mais")
+    btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
+    btn = _UI_REFS.get("btn_select_pdf")
+    btn_tag = _UI_REFS.get("btn_tag")
+
     from global_vars import results_by_source
     results_by_source["MVA"].clear()
     results_by_source["EH"].clear()
 
-    btn_merge_spreadsheet.configure(state="normal")
-    btn_add_mais.configure(state="normal")
-    btn.configure(state="normal")
-    btn_tag.configure(state="disabled", fg_color="#EE9919", text_color_disabled="gray45")
+    if btn_merge_spreadsheet:
+        btn_merge_spreadsheet.configure(state="normal")
+    if btn_add_mais:
+        btn_add_mais.configure(state="normal")
+    if btn:
+        btn.configure(state="normal")
+    if btn_tag:
+        btn_tag.configure(state="disabled", fg_color="#EE9919", text_color_disabled="gray45")
     
     list_results.clear()
     listFiles.clear()
@@ -921,8 +1056,7 @@ def limpar_tabelas(tree, tree_planilha, label_files_var, progress_var):
     messagebox.showinfo("Limpo", "Todas as tabelas foram limpas com sucesso!")
             
 def _excel_export(tree):
-    from tkinter import filedialog
-    
+    pd = _get_pd()
     # Extrai os dados
     cols = [tree.heading(col)["text"] for col in tree["columns"]]
     dados = [tree.item(item)["values"] for item in tree.get_children()]
@@ -951,15 +1085,14 @@ def _excel_export(tree):
     )
     
     if not caminho:
-        return
+        return False
     
     df.to_excel(caminho, index=False, engine="openpyxl")
     
     messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
-def _pdf_export(tree):
-    
-    from tkinter import filedialog
+def _pdf_export(tree) -> bool:
+
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     
@@ -977,7 +1110,7 @@ def _pdf_export(tree):
         title="Salvar relatório PDF"
     )
     if not caminho:
-        return
+        return False
 
     # Criar PDF simples
     c = canvas.Canvas(caminho, pagesize=A4)
@@ -1008,8 +1141,6 @@ def _pdf_export(tree):
 
 def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var):
     """Limpa todas as tabelas (PDF + MVA + EH) e reseta os indicadores."""
-    from tkinter import messagebox
-    
     global LAST_EH, LAST_MVA, LAST_STATE_SPREADSHEET, LAST_HASH_MERGE
 
 
@@ -1029,16 +1160,23 @@ def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var
     
     # também limpa lista de resultados
     from global_vars import list_results, listFiles
-    from tk_vendas import btn_add_mais, btn_merge_spreadsheet, btn, btn_tag
+    btn_add_mais = _UI_REFS.get("btn_add_mais")
+    btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
+    btn = _UI_REFS.get("btn_select_pdf")
+    btn_tag = _UI_REFS.get("btn_tag")
     from global_vars import results_by_source
     results_by_source["MVA"].clear()
     results_by_source["EH"].clear()
 
     
-    btn_merge_spreadsheet.configure(state="normal")
-    btn_add_mais.configure(state="normal")
-    btn.configure(state="normal")
-    btn_tag.configure(state="disabled", fg_color="#EE9919", text_color_disabled="gray45")
+    if btn_merge_spreadsheet:
+        btn_merge_spreadsheet.configure(state="normal")
+    if btn_add_mais:
+        btn_add_mais.configure(state="normal")
+    if btn:
+        btn.configure(state="normal")
+    if btn_tag:
+        btn_tag.configure(state="disabled", fg_color="#EE9919", text_color_disabled="gray45")
     
     list_results.clear()
     listFiles.clear()
@@ -1047,19 +1185,35 @@ def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var
     progress_var.set(0)
     messagebox.showinfo("Limpeza concluída", "🧹 Todas as tabelas foram limpas com sucesso.")
 
+def _hash_tree_snapshot(trees):
+    import hashlib
+
+    hasher = hashlib.md5()
+    for tree in trees:
+        for item in tree.get_children():
+            values = tree.item(item)["values"]
+            for val in values:
+                hasher.update(str(val).encode("utf-8"))
+                hasher.update(b"\x1f")
+            hasher.update(b"\x1e")
+    return hasher.hexdigest()
+
+
+
 def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_var,
                            tree_mva, tree_eh):
     """
     Mescla os valores das planilhas online (MVA e EH) com a tabela de PDFs (tree).
     Soma os dados das duas planilhas e atualiza a barra de progresso.
     """
-    from tk_vendas import btn_merge_spreadsheet, btn_add_mais, btn
+    btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
+    btn_add_mais = _UI_REFS.get("btn_add_mais")
+    btn = _UI_REFS.get("btn_select_pdf")
     global LAST_HASH_MERGE, LAST_STATE_SPREADSHEET
 
-    import threading, queue, time, json, hashlib
-    from tkinter import messagebox
-
-    btn_merge_spreadsheet.configure(state="enabled")
+    import threading, queue
+    if btn_merge_spreadsheet:
+        btn_merge_spreadsheet.configure(state="enabled")
 
     # 🔹 Verifica se alguma tabela está vazia
     if not tree.get_children():
@@ -1068,19 +1222,16 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
     if not tree_mva.get_children() and not tree_eh.get_children():
         messagebox.showwarning("Aviso", "As tabelas online estão vazias. Carregue as planilhas MVA e EH antes de mesclar.")
         return
+    try:
+        from global_vars import results_by_source
+    except Exception:
+        results_by_source = {"MVA": [], "EH": []}
+    if not results_by_source.get("MVA") or not results_by_source.get("EH"):
+        messagebox.showwarning("Aviso", "Importe os dois PDFs (MVA e EH) antes de mesclar.")
+        return
 
-    # Snapshot dos dados atuais (pra detectar duplicações)
-    dados_pdf_snapshot = [tree.item(i)["values"] for i in tree.get_children()]
-    dados_mva_snapshot = [tree_mva.item(i)["values"] for i in tree_mva.get_children()]
-    dados_eh_snapshot = [tree_eh.item(i)["values"] for i in tree_eh.get_children()]
-
-    snapshot_str = json.dumps({
-        "pdf": dados_pdf_snapshot,
-        "mva": dados_mva_snapshot,
-        "eh": dados_eh_snapshot
-    }, sort_keys=True)
-
-    novo_hash = hashlib.md5(snapshot_str.encode()).hexdigest()
+    # Snapshot dos dados atuais (pra detectar duplicacoes)
+    novo_hash = _hash_tree_snapshot((tree, tree_mva, tree_eh))
     if LAST_HASH_MERGE == novo_hash:
         messagebox.showinfo("Aviso", "⚠️ Esses dados já foram mesclados. Nenhuma alteração detectada.")
         return
@@ -1151,7 +1302,6 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                 LAST_STATE_SPREADSHEET[vendedor] = dados
                 progresso = int(idx * 40 / max(1, len(dados_planilha_total)))
                 merge_queue.put(("progress", progresso))
-                time.sleep(0.01)
 
             # 5️⃣ Mescla tudo
             total_vendedores = len(set(dados_pdf.keys()) | set(novos_planilha.keys()))
@@ -1169,7 +1319,6 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
 
                 progresso = 40 + int(idx * 60 / max(1, total_vendedores))
                 merge_queue.put(("progress", progresso))
-                time.sleep(0.01)
 
             merge_queue.put(("done", dados_pdf))
 
@@ -1181,15 +1330,18 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
     # ------------------ POLL QUEUE ------------------
     def poll_merge_queue():
         try:
-            while True:
+            for _ in range(50):
                 kind, payload = merge_queue.get_nowait()
                 if kind == "progress":
                     progress_var.set(payload)
                     progress_bar.update_idletasks()
                 elif kind == "done":
-                    btn_merge_spreadsheet.configure(state="disabled")
-                    btn_add_mais.configure(state="disabled")
-                    btn.configure(state="disabled")
+                    if btn_merge_spreadsheet:
+                        btn_merge_spreadsheet.configure(state="disabled")
+                    if btn_add_mais:
+                        btn_add_mais.configure(state="disabled")
+                    if btn:
+                        btn.configure(state="disabled")
 
                     for item in tree.get_children():
                         tree.delete(item)
@@ -1224,6 +1376,7 @@ def analisar_SALES_PERIOD(caminho_pdf):
     datas = []
 
     try:
+        pdfplumber = _get_pdfplumber()
         with pdfplumber.open(caminho_pdf) as pdf:
             for pagina in pdf.pages:
                 texto = pagina.extract_text() or ""
@@ -1253,7 +1406,6 @@ def analisar_SALES_PERIOD(caminho_pdf):
 
 # ----------------- Conexão com Supabase -----------------
 
-from supabase import create_client
 import json
 
 _supabase = None
@@ -1262,6 +1414,7 @@ def get_supabase():
     global _supabase
     if _supabase is None:
         try:
+            from supabase import create_client
             cred_path = resource_path(os.path.join("data", "credenciaisDB.json"))
             with open(cred_path, "r", encoding="utf-8") as f:
                 creds = json.load(f)
@@ -1270,7 +1423,6 @@ def get_supabase():
             key = creds["SUPABASE_KEY"]
             _supabase = create_client(url, key)
         except Exception as e:
-            from tkinter import messagebox
             messagebox.showerror("Erro", f"Erro ao conectar ao Supabase: {e}")
             raise
     return _supabase
@@ -1282,7 +1434,6 @@ def listar_vendedores_db():
         data = supabase.table("vendedores").select("nome").order("nome").execute()
         return [v["nome"] for v in data.data] if data and hasattr(data, "data") else []
     except Exception as e:
-        from tkinter import messagebox
         messagebox.showerror("Erro", f"Erro ao listar vendedores: {e}")
         return []
 
@@ -1294,7 +1445,6 @@ def registrar_vendedor_db(nome: str):
         if not existe.data:
             supabase.table("vendedores").insert({"nome": nome}).execute()
     except Exception as e:
-        from tkinter import messagebox
         messagebox.showerror("Erro", f"Erro ao registrar vendedor: {e}")
 
 def excluir_ultimo_feedback(vendedor: str):
@@ -1339,7 +1489,6 @@ def salvar_feedback_db(vendedor: str, texto: str):
         }).execute()
         return True
     except Exception as e:
-        from tkinter import messagebox
         messagebox.showerror("Erro", f"Erro ao salvar feedback no banco: {e}")
         return False
 
@@ -1350,6 +1499,5 @@ def carregar_feedbacks_db(vendedor: str):
         data = supabase.table("feedbacks").select("*").eq("vendedor", vendedor).order("created_at").execute()
         return data.data if data and hasattr(data, "data") else []
     except Exception as e:
-        from tkinter import messagebox
         messagebox.showerror("Erro", f"Erro ao carregar feedbacks: {e}")
         return []

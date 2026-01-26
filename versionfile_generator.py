@@ -1,11 +1,29 @@
-from global_vars import APP_VERSION
+import re
+
+
+def _read_app_version() -> str:
+    with open("global_vars.py", "r", encoding="utf-8") as f:
+        data = f.read()
+    match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', data)
+    if not match:
+        raise RuntimeError("APP_VERSION não encontrado em global_vars.py")
+    return match.group(1)
+
+def _version_tuple(version: str) -> str:
+    parts = [int(p) for p in version.split(".") if p.strip().isdigit()]
+    while len(parts) < 4:
+        parts.append(0)
+    return ", ".join(str(p) for p in parts[:4])
+
 
 def versionfile_generator():
+    app_version = _read_app_version()
+    ver_tuple = _version_tuple(app_version)
     template = f"""
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=({APP_VERSION.replace('.', ',')}, 0),
-    prodvers=({APP_VERSION.replace('.', ',')}, 0),
+    filevers=({ver_tuple}),
+    prodvers=({ver_tuple}),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +38,12 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'MVA'),
         StringStruct('FileDescription', 'Relatório de Clientes por Vendedor'),
-        StringStruct('FileVersion', '{APP_VERSION}'),
+        StringStruct('FileVersion', '{app_version}'),
         StringStruct('InternalName', 'RelatorioClientes'),
         StringStruct('LegalCopyright', '© 2025 MVA'),
         StringStruct('OriginalFilename', 'RelatorioClientes.exe'),
         StringStruct('ProductName', 'Sistema de Relatórios'),
-        StringStruct('ProductVersion', '{APP_VERSION}')])
+        StringStruct('ProductVersion', '{app_version}')])
       ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

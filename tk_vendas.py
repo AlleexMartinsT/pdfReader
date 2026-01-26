@@ -6,7 +6,7 @@ from utils import (
     carregar_feedbacks_db, excluir_ultimo_feedback, atualizar_ultimo_feedback,
 )
 import customtkinter
-from library import Image, ImageTk
+from PIL import Image, ImageTk
 from tkinter import filedialog, ttk, messagebox
 import sys, os
 

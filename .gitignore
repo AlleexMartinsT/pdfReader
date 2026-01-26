@@ -9,3 +9,5 @@ build/
 data/
 *.exe
 *.spec
+__pycache__/
+*.pyc

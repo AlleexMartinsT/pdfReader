@@ -1,35 +1,35 @@
-﻿# PDF Reader (Relatorio de Clientes)
+﻿# PDF Reader (Customer Sales Report)
 
-Aplicativo desktop para importar relatorios em PDF e planilhas online, consolidar vendas por vendedor, editar dados locais com seguranca e visualizar indicadores em graficos. Feito para uso interno com dois fluxos de dados (MVA e EH) e exportacoes em PDF.
+Desktop app to import PDF reports and online spreadsheets, consolidate sales by seller, safely edit local data, and visualize indicators in charts. Built for internal use with two data sources (MVA and EH) and PDF exports.
 
-## Visao geral
+## Overview
 
-O programa le PDFs e planilhas online, identifica a origem (MVA/EH), organiza os dados em tabelas separadas e permite:
-- Importar PDFs locais.
-- Carregar planilha online.
-- Mesclar resultados quando houver as duas fontes.
-- Editar a tabela local (com fluxo de salvar em novo PDF).
-- Exportar planilhas e feedbacks em PDF.
-- Visualizar graficos (MVA, EH, Todos, Vendas totais).
+The app reads PDFs and online spreadsheets, detects the source (MVA/EH), organizes data into separate tables, and lets you:
+- Import local PDFs.
+- Load the online spreadsheet.
+- Merge results when both sources are available.
+- Edit the local table (with a save-to-new-PDF flow).
+- Export spreadsheets and feedbacks to PDF.
+- View charts (MVA, EH, All, Total Sales).
 
-## Funcionalidades principais
+## Main features
 
-- Importacao de PDFs e deteccao de origem (MVA/EH), incluindo tolerancia a nomes similares.
-- Planilha online integrada, com tabelas sempre somente leitura.
-- Mescla controlada das fontes locais e online.
-- Edicao da tabela local com botao dedicado e aviso de alteracoes nao salvas.
-- Exportacao de planilhas e feedbacks em PDF.
-- Graficos por metricas: Atendidos, Devolucoes, Total Final, Total Vendas.
-- Barra(s) de progresso com botao de cancelar.
-- Interface responsiva, com colunas ajustaveis e bordas arredondadas.
+- PDF import with source detection (MVA/EH), including tolerance for similar names.
+- Integrated online spreadsheet, always read-only tables.
+- Controlled merge of local and online sources.
+- Local table editing with a dedicated button and unsaved-change warnings.
+- PDF export for spreadsheets and feedbacks.
+- Charts by metrics: Attended, Returns, Final Total, Total Sales.
+- Progress bar(s) with cancel.
+- Responsive UI, adjustable columns, rounded borders.
 
-## Requisitos
+## Requirements
 
 - Windows 10/11
-- Python 3.13 (recomendado)
-- Dependencias em requirements.txt
+- Python 3.13 (recommended)
+- Dependencies in `requirements.txt`
 
-## Instalacao (dev)
+## Setup (dev)
 
 ```powershell
 python -m venv .venv64
@@ -38,14 +38,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Como usar
+## How to use
 
-1) Clique em Importar para selecionar PDFs locais.
-2) Use Planilha online para carregar dados remotos.
-3) Mesclar Planilhas so fica habilitado quando as duas fontes estao disponiveis.
-4) Clique em Editar para liberar a tabela local; ao salvar, um novo PDF e gerado.
-5) Exportar permite salvar planilhas ou feedbacks.
-6) Graficos alterna para a tela de indicadores.
+1) Click Import to select local PDFs.
+2) Use Online spreadsheet to load remote data.
+3) Merge Spreadsheets only enables when both sources are available.
+4) Click Edit to unlock the local table; on save, a new PDF is generated.
+5) Export saves spreadsheets or feedbacks.
+6) Charts toggles to the indicators screen.
 
 ## Build (Windows)
 
@@ -53,20 +53,20 @@ python main.py
 .\.venv64\Scripts\python.exe .\build.py
 ```
 
-O build gera:
-- dist/Relatorio de Clientes/ (onedir)
-- dist/RelatorioClientes-<versao>.zip (usado no release)
+The build generates:
+- `dist/Relatorio de Clientes/` (onedir)
+- `dist/RelatorioClientes-<version>.zip` (release asset)
 
-## Atualizacao
+## Updates
 
-O aplicativo verifica releases do GitHub e baixa o ZIP mais recente. Depois de baixar, extrai em %LOCALAPPDATA%\RelatorioClientes e inicia a versao nova.
+The app checks GitHub releases and downloads the latest ZIP. After download, it extracts to `%LOCALAPPDATA%\RelatorioClientes` and launches the new version.
 
-## Observacoes
+## Notes
 
-- Tabelas online sao sempre somente leitura.
-- A edicao vale apenas para a tabela local.
-- O sistema identifica MVA/EH pelo nome do arquivo e por confirmacoes do usuario quando necessario.
+- Online tables are always read-only.
+- Editing applies only to the local table.
+- The system identifies MVA/EH by filename and asks for confirmation when needed.
 
-## Licenca
+## License
 
-Uso interno.
+Internal use.

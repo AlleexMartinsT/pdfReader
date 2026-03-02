@@ -559,7 +559,7 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                         total = 0.0
                         for v in valores:
                             try:
-                                total += float(str(v).replace(",", "."))
+                                total += parse_number(str(v))
                             except Exception:
                                 pass
                         if atendidos > 0 or total > 0:

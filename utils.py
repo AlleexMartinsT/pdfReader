@@ -237,7 +237,7 @@ def canonicalize_name(raw: str) -> str:
 
 # --- Funções principais ---
 
-def criar_etiquetas():
+def criar_etiquetas_legacy():
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from global_vars import results_by_source
@@ -305,6 +305,113 @@ def criar_etiquetas():
 
     c.save()
     messagebox.showinfo("Sucesso", f"✅ Etiquetas geradas em:\n{caminho}")
+
+def _rows_from_tree_for_labels(tree):
+    rows = []
+    if tree is None:
+        return rows
+
+    for item in tree.get_children():
+        values = tree.item(item).get("values", [])
+        if not values:
+            continue
+
+        vendedor = str(values[0]).strip() if len(values) > 0 else ""
+        if not vendedor:
+            continue
+
+        atendidos = int(parse_number(values[1])) if len(values) > 1 else 0
+        devolucoes = int(parse_number(values[2])) if len(values) > 2 else 0
+        total_clientes = int(parse_number(values[3])) if len(values) > 3 else 0
+        total_vendas = parse_number(values[4]) if len(values) > 4 else 0.0
+
+        rows.append({
+            "vendedor": vendedor,
+            "atendidos": atendidos,
+            "devolucoes": devolucoes,
+            "total_clientes": total_clientes,
+            "total_vendas": total_vendas,
+        })
+
+    return rows
+
+
+def criar_etiquetas(tree=None):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from global_vars import results_by_source
+
+    rows_from_table = _rows_from_tree_for_labels(tree)
+
+    if not rows_from_table:
+        if not results_by_source["MVA"] or not results_by_source["EH"]:
+            messagebox.showwarning("Aviso", "E necessario carregar os dois PDFs (MVA e EH).")
+            return
+
+    caminho = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("Arquivo PDF", "*.pdf")],
+        title="Salvar etiquetas"
+    )
+    if not caminho:
+        return False
+
+    c = canvas.Canvas(caminho, pagesize=A4)
+    largura, altura = A4
+    y = altura - 50
+    c.setFont("Helvetica", 11)
+
+    if rows_from_table:
+        for row in sorted(rows_from_table, key=lambda x: x["vendedor"].lower()):
+            linha1 = f"{row['vendedor']} = {format_number_br(row['total_vendas'])}"
+            linha2 = (
+                f"Atendidos: {row['atendidos']} | "
+                f"Devolucoes: {row['devolucoes']} | "
+                f"Total Final: {row['total_clientes']}"
+            )
+            c.drawString(50, y, linha1)
+            y -= 15
+            c.drawString(50, y, linha2)
+            y -= 30
+            if y < 50:
+                c.showPage()
+                c.setFont("Helvetica", 11)
+                y = altura - 50
+    else:
+        vendedores = set()
+        for _, res in results_by_source["MVA"]:
+            vendedores.update(res.keys())
+        for _, res in results_by_source["EH"]:
+            vendedores.update(res.keys())
+
+        for vendedor in sorted(vendedores):
+            total_mva = total_eh = 0.0
+            clientes_mva = clientes_eh = 0
+            for _, res in results_by_source["MVA"]:
+                if vendedor in res:
+                    total_mva += parse_number(res[vendedor].get("total_vendas", 0))
+                    clientes_mva += res[vendedor].get("total_clientes", 0)
+            for _, res in results_by_source["EH"]:
+                if vendedor in res:
+                    total_eh += parse_number(res[vendedor].get("total_vendas", 0))
+                    clientes_eh += res[vendedor].get("total_clientes", 0)
+
+            total_final = total_mva + total_eh
+            clientes_total = clientes_mva + clientes_eh
+            linha1 = f"{vendedor} = {format_number_br(total_mva)} + {format_number_br(total_eh)} = {format_number_br(total_final)}"
+            linha2 = f"Clientes atendidos = {clientes_mva} + {clientes_eh} = {clientes_total}"
+            c.drawString(50, y, linha1)
+            y -= 15
+            c.drawString(50, y, linha2)
+            y -= 30
+            if y < 50:
+                c.showPage()
+                c.setFont("Helvetica", 11)
+                y = altura - 50
+
+    c.save()
+    messagebox.showinfo("Sucesso", f"Etiquetas geradas em:\n{caminho}")
+
 
 def extrair_planilha_online():
     import gspread

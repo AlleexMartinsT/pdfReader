@@ -780,7 +780,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_graphs.clicked.connect(self._toggle_graphs_view)
         self.btn_clear.clicked.connect(self._handle_clear_tables)
         self.btn_merge.clicked.connect(self._handle_merge_tables)
-        self.btn_tag.clicked.connect(criar_etiquetas)
+        self.btn_tag.clicked.connect(lambda: criar_etiquetas(self.tree_main))
         self.btn_tag.setEnabled(False)
         self.btn_feedback.clicked.connect(self._open_feedback)
 

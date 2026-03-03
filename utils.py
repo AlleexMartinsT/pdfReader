@@ -1043,16 +1043,51 @@ def check_for_updates(root):
     import shutil
     import subprocess
     import sys
+    import re
+
+    def version_key(raw: str):
+        text = (raw or "").strip().lstrip("vV")
+        nums = [int(x) for x in re.findall(r"\d+", text)]
+        while len(nums) < 4:
+            nums.append(0)
+        return tuple(nums[:4])
+
+    def resolve_latest_release() -> dict | None:
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "RelatorioClientes-Updater"}
+        timeout = 20
+
+        # 1) endpoint direto do latest
+        try:
+            resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            if data and data.get("tag_name"):
+                return data
+        except Exception:
+            pass
+
+        # 2) fallback: lista releases e pega maior versao valida (nao pre-release)
+        try:
+            resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            releases = resp.json() or []
+            candidates = [r for r in releases if not r.get("draft") and not r.get("prerelease") and r.get("tag_name")]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda r: version_key(r.get("tag_name", "")), reverse=True)
+            return candidates[0]
+        except Exception:
+            return None
 
     def worker():
         try:
-            # Checa versao
-            response = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            latest_version = data["tag_name"].lstrip("v")
+            data = resolve_latest_release()
+            if not data or not data.get("tag_name"):
+                return
 
-            if latest_version > APP_VERSION:
+            latest_version = data["tag_name"].lstrip("vV")
+
+            if version_key(latest_version) > version_key(APP_VERSION):
                 # Mostra dialogo na thread principal usando after()
                 def ask_user():
                     if messagebox.askyesno("Atualizacao Disponivel",

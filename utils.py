@@ -28,6 +28,11 @@ _UI_REFS = {
     "btn_select_pdf": None,
 }
 
+REGEX_VENDOR_HEADER = re.compile(r"^\s*Vendedor(?:\(a\))?:\s*(.+?)\s*$", re.IGNORECASE)
+REGEX_NEW_SALE_LINE = re.compile(r"^\s*(?:NFC|NF)-e\s+\d+\s+\d{2}/\d{2}/\d{4}\b", re.IGNORECASE)
+REGEX_NEW_TOTALS_LINE = re.compile(r"^\s*Totais\s+R\$\s+([-\d\.,]+)\s+[-\d\.,]+\s*$", re.IGNORECASE)
+REGEX_ANY_DATE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+
 
 def _get_pd():
     import pandas as pd
@@ -46,6 +51,54 @@ def set_btn_cancel(state="disabled"):
     btn_cancel = _UI_REFS.get("btn_cancel")
     if btn_cancel:
         btn_cancel.configure(state=state)
+
+
+def _extract_vendor_name(line: str) -> str | None:
+    match = REGEX_VENDOR_HEADER.match(line or "")
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _is_sale_entry_line(line: str) -> bool:
+    if not line:
+        return False
+    return bool(regex_data.match(line) or REGEX_NEW_SALE_LINE.match(line))
+
+
+def _extract_total_vendas(line: str) -> str | None:
+    if not line:
+        return None
+
+    match = re.search(r"Totais:\s*([-\d\.,]+)", line)
+    if match:
+        return match.group(1)
+
+    match = REGEX_NEW_TOTALS_LINE.match(line)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def _extract_sale_date(line: str) -> str | None:
+    if not line:
+        return None
+
+    if REGEX_NEW_SALE_LINE.match(line):
+        match = REGEX_ANY_DATE.search(line)
+        if match:
+            return match.group(1)
+
+    match = regex_data.match(line)
+    if not match:
+        return None
+
+    lowered = line.lower()
+    if " ate " in lowered or " até " in lowered:
+        return None
+
+    return match.group().strip()
 
 def process_cancel(): 
     cancel_event.set()
@@ -70,6 +123,39 @@ def process_cancel():
     if progress_bar_online:
         progress_bar_online.stop()
         progress_bar_online.config(mode="determinate")
+
+
+def _scroll_tree_to_top(tree) -> None:
+    scroll = getattr(tree, "scroll_to_top", None)
+    if callable(scroll):
+        scroll()
+
+
+def _has_visible_data(dados: dict) -> bool:
+    atendidos = int(dados.get("atendidos", 0) or 0)
+    devolucoes = int(dados.get("devolucoes", 0) or 0)
+    total_clientes = int(dados.get("total_clientes", 0) or 0)
+
+    try:
+        total_vendas = parse_number(dados.get("total_vendas", 0))
+    except Exception:
+        total_vendas = 0.0
+
+    return any((atendidos, devolucoes, total_clientes)) or abs(total_vendas) > 0
+
+
+def _total_vendas_value(dados: dict) -> float:
+    try:
+        return parse_number(dados.get("total_vendas", 0))
+    except Exception:
+        return 0.0
+
+
+def _sorted_rows_by_total_vendas(data: dict) -> list[tuple[str, dict]]:
+    return sorted(
+        data.items(),
+        key=lambda item: (-_total_vendas_value(item[1]), item[0].casefold())
+    )
 
 def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, path_var=None):
     """Consome eventos da fila em intervalos e atualiza a UI sem travar."""
@@ -126,6 +212,7 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
         # atualiza a interface (label e tree)
         label_files_var.set(f"Arquivo carregado: {os.path.basename(path_var)} ({source})")
         tree_update(tree)
+        _scroll_tree_to_top(tree)
         messagebox.showinfo("Conclu?do", f"Processamento finalizado ({source})!")
         for vendedor in results.keys():
             registrar_vendedor_db(vendedor)
@@ -226,6 +313,13 @@ def canonicalize_name(raw: str) -> str:
     # 2) se já é o nome completo
     if key in CANON_BY_VALUE_UPPER:
         return CANON_BY_VALUE_UPPER[key]
+
+    prefix_matches = [
+        canon for canon_upper, canon in CANON_BY_VALUE_UPPER.items()
+        if canon_upper.startswith(f"{key} ")
+    ]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
 
     # 3) fuzzy matching
     match = difflib.get_close_matches(key, list(CANON_BY_VALUE_UPPER.keys()), n=1, cutoff=0.93)
@@ -676,6 +770,8 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
 
                 fill_tree(dfMVA, tree_mva)
                 fill_tree(dfEH, tree_eh)
+                _scroll_tree_to_top(tree_mva)
+                _scroll_tree_to_top(tree_eh)
 
                 progressQueuePlanilha.put(("done_planilha", "ok"))
 
@@ -893,7 +989,9 @@ def tree_update(tree):
     
     mesclado = mesclar_resultados(list_results)
     
-    for vendedor, dados in sorted(mesclado.items()):
+    for vendedor, dados in _sorted_rows_by_total_vendas(mesclado):
+        if not _has_visible_data(dados):
+            continue
         total_vendas_str = ""
         if dados["total_vendas"] > 0:
             total_vendas_str = format_number_br(dados["total_vendas"])
@@ -907,6 +1005,7 @@ def tree_update(tree):
             dados['total_clientes'],
             total_vendas_str
         ))
+    _scroll_tree_to_top(tree)
 
 def mesclar_resultados(list_results):
     mesclado = {}
@@ -972,20 +1071,20 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
             try:
                 texto = pagina.extract_text() or ""
                 for linha in texto.splitlines():
-                    if "Vendedor: " in linha:
+                    vendedor_bruto = _extract_vendor_name(linha)
+                    if vendedor_bruto is not None:
                         fechar_vendedor()
-                        partes = linha.split("Vendedor: ", 1)[1].strip()
-                        if partes:
-                            palavras = partes.split()
+                        if vendedor_bruto:
+                            palavras = vendedor_bruto.split()
                             if palavras and palavras[0].isdigit():
-                                vendedor_bruto = " ".join(palavras[1:])
+                                vendedor_base = " ".join(palavras[1:])
                             else:
-                                vendedor_bruto = " ".join(palavras)
-                            if vendedor_bruto in canon_cache:
-                                vendedor_atual = canon_cache[vendedor_bruto]
+                                vendedor_base = " ".join(palavras)
+                            if vendedor_base in canon_cache:
+                                vendedor_atual = canon_cache[vendedor_base]
                             else:
-                                vendedor_atual = canonicalize_name(vendedor_bruto)
-                                canon_cache[vendedor_bruto] = vendedor_atual
+                                vendedor_atual = canonicalize_name(vendedor_base)
+                                canon_cache[vendedor_base] = vendedor_atual
                             if vendedor_atual not in resultados:
                                 resultados[vendedor_atual] = {
                                     "atendidos": 0,
@@ -995,17 +1094,17 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                                 }
                         continue
 
-                    if regex_data.match(linha):
+                    if _is_sale_entry_line(linha):
                         if not vendedor_atual:
                             continue
                         resultados[vendedor_atual]["atendidos"] += 1
                         if regex_negative.search(linha):
                             resultados[vendedor_atual]["devolucoes"] += 1
+                        continue
 
-                    if "Totais" in linha and vendedor_atual:
-                        m = re.search(r"Totais:\s*([\d\.\,]+)", linha)
-                        if m:
-                            resultados[vendedor_atual]["total_vendas"] = m.group(1)
+                    total_vendas = _extract_total_vendas(linha)
+                    if total_vendas is not None and vendedor_atual:
+                        resultados[vendedor_atual]["total_vendas"] = total_vendas
 
                 # Atualiza o progresso a cada página
                 progresso = int(i * 100 / max(1, total))
@@ -1488,7 +1587,9 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                     for item in tree.get_children():
                         tree.delete(item)
 
-                    for vendedor, dados in sorted(payload.items()):
+                    for vendedor, dados in _sorted_rows_by_total_vendas(payload):
+                        if not _has_visible_data(dados):
+                            continue
                         tree.insert("", "end", values=(
                             vendedor,
                             dados["atendidos"],
@@ -1496,6 +1597,7 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                             dados["total_clientes"],
                             format_number_br(dados["total_vendas"])
                         ))
+                    _scroll_tree_to_top(tree)
                     progress_var.set(100)
                     messagebox.showinfo("Concluído", "✅ Mesclagem das tabelas (PDF + MVA + EH) finalizada!")
                     return
@@ -1523,14 +1625,14 @@ def analisar_SALES_PERIOD(caminho_pdf):
             for pagina in pdf.pages:
                 texto = pagina.extract_text() or ""
                 for linha in texto.splitlines():
-                    # Procura datas com regex_data (já importado do globalVar)
-                    if regex_data.match(linha):
-                        data_str = regex_data.match(linha).group()
-                        try:
-                            data = datetime.strptime(data_str, "%d/%m/%Y")
-                            datas.append(data)
-                        except ValueError:
-                            pass
+                    data_str = _extract_sale_date(linha)
+                    if not data_str:
+                        continue
+                    try:
+                        data = datetime.strptime(data_str, "%d/%m/%Y")
+                        datas.append(data)
+                    except ValueError:
+                        pass
 
         if not datas:
             SALES_PERIOD = None

@@ -139,6 +139,13 @@ class QtTreeAdapter:
             return {}
         return {"text": col}
 
+    def scroll_to_top(self) -> None:
+        self._table.clearSelection()
+        self._table.scrollToTop()
+        bar = self._table.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.minimum())
+
     def __getitem__(self, key: str):
         if key == "columns":
             return tuple(self._columns)

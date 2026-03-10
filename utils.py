@@ -31,7 +31,9 @@ _UI_REFS = {
 REGEX_VENDOR_HEADER = re.compile(r"^\s*Vendedor(?:\(a\))?:\s*(.+?)\s*$", re.IGNORECASE)
 REGEX_NEW_SALE_LINE = re.compile(r"^\s*(?:NFC|NF)-e\s+\d+\s+\d{2}/\d{2}/\d{4}\b", re.IGNORECASE)
 REGEX_NEW_TOTALS_LINE = re.compile(r"^\s*Totais\s+R\$\s+([-\d\.,]+)\s+[-\d\.,]+\s*$", re.IGNORECASE)
+REGEX_NEW_SALE_AMOUNT = re.compile(r"^\s*(?:NFC|NF)-e\s+\d+\s+\d{2}/\d{2}/\d{4}\b.*?\s+([-\d\.,]+)\s+[-\d\.,]+\s*$", re.IGNORECASE)
 REGEX_ANY_DATE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+REGEX_D_MARKER = re.compile(r"\(\s*d\s*\)", re.IGNORECASE)
 
 
 def _get_pd():
@@ -99,6 +101,20 @@ def _extract_sale_date(line: str) -> str | None:
         return None
 
     return match.group().strip()
+
+
+def _line_has_d_marker(line: str) -> bool:
+    return bool(REGEX_D_MARKER.search(line or ""))
+
+
+def _extract_sale_amount(line: str) -> float | None:
+    match = REGEX_NEW_SALE_AMOUNT.match(line or "")
+    if not match:
+        return None
+    try:
+        return parse_number(match.group(1))
+    except Exception:
+        return None
 
 def process_cancel(): 
     cancel_event.set()
@@ -1049,6 +1065,10 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
     resultados = {}
     vendedor_atual = None
     canon_cache = {}
+    ajuste_total_d = {}
+    pending_d_marker = False
+    last_sale = None
+    last_line_type = None
 
     # se não vier nada, cria versões "neutras"
     if on_progress is None:
@@ -1062,6 +1082,32 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
             dados = resultados[vendedor_atual]
             dados["total_clientes"] = dados["atendidos"] - dados["devolucoes"]
 
+    def reset_sale_state():
+        nonlocal pending_d_marker, last_sale, last_line_type
+        pending_d_marker = False
+        last_sale = None
+        last_line_type = None
+
+    def apply_d_marker_to_last_sale() -> bool:
+        nonlocal last_sale
+        if not last_sale or last_sale.get("vendedor") != vendedor_atual:
+            return False
+
+        dados = resultados.get(vendedor_atual)
+        if not dados:
+            return False
+
+        if not last_sale["counted_as_return"]:
+            dados["devolucoes"] += 1
+            last_sale["counted_as_return"] = True
+
+        amount = last_sale.get("amount")
+        if not last_sale["d_adjusted"] and amount is not None and amount > 0:
+            ajuste_total_d[vendedor_atual] = ajuste_total_d.get(vendedor_atual, 0.0) + amount
+            last_sale["d_adjusted"] = True
+
+        return True
+
     pdfplumber = _get_pdfplumber()
     with pdfplumber.open(caminho_pdf) as pdf:
         total = len(pdf.pages)
@@ -1074,6 +1120,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                     vendedor_bruto = _extract_vendor_name(linha)
                     if vendedor_bruto is not None:
                         fechar_vendedor()
+                        reset_sale_state()
                         if vendedor_bruto:
                             palavras = vendedor_bruto.split()
                             if palavras and palavras[0].isdigit():
@@ -1092,19 +1139,54 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                                     "total_clientes": 0,
                                     "total_vendas": 0.0
                                 }
+                        last_line_type = "vendor"
                         continue
 
                     if _is_sale_entry_line(linha):
                         if not vendedor_atual:
                             continue
+
+                        sale_amount = _extract_sale_amount(linha)
+                        has_negative_return = bool(regex_negative.search(linha))
+                        has_d_return = _line_has_d_marker(linha) or pending_d_marker
+
                         resultados[vendedor_atual]["atendidos"] += 1
-                        if regex_negative.search(linha):
+                        last_sale = {
+                            "vendedor": vendedor_atual,
+                            "amount": sale_amount,
+                            "counted_as_return": False,
+                            "d_adjusted": False,
+                        }
+
+                        if has_negative_return:
                             resultados[vendedor_atual]["devolucoes"] += 1
+                            last_sale["counted_as_return"] = True
+
+                        if has_d_return:
+                            apply_d_marker_to_last_sale()
+
+                        pending_d_marker = False
+                        last_line_type = "sale"
+                        continue
+
+                    if _line_has_d_marker(linha):
+                        if last_line_type == "sale" and apply_d_marker_to_last_sale():
+                            last_line_type = "marker"
+                            continue
+                        pending_d_marker = True
+                        last_line_type = "marker"
                         continue
 
                     total_vendas = _extract_total_vendas(linha)
                     if total_vendas is not None and vendedor_atual:
-                        resultados[vendedor_atual]["total_vendas"] = total_vendas
+                        total_bruto = parse_number(total_vendas)
+                        resultados[vendedor_atual]["total_vendas"] = total_bruto - ajuste_total_d.get(vendedor_atual, 0.0)
+                        reset_sale_state()
+                        last_line_type = "total"
+                        continue
+
+                    if linha.strip():
+                        last_line_type = "other"
 
                 # Atualiza o progresso a cada página
                 progresso = int(i * 100 / max(1, total))

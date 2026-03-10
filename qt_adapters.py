@@ -5,12 +5,27 @@ from typing import Callable, Iterable, List, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
+class _QtAfterBridge(QtCore.QObject):
+    schedule = QtCore.Signal(int, object)
+
+    def __init__(self, parent: QtCore.QObject) -> None:
+        super().__init__(parent)
+        self.schedule.connect(self._schedule_callback, QtCore.Qt.QueuedConnection)
+
+    @QtCore.Slot(int, object)
+    def _schedule_callback(self, ms: int, callback: object) -> None:
+        if not callable(callback):
+            return
+        QtCore.QTimer.singleShot(ms, callback)
+
+
 class QtRootAdapter:
     def __init__(self, widget: QtWidgets.QWidget) -> None:
         self._widget = widget
+        self._bridge = _QtAfterBridge(widget)
 
     def after(self, ms: int, callback: Callable[[], None]) -> None:
-        QtCore.QTimer.singleShot(ms, callback)
+        self._bridge.schedule.emit(ms, callback)
 
 
 class QtVar:

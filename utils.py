@@ -318,6 +318,349 @@ def format_number_br(num: float) -> str:
     """Formata número no padrão brasileiro com duas casas decimais."""
     return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+
+def _normalize_caixa_client(name: str) -> str:
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", name or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"\s+", " ", normalized).strip().upper()
+    return normalized
+
+
+def _classify_caixa_document(description: str) -> str:
+    normalized = _normalize_caixa_client(description)
+    if "NOTA FISCAL DE CONSUMIDOR ELETRONICA" in normalized:
+        return "Nota Fiscal de Consumidor Eletronica"
+    if "NOTA FISCAL ELETRONICA" in normalized:
+        return "Nota Fiscal Eletronica"
+    return description.strip()
+
+
+def analisar_pdf_caixa(caminho_pdf: str) -> dict:
+    pdfplumber = _get_pdfplumber()
+    pedidos = []
+    cliente_atual = None
+    periodo = None
+    total_documento = None
+    itens_caixa = []
+    itens_excluidos = []
+
+    with pdfplumber.open(caminho_pdf) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text() or ""
+            for linha in texto.splitlines():
+                if periodo is None:
+                    linha_normalizada = _normalize_caixa_client(linha)
+                    match_periodo = re.search(r"(\d{2}/\d{2}/\d{4})\s+ATE\s+(\d{2}/\d{2}/\d{4})", linha_normalizada)
+                    if match_periodo:
+                        periodo = f"{match_periodo.group(1)} - {match_periodo.group(2)}"
+
+                match_cliente = re.match(r"^Cliente:\s*(.*?)\s+\d{2}/\d{2}/\d{4}\s*$", linha)
+                if match_cliente:
+                    cliente_atual = match_cliente.group(1).strip()
+                    continue
+
+                match_pedido = re.match(r"^(N\S*\s+\d+\s+.+?)\s+([-\d\.,]+)\s*$", linha)
+                if match_pedido and cliente_atual:
+                    descricao = match_pedido.group(1).strip()
+                    valor = parse_number(match_pedido.group(2))
+                    numero_match = re.search(r"\b(\d{5,})\b", descricao)
+                    pedidos.append({
+                        "cliente": cliente_atual,
+                        "valor": valor,
+                        "pedido": numero_match.group(1) if numero_match else "",
+                        "documento": _classify_caixa_document(descricao),
+                    })
+                    cliente_atual = None
+                    continue
+
+                match_total = re.match(r"^Total R\$\s+([-\d\.,]+)\s*$", linha)
+                if match_total:
+                    total_documento = parse_number(match_total.group(1))
+
+    total_caixa_bruto = 0.0
+    total_excluido = 0.0
+    pedidos_caixa = 0
+    pedidos_balcao = 0
+    pedidos_excluidos = 0
+    pedidos_excluidos_cliente = 0
+    pedidos_excluidos_documento = 0
+
+    for pedido in pedidos:
+        cliente = pedido["cliente"]
+        valor = pedido["valor"]
+        is_balcao = _normalize_caixa_client(cliente) == "CLIENTE BALCAO"
+        is_nfe = pedido["documento"] == "Nota Fiscal Eletronica"
+        motivos = []
+
+        if is_balcao:
+            pedidos_balcao += 1
+        if not is_balcao:
+            pedidos_excluidos_cliente += 1
+            motivos.append("Cliente diferente")
+        if is_nfe:
+            pedidos_excluidos_documento += 1
+            motivos.append("NF-e")
+
+        if motivos:
+            total_excluido += valor
+            pedidos_excluidos += 1
+            itens_excluidos.append(
+                {
+                    "pedido": pedido["pedido"],
+                    "cliente": cliente,
+                    "documento": pedido["documento"],
+                    "motivo": " + ".join(motivos),
+                    "valor": round(valor, 2),
+                }
+            )
+            continue
+
+        total_caixa_bruto += valor
+        pedidos_caixa += 1
+        itens_caixa.append(
+            {
+                "pedido": pedido["pedido"],
+                "cliente": cliente,
+                "documento": pedido["documento"],
+                "valor": round(valor, 2),
+            }
+        )
+
+    if total_documento is None:
+        total_documento = total_caixa_bruto + total_excluido
+
+    total_documento = round(total_documento, 2)
+    total_excluido = round(total_excluido, 2)
+    total_caixa = round(total_documento - total_excluido, 2)
+
+    return {
+        "arquivo": os.path.basename(caminho_pdf),
+        "periodo": periodo,
+        "pedidos_total": len(pedidos),
+        "pedidos_balcao": pedidos_balcao,
+        "pedidos_caixa": pedidos_caixa,
+        "pedidos_excluidos": pedidos_excluidos,
+        "pedidos_excluidos_cliente": pedidos_excluidos_cliente,
+        "pedidos_excluidos_documento": pedidos_excluidos_documento,
+        "total_documento": total_documento,
+        "total_excluido": total_excluido,
+        "total_caixa": total_caixa,
+        "itens_caixa": sorted(
+            itens_caixa,
+            key=lambda item: (item["pedido"], item["cliente"].casefold()),
+        ),
+        "itens_excluidos": sorted(
+            itens_excluidos,
+            key=lambda item: (-item["valor"], item["cliente"].casefold(), item["pedido"]),
+        ),
+    }
+
+
+def _normalize_fiscal_number(numero: str) -> str:
+    digits = re.sub(r"\D", "", str(numero or ""))
+    if not digits:
+        return ""
+    return digits.zfill(9)
+
+
+def _display_fiscal_number(numero: str) -> str:
+    normalized = _normalize_fiscal_number(numero)
+    if not normalized:
+        return ""
+    return str(int(normalized))
+
+
+def _extract_period_range(periodo: str) -> tuple[str | None, str | None]:
+    match = re.search(r"(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})", periodo or "")
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def _find_missing_fiscal_numbers(numbers: list[str]) -> list[str]:
+    normalized_numbers = [
+        _normalize_fiscal_number(numero)
+        for numero in numbers
+        if _normalize_fiscal_number(numero)
+    ]
+    if not normalized_numbers:
+        return []
+
+    ints = sorted({int(numero) for numero in normalized_numbers})
+    missing = []
+    for current, nxt in zip(ints, ints[1:]):
+        if nxt - current > 1:
+            for numero in range(current + 1, nxt):
+                missing.append(_normalize_fiscal_number(numero))
+    return missing
+
+
+def validar_periodo_relatorios_caixa(relatorio_caixa: dict, relatorio_nfce: dict) -> tuple[bool, str]:
+    inicio_caixa, fim_caixa = _extract_period_range(relatorio_caixa.get("periodo", ""))
+    inicio_resumo, fim_resumo = _extract_period_range(relatorio_nfce.get("periodo", ""))
+
+    if not all((inicio_caixa, fim_caixa, inicio_resumo, fim_resumo)):
+        return False, "Nao foi possivel identificar o periodo dos dois relatorios."
+    if inicio_caixa != fim_caixa:
+        return False, "O relatorio de pedidos importados precisa ser de um unico dia."
+    if inicio_resumo != fim_resumo:
+        return False, "O Resumo NFC-e precisa ser de um unico dia."
+    if inicio_caixa != inicio_resumo:
+        return False, (
+            f"Os relatorios sao de dias diferentes.\n"
+            f"Pedidos importados: {inicio_caixa}\n"
+            f"Resumo NFC-e: {inicio_resumo}"
+        )
+    return True, inicio_caixa
+
+
+def validar_relatorio_pedidos_importados(relatorio: dict) -> tuple[bool, str]:
+    if not relatorio or relatorio.get("pedidos_total", 0) <= 0:
+        return False, "O arquivo selecionado no passo 1 nao parece ser um relatorio de pedidos importados."
+    if not relatorio.get("periodo"):
+        return False, "Nao foi possivel identificar o periodo no relatorio de pedidos importados."
+    if relatorio.get("total_documento", 0.0) <= 0:
+        return False, "O relatorio de pedidos importados nao trouxe um total valido."
+    return True, ""
+
+
+def validar_relatorio_resumo_nfce(relatorio: dict) -> tuple[bool, str]:
+    if not relatorio or relatorio.get("quantidade_nfce", 0) <= 0:
+        return False, "O arquivo selecionado no passo 2 nao parece ser um Resumo NFC-e."
+    if not relatorio.get("periodo"):
+        return False, "Nao foi possivel identificar o periodo no Resumo NFC-e."
+    if relatorio.get("total_nfce", 0.0) <= 0:
+        return False, "O Resumo NFC-e nao trouxe um total valido."
+    return True, ""
+
+
+def analisar_pdf_resumo_nfce(caminho_pdf: str) -> dict:
+    pdfplumber = _get_pdfplumber()
+    itens_nfce = []
+    periodo = None
+    total_nfce = None
+
+    with pdfplumber.open(caminho_pdf) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text() or ""
+            for linha in texto.splitlines():
+                linha = linha.strip()
+                linha_normalizada = _normalize_caixa_client(linha)
+
+                if periodo is None:
+                    match_periodo = re.search(
+                        r"(\d{2}/\d{2}/\d{4})\s+ATE\s+(\d{2}/\d{2}/\d{4})",
+                        linha_normalizada,
+                    )
+                    if match_periodo:
+                        periodo = f"{match_periodo.group(1)} - {match_periodo.group(2)}"
+
+                match_nfce = re.match(
+                    r"^(\d{6,})\s+Autorizada\s+\d+\s+65\s+\d{2}/\d{2}/\d{4}\s+(.+?)\s+([-\d\.,]+)\s*$",
+                    linha,
+                )
+                if match_nfce:
+                    numero = _normalize_fiscal_number(match_nfce.group(1))
+                    itens_nfce.append(
+                        {
+                            "numero": numero,
+                            "numero_exibicao": _display_fiscal_number(numero),
+                            "descricao": match_nfce.group(2).strip(),
+                            "valor": round(parse_number(match_nfce.group(3)), 2),
+                        }
+                    )
+                    continue
+
+                match_total = re.match(r"^Totais?\s+R\$\s+([-\d\.,]+)\s*$", linha)
+                if match_total:
+                    total_nfce = round(parse_number(match_total.group(1)), 2)
+
+    if total_nfce is None:
+        total_nfce = round(sum(item["valor"] for item in itens_nfce), 2)
+
+    faltantes_sequencia = _find_missing_fiscal_numbers([item["numero"] for item in itens_nfce])
+
+    return {
+        "arquivo": os.path.basename(caminho_pdf),
+        "periodo": periodo,
+        "quantidade_nfce": len(itens_nfce),
+        "total_nfce": total_nfce,
+        "nfces": sorted(itens_nfce, key=lambda item: item["numero"]),
+        "nfces_faltantes_sequencia": faltantes_sequencia,
+    }
+
+
+def comparar_caixa_resumo_nfce(relatorio_caixa: dict, relatorio_nfce: dict) -> dict:
+    itens_caixa = relatorio_caixa.get("itens_caixa", [])
+    itens_nfce = relatorio_nfce.get("nfces", [])
+
+    caixa_map = {
+        _normalize_fiscal_number(item.get("pedido", "")): round(float(item.get("valor", 0.0)), 2)
+        for item in itens_caixa
+        if _normalize_fiscal_number(item.get("pedido", ""))
+    }
+    nfce_map = {
+        _normalize_fiscal_number(item.get("numero", "")): round(float(item.get("valor", 0.0)), 2)
+        for item in itens_nfce
+        if _normalize_fiscal_number(item.get("numero", ""))
+    }
+
+    numeros_caixa = sorted(caixa_map.keys(), key=int)
+    numeros_nfce = sorted(nfce_map.keys(), key=int)
+    faltantes_sequencia = sorted(
+        {
+            _normalize_fiscal_number(numero)
+            for numero in relatorio_nfce.get("nfces_faltantes_sequencia", [])
+            if _normalize_fiscal_number(numero)
+        },
+        key=int,
+    )
+    faltando_no_resumo = sorted(set(numeros_caixa) - set(numeros_nfce), key=int)
+    numeros_faltantes = sorted(set(faltando_no_resumo) | set(faltantes_sequencia), key=int)
+
+    registros = []
+    for numero in numeros_faltantes:
+        valor = caixa_map.get(numero)
+        registros.append(
+            {
+                "numero": numero,
+                "numero_exibicao": _display_fiscal_number(numero),
+                "origem": "DAV importado" if numero in caixa_map else "Sequencia",
+                "observacao": "NFC-e faltante",
+                "valor": valor,
+            }
+        )
+
+    total_caixa = round(float(relatorio_caixa.get("total_caixa", 0.0)), 2)
+    total_resumo = round(float(relatorio_nfce.get("total_nfce", 0.0)), 2)
+    diferenca_total = round(total_caixa - total_resumo, 2)
+    valor_faltantes = round(
+        sum(caixa_map.get(numero, 0.0) for numero in numeros_faltantes if numero in caixa_map),
+        2,
+    )
+    status = "Confere" if abs(diferenca_total) < 0.01 and not numeros_faltantes else "Faltante"
+    periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
+
+    return {
+        "arquivo_caixa": relatorio_caixa.get("arquivo"),
+        "arquivo_resumo": relatorio_nfce.get("arquivo"),
+        "periodo": periodo_unico or relatorio_caixa.get("periodo"),
+        "total_caixa": total_caixa,
+        "total_resumo_nfce": total_resumo,
+        "nfces_faltantes_count": len(numeros_faltantes),
+        "valor_faltantes": valor_faltantes,
+        "status": status,
+        "registros_conferencia": sorted(
+            registros,
+            key=lambda item: (
+                int(item["numero"]) if item.get("numero") else 0,
+                item["origem"],
+            ),
+        ),
+    }
+
 def canonicalize_name(raw: str) -> str:
     _ensure_mapping_loaded()
     key = _normalize_key(raw)

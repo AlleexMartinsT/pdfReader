@@ -11,6 +11,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from utils import (
     source_pdf_async,
     adicionar_pdf,
+    analisar_pdf_caixa,
+    analisar_pdf_resumo_nfce,
+    comparar_caixa_resumo_nfce,
+    validar_periodo_relatorios_caixa,
+    validar_relatorio_pedidos_importados,
+    validar_relatorio_resumo_nfce,
     ordenar_coluna,
     process_cancel,
     carregar_planilhas_duplas_async,
@@ -21,6 +27,7 @@ from utils import (
     _pdf_export,
     _excel_export,
     parse_number,
+    format_number_br,
     criar_etiquetas,
     salvar_feedback_db,
     carregar_feedbacks_db,
@@ -65,6 +72,38 @@ class SourceDialog(QtWidgets.QDialog):
         if self.exec() == QtWidgets.QDialog.Accepted:
             return self._choice
         return None
+
+
+class InstructionDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget, title: str, message: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.resize(430, 170)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        label = QtWidgets.QLabel(message)
+        label.setWordWrap(True)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(label, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch()
+
+        btn_continue = QtWidgets.QPushButton("Continuar")
+        btn_continue.setStyleSheet("text-align:center;")
+        btn_continue.setMinimumWidth(120)
+
+        btn_continue.clicked.connect(self.accept)
+
+        buttons.addWidget(btn_continue)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+    def confirmed(self) -> bool:
+        return self.exec() == QtWidgets.QDialog.Accepted
 
 
 class FeedbackDialog(QtWidgets.QDialog):
@@ -281,6 +320,470 @@ class ObservacoesDialog(QtWidgets.QDialog):
             self._new_text.clear()
             self._refresh_history()
             self._confirm_edit.setVisible(False)
+
+
+class CaixaReportDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+        relatorio_caixa: dict,
+        fechamento: dict | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Relatorio de Caixa")
+        self.resize(920, 700)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("Relatorio de Caixa")
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(13)
+        title.setFont(title_font)
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self._build_davs_tab(relatorio_caixa), "DAVs Importados")
+        if fechamento:
+            tabs.addTab(self._build_fechamento_tab(fechamento), "Fechamento Caixa")
+        layout.addWidget(tabs, 1)
+
+        btn_close = QtWidgets.QPushButton("Fechar")
+        btn_close.setStyleSheet("text-align:center;")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close, alignment=QtCore.Qt.AlignHCenter)
+
+    def _build_davs_tab(self, relatorio: dict) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        summary_items = (
+            ("Arquivo", relatorio.get("arquivo") or "-"),
+            ("Periodo", relatorio.get("periodo") or "Nao identificado"),
+            ("Pedidos totais", str(relatorio.get("pedidos_total", 0))),
+            ("Pedidos Caixa", str(relatorio.get("pedidos_caixa", 0))),
+            ("Fora do balcão", str(relatorio.get("pedidos_excluidos_cliente", 0))),
+            ("NF-e excluidas", str(relatorio.get("pedidos_excluidos_documento", 0))),
+            ("Pedidos excluidos", str(relatorio.get("pedidos_excluidos", 0))),
+            ("Total do documento", f"R$ {format_number_br(relatorio.get('total_documento', 0.0))}"),
+            ("Total excluido", f"R$ {format_number_br(relatorio.get('total_excluido', 0.0))}"),
+            ("Total Caixa", f"R$ {format_number_br(relatorio.get('total_caixa', 0.0))}"),
+        )
+        layout.addWidget(self._build_summary_frame(summary_items, {"Total Caixa"}))
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(
+            self._create_export_button(
+                "Imprimir PDF",
+                lambda: self._export_davs_pdf(relatorio),
+            )
+        )
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        section_label = QtWidgets.QLabel("Pedidos excluidos do calculo")
+        section_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(section_label)
+
+        table = QtWidgets.QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(("Pedido", "Cliente", "Documento", "Valor"))
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        table.setMinimumSize(0, 0)
+        table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._configure_resizable_table(table, [90, 280, 190, 120])
+
+        itens_excluidos = relatorio.get("itens_excluidos", [])
+        table.setRowCount(len(itens_excluidos))
+        for row, item in enumerate(itens_excluidos):
+            pedido_item = QtWidgets.QTableWidgetItem(self._display_numero(item.get("pedido", "")))
+            cliente_item = QtWidgets.QTableWidgetItem(item.get("cliente", ""))
+            documento_item = QtWidgets.QTableWidgetItem(item.get("documento", ""))
+            total_item = QtWidgets.QTableWidgetItem(f"R$ {format_number_br(item.get('valor', 0.0))}")
+
+            pedido_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            cliente_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            documento_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            total_item.setTextAlignment(QtCore.Qt.AlignCenter)
+
+            table.setItem(row, 0, pedido_item)
+            table.setItem(row, 1, cliente_item)
+            table.setItem(row, 2, documento_item)
+            table.setItem(row, 3, total_item)
+
+        if not itens_excluidos:
+            table.setRowCount(1)
+            empty_item = QtWidgets.QTableWidgetItem("Nenhum pedido excluido encontrado.")
+            empty_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            table.setSpan(0, 0, 1, 4)
+            table.setItem(0, 0, empty_item)
+
+        self._fit_table_width(table)
+        table_wrap = QtWidgets.QHBoxLayout()
+        table_wrap.addStretch()
+        table_wrap.addWidget(table)
+        table_wrap.addStretch()
+        layout.addLayout(table_wrap, 1)
+
+        return widget
+
+    def _build_fechamento_tab(self, fechamento: dict) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        subtitle = QtWidgets.QLabel(
+            "Compara o total de caixa dos DAVs importados com o Resumo NFC-e e aponta as NFC-e faltantes."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(subtitle)
+
+        summary_items = (
+            ("Arquivo DAVs", fechamento.get("arquivo_caixa") or "-"),
+            ("Arquivo Resumo", fechamento.get("arquivo_resumo") or "-"),
+            ("Periodo", fechamento.get("periodo") or "Nao identificado"),
+            ("Total DAVs importados", f"R$ {format_number_br(fechamento.get('total_caixa', 0.0))}"),
+            ("Total Resumo NFC-e", f"R$ {format_number_br(fechamento.get('total_resumo_nfce', 0.0))}"),
+            ("NFC-e faltantes", str(fechamento.get("nfces_faltantes_count", 0))),
+            ("Valor das faltantes", f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"),
+            ("Status", fechamento.get("status", "-")),
+        )
+        layout.addWidget(
+            self._build_summary_frame(
+                summary_items,
+                {"Valor das faltantes", "Status"},
+                fechamento=fechamento,
+            )
+        )
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(
+            self._create_export_button(
+                "Imprimir PDF",
+                lambda: self._export_fechamento_pdf(fechamento),
+            )
+        )
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        section_label = QtWidgets.QLabel("NFC-e faltantes")
+        section_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(section_label)
+
+        table = QtWidgets.QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(("Numero", "Valor"))
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        table.setSortingEnabled(False)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setFocusPolicy(QtCore.Qt.NoFocus)
+        table.setWordWrap(False)
+        table.setTextElideMode(QtCore.Qt.ElideRight)
+        table.setShowGrid(True)
+        table.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        table.setMinimumSize(0, 0)
+        table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        table.verticalHeader().setDefaultSectionSize(32)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        header.setDefaultAlignment(QtCore.Qt.AlignCenter)
+        table.setColumnWidth(0, 185)
+        table.setColumnWidth(1, 145)
+        table_box = QtWidgets.QFrame()
+        table_box.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        table_box.setStyleSheet("QFrame{background-color:#1e1e1e;border:1px solid #3b3b3b;}")
+        table_box.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        table_box_layout = QtWidgets.QVBoxLayout(table_box)
+        table_box_layout.setContentsMargins(0, 0, 0, 0)
+        table_box_layout.setSpacing(0)
+        table.setFrameShape(QtWidgets.QFrame.NoFrame)
+        table_box_layout.addWidget(table, 1)
+
+        registros = fechamento.get("registros_conferencia", [])
+        table.setRowCount(len(registros) if registros else 1)
+        for row, item in enumerate(registros):
+            numero_item = QtWidgets.QTableWidgetItem(item.get("numero_exibicao", ""))
+            valor = item.get("valor")
+            valor_texto = "-" if valor in (None, "") else f"R$ {format_number_br(valor)}"
+            valor_item = QtWidgets.QTableWidgetItem(valor_texto)
+
+            numero_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            valor_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            numero_item.setFlags(QtCore.Qt.ItemIsEnabled)
+            valor_item.setFlags(QtCore.Qt.ItemIsEnabled)
+
+            table.setItem(row, 0, numero_item)
+            table.setItem(row, 1, valor_item)
+
+        if not registros:
+            empty_item = QtWidgets.QTableWidgetItem("Nenhuma NFC-e faltante encontrada.")
+            empty_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            empty_item.setFlags(QtCore.Qt.ItemIsEnabled)
+            table.setSpan(0, 0, 1, 2)
+            table.setItem(0, 0, empty_item)
+
+        total_frame = QtWidgets.QFrame()
+        total_frame.setStyleSheet("QFrame{background-color:#2a2a2a;border-top:1px solid #3b3b3b;}")
+        total_frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        total_layout = QtWidgets.QHBoxLayout(total_frame)
+        total_layout.setContentsMargins(10, 6, 10, 6)
+        total_layout.setSpacing(0)
+        total_label = QtWidgets.QLabel(
+            f"Total faltante: R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"
+        )
+        total_font = total_label.font()
+        total_font.setBold(True)
+        total_label.setFont(total_font)
+        total_label.setAlignment(QtCore.Qt.AlignCenter)
+        total_color = "#59C734" if fechamento.get("status") == "Confere" else "#FF4D4F"
+        total_label.setStyleSheet(f"color:{total_color};")
+        total_layout.addStretch()
+        total_layout.addWidget(total_label)
+        total_layout.addStretch()
+
+        self._fit_table_width(table)
+        table_box_layout.addWidget(total_frame, 0)
+        table_box.setFixedWidth(table.width() + table_box.frameWidth() * 2)
+
+        table_wrap = QtWidgets.QHBoxLayout()
+        table_wrap.addStretch()
+        table_wrap.addWidget(table_box)
+        table_wrap.addStretch()
+        layout.addLayout(table_wrap, 1)
+        return widget
+
+    def _build_summary_frame(
+        self,
+        items,
+        highlighted_labels: set[str] | None = None,
+        fechamento: dict | None = None,
+    ) -> QtWidgets.QFrame:
+        highlighted_labels = highlighted_labels or set()
+        frame = QtWidgets.QFrame()
+        layout = QtWidgets.QGridLayout(frame)
+        layout.setHorizontalSpacing(16)
+        layout.setVerticalSpacing(8)
+
+        for row, (label_text, value_text) in enumerate(items):
+            label = QtWidgets.QLabel(f"{label_text}:")
+            value = QtWidgets.QLabel(value_text)
+            label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+            if label_text in highlighted_labels:
+                value_font = value.font()
+                value_font.setBold(True)
+                value_font.setPointSize(value_font.pointSize() + 1)
+                value.setFont(value_font)
+
+            if label_text == "Total Caixa":
+                value.setStyleSheet("color:#59C734;")
+            if label_text in {"Valor das faltantes", "Status"}:
+                cor = "#59C734"
+                if fechamento and fechamento.get("status") != "Confere":
+                    cor = "#FF4D4F"
+                value.setStyleSheet(f"color:{cor};")
+
+            layout.addWidget(label, row, 0)
+            layout.addWidget(value, row, 1)
+
+        return frame
+
+    def _create_export_button(self, text: str, callback) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setStyleSheet("text-align:center;")
+        button.clicked.connect(callback)
+        return button
+
+    def _configure_resizable_table(self, table: QtWidgets.QTableWidget, widths: list[int]) -> None:
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        table.setMinimumSize(0, 0)
+        for index, width in enumerate(widths):
+            table.setColumnWidth(index, width)
+        table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+
+    def _fit_table_width(self, table: QtWidgets.QTableWidget) -> None:
+        width = table.horizontalHeader().length() + table.frameWidth() * 2 + 2
+        if table.verticalScrollBar().isVisible():
+            width += table.verticalScrollBar().sizeHint().width()
+        table.setFixedWidth(width)
+
+    def _export_davs_pdf(self, relatorio: dict) -> None:
+        summary_items = (
+            ("Arquivo", relatorio.get("arquivo") or "-"),
+            ("Periodo", relatorio.get("periodo") or "Nao identificado"),
+            ("Pedidos totais", str(relatorio.get("pedidos_total", 0))),
+            ("Pedidos Caixa", str(relatorio.get("pedidos_caixa", 0))),
+            ("Fora do balcao", str(relatorio.get("pedidos_excluidos_cliente", 0))),
+            ("NF-e excluidas", str(relatorio.get("pedidos_excluidos_documento", 0))),
+            ("Pedidos excluidos", str(relatorio.get("pedidos_excluidos", 0))),
+            ("Total do documento", f"R$ {format_number_br(relatorio.get('total_documento', 0.0))}"),
+            ("Total excluido", f"R$ {format_number_br(relatorio.get('total_excluido', 0.0))}"),
+            ("Total Caixa", f"R$ {format_number_br(relatorio.get('total_caixa', 0.0))}"),
+        )
+        rows = [
+            (
+                self._display_numero(item.get("pedido", "")),
+                item.get("cliente", ""),
+                item.get("documento", ""),
+                f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+            for item in relatorio.get("itens_excluidos", [])
+        ]
+        self._export_report_pdf(
+            title="Relatorio de Caixa - DAVs Importados",
+            default_name="relatorio_caixa_davs.pdf",
+            summary_items=summary_items,
+            headers=("Pedido", "Cliente", "Documento", "Valor"),
+            rows=rows,
+            empty_message="Nenhum pedido excluido encontrado.",
+        )
+
+    def _export_fechamento_pdf(self, fechamento: dict) -> None:
+        summary_items = (
+            ("Arquivo DAVs", fechamento.get("arquivo_caixa") or "-"),
+            ("Arquivo Resumo", fechamento.get("arquivo_resumo") or "-"),
+            ("Periodo", fechamento.get("periodo") or "Nao identificado"),
+            ("Total DAVs importados", f"R$ {format_number_br(fechamento.get('total_caixa', 0.0))}"),
+            ("Total Resumo NFC-e", f"R$ {format_number_br(fechamento.get('total_resumo_nfce', 0.0))}"),
+            ("NFC-e faltantes", str(fechamento.get("nfces_faltantes_count", 0))),
+            ("Valor das faltantes", f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"),
+            ("Status", fechamento.get("status", "-")),
+        )
+        rows = [
+            (
+                item.get("numero_exibicao", ""),
+                "-" if item.get("valor") in (None, "") else f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+            for item in fechamento.get("registros_conferencia", [])
+        ]
+        if rows:
+            rows.append(
+                (
+                    "Total faltante",
+                    f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}",
+                )
+            )
+        self._export_report_pdf(
+            title="Relatorio de Caixa - Fechamento",
+            default_name="relatorio_caixa_fechamento.pdf",
+            summary_items=summary_items,
+            headers=("Numero", "Valor"),
+            rows=rows,
+            empty_message="Nenhuma divergencia encontrada.",
+        )
+
+    def _export_report_pdf(
+        self,
+        title: str,
+        default_name: str,
+        summary_items,
+        headers,
+        rows,
+        empty_message: str,
+    ) -> None:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+            title=title,
+        )
+        if not path:
+            return
+        if os.path.isdir(path):
+            path = os.path.join(path, default_name)
+
+        pdf = canvas.Canvas(path, pagesize=A4)
+        width, height = A4
+        y = height - 40
+
+        def new_page():
+            nonlocal y
+            pdf.showPage()
+            y = height - 40
+            pdf.setFont("Helvetica", 10)
+
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(40, y, title)
+        y -= 28
+
+        pdf.setFont("Helvetica", 10)
+        for label, value in summary_items:
+            text = f"{label}: {value}"
+            for part in self._split_pdf_text(text, 95):
+                if y < 45:
+                    new_page()
+                pdf.drawString(40, y, part)
+                y -= 14
+        y -= 10
+
+        if y < 60:
+            new_page()
+
+        pdf.setFont("Helvetica-Bold", 10)
+        pdf.drawString(40, y, " | ".join(headers))
+        y -= 16
+        pdf.setFont("Helvetica", 9)
+
+        if not rows:
+            pdf.drawString(40, y, empty_message)
+        else:
+            for row in rows:
+                line = " | ".join(str(value) for value in row)
+                for part in self._split_pdf_text(line, 120):
+                    if y < 45:
+                        new_page()
+                    pdf.drawString(40, y, part)
+                    y -= 12
+
+        pdf.save()
+        messagebox.showinfo("Exportado", f"PDF salvo em:\n{path}")
+
+    def _split_pdf_text(self, text: str, max_chars: int) -> list[str]:
+        text = str(text or "")
+        if len(text) <= max_chars:
+            return [text]
+        parts = []
+        current = []
+        current_len = 0
+        for word in text.split():
+            projected = current_len + len(word) + (1 if current else 0)
+            if projected > max_chars and current:
+                parts.append(" ".join(current))
+                current = [word]
+                current_len = len(word)
+            else:
+                current.append(word)
+                current_len = projected
+        if current:
+            parts.append(" ".join(current))
+        return parts or [text]
+
+    def _display_numero(self, numero: str) -> str:
+        digits = re.sub(r"\D", "", str(numero or ""))
+        if not digits:
+            return ""
+        return str(int(digits))
 
 
 class BarChartWidget(QtWidgets.QWidget):
@@ -570,6 +1073,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_select_pdf = QtWidgets.QPushButton("Importar")
         self.btn_select_pdf.setObjectName("btn_import")
         btn_policy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.btn_caixa = QtWidgets.QPushButton("Caixa")
         self.btn_spreadsheet = QtWidgets.QPushButton("Planilha online")
         self.btn_export = QtWidgets.QPushButton("Exportar")
         self.btn_edit_table = QtWidgets.QPushButton("Editar")
@@ -580,6 +1084,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_feedback = QtWidgets.QPushButton("Feedback")
         for btn in (
             self.btn_select_pdf,
+            self.btn_caixa,
             self.btn_spreadsheet,
             self.btn_export,
             self.btn_edit_table,
@@ -598,6 +1103,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_export,
             self.btn_feedback,
             self.btn_select_pdf,
+            self.btn_caixa,
             self.btn_clear,
             self.btn_merge,
             self.btn_spreadsheet,
@@ -774,6 +1280,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _bind_actions(self) -> None:
         self.btn_cancel.clicked.connect(process_cancel)
         self.btn_select_pdf.clicked.connect(self._handle_pdf_button)
+        self.btn_caixa.clicked.connect(self._handle_caixa_report)
         self.btn_spreadsheet.clicked.connect(self._handle_load_planilhas)
         self.btn_export.clicked.connect(lambda: self._export_dialog())
         self.btn_edit_table.clicked.connect(self._toggle_table_edit)
@@ -828,6 +1335,80 @@ class MainWindow(QtWidgets.QMainWindow):
             self.root_adapter,
             self.label_files_var,
         )
+
+    def _handle_caixa_report(self) -> None:
+        if not InstructionDialog(
+            self,
+            "Caixa - Passo 1 de 2",
+            "Selecione agora o PDF de pedidos importados.\n\n"
+            "No passo seguinte o sistema vai pedir o Resumo NFC-e para fazer o fechamento do caixa.",
+        ).confirmed():
+            return
+        path_caixa = filedialog.askopenfilename(
+            filetypes=[("Arquivos PDF", "*.pdf")],
+            title="Caixa - Passo 1 de 2: selecionar relatorio de pedidos importados",
+        )
+        if not path_caixa:
+            return
+
+        if not InstructionDialog(
+            self,
+            "Caixa - Passo 2 de 2",
+            "Agora selecione o PDF Resumo NFC-e.\n\n"
+            "Ele sera usado para comparar com os DAVs importados e apontar NFC-e faltantes.",
+        ).confirmed():
+            return
+        path_resumo = filedialog.askopenfilename(
+            filetypes=[("Arquivos PDF", "*.pdf")],
+            title="Caixa - Passo 2 de 2: selecionar resumo NFC-e",
+        )
+        if not path_resumo:
+            continuar_sem_resumo = messagebox.askyesno(
+                "Resumo NFC-e nao selecionado",
+                "O Resumo NFC-e nao foi selecionado.\n\n"
+                "Deseja continuar somente com a analise dos DAVs importados?",
+            )
+            if not continuar_sem_resumo:
+                return
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            relatorio = analisar_pdf_caixa(path_caixa)
+            fechamento = None
+            relatorio_nfce = None
+            if path_resumo:
+                relatorio_nfce = analisar_pdf_resumo_nfce(path_resumo)
+        except Exception as exc:
+            messagebox.showerror("Erro", f"Erro ao analisar PDF de Caixa:\n{exc}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        if relatorio.get("pedidos_total", 0) <= 0:
+            messagebox.showwarning("Aviso", "Nenhum pedido foi encontrado neste PDF.")
+            return
+
+        caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(relatorio)
+        if not caixa_ok:
+            messagebox.showwarning("Arquivo invalido", caixa_msg)
+            return
+
+        if path_resumo and relatorio_nfce and relatorio_nfce.get("quantidade_nfce", 0) <= 0:
+            messagebox.showwarning("Aviso", "Nenhuma NFC-e foi encontrada no Resumo NFC-e.")
+            return
+
+        if path_resumo and relatorio_nfce:
+            resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(relatorio_nfce)
+            if not resumo_ok:
+                messagebox.showwarning("Arquivo invalido", resumo_msg)
+                return
+            periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(relatorio, relatorio_nfce)
+            if not periodo_ok:
+                messagebox.showwarning("Periodo invalido", periodo_msg)
+                return
+            fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_nfce)
+
+        CaixaReportDialog(self, relatorio, fechamento).exec()
 
     def _build_graphs_view(self) -> QtWidgets.QWidget:
         container = QtWidgets.QWidget()

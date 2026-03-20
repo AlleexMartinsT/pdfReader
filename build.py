@@ -8,6 +8,18 @@ from versionfile_generator import versionfile_generator
 
 versionfile_generator()
 
+preferred_python = Path(".venv64") / "Scripts" / "python.exe"
+python_executable = str(preferred_python if preferred_python.exists() else Path(sys.executable))
+
+subprocess.run(
+    [
+        python_executable,
+        "-c",
+        "import PySide6, openpyxl, pdfplumber",
+    ],
+    check=True,
+)
+
 hidden_imports = [
     "openpyxl",
     "gspread",
@@ -23,7 +35,7 @@ data_files = [
 ]
 
 args = [
-    sys.executable,
+    python_executable,
     "-m",
     "PyInstaller",
     "--onedir",

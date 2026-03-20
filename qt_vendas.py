@@ -13,8 +13,10 @@ from utils import (
     adicionar_pdf,
     analisar_pdf_caixa,
     analisar_pdf_resumo_nfce,
+    combinar_relatorios_caixa_mva,
     comparar_caixa_resumo_nfce,
     validar_periodo_relatorios_caixa,
+    validar_arquivo_caixa_mva,
     validar_relatorio_pedidos_importados,
     validar_relatorio_resumo_nfce,
     ordenar_coluna,
@@ -104,6 +106,42 @@ class InstructionDialog(QtWidgets.QDialog):
 
     def confirmed(self) -> bool:
         return self.exec() == QtWidgets.QDialog.Accepted
+
+
+class CaixaCnpjDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Caixa - CNPJ")
+        self.setModal(True)
+        self._choice = None
+        self.resize(300, 150)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        label = QtWidgets.QLabel("Selecione o CNPJ para o fluxo de Caixa.")
+        label.setWordWrap(True)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(label)
+
+        btn_mva = QtWidgets.QPushButton("MVA")
+        btn_eh = QtWidgets.QPushButton("EH")
+        for btn in (btn_mva, btn_eh):
+            btn.setStyleSheet("text-align:center;")
+            btn.setMinimumHeight(36)
+            layout.addWidget(btn)
+
+        btn_mva.clicked.connect(lambda: self._set_choice("MVA"))
+        btn_eh.clicked.connect(lambda: self._set_choice("EH"))
+
+    def _set_choice(self, value: str) -> None:
+        self._choice = value
+        self.accept()
+
+    def choice(self) -> Optional[str]:
+        if self.exec() == QtWidgets.QDialog.Accepted:
+            return self._choice
+        return None
 
 
 class FeedbackDialog(QtWidgets.QDialog):
@@ -355,23 +393,108 @@ class CaixaReportDialog(QtWidgets.QDialog):
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close, alignment=QtCore.Qt.AlignHCenter)
 
-    def _build_davs_tab(self, relatorio: dict) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(widget)
-        layout.setSpacing(12)
+    def _build_davs_summary_items(self, relatorio: dict):
+        if relatorio.get("caixa_modelo") == "MVA":
+            return (
+                ("Arquivo", relatorio.get("arquivo") or "-"),
+                ("Periodo", relatorio.get("periodo") or "Nao identificado"),
+                ("Pedidos totais", str(relatorio.get("pedidos_total", 0))),
+                ("Finalizados", str(relatorio.get("pedidos_caixa", 0))),
+                ("Editando", str(relatorio.get("pedidos_editando", 0))),
+                ("Outros status", str(relatorio.get("pedidos_outros_status", 0))),
+                ("Pedidos excluidos", str(relatorio.get("pedidos_excluidos", 0))),
+                ("Total do documento", f"R$ {format_number_br(relatorio.get('total_documento', 0.0))}"),
+                ("Total excluido", f"R$ {format_number_br(relatorio.get('total_excluido', 0.0))}"),
+                ("Total Caixa", f"R$ {format_number_br(relatorio.get('total_caixa', 0.0))}"),
+            )
 
-        summary_items = (
+        return (
             ("Arquivo", relatorio.get("arquivo") or "-"),
             ("Periodo", relatorio.get("periodo") or "Nao identificado"),
             ("Pedidos totais", str(relatorio.get("pedidos_total", 0))),
             ("Pedidos Caixa", str(relatorio.get("pedidos_caixa", 0))),
-            ("Fora do balcão", str(relatorio.get("pedidos_excluidos_cliente", 0))),
+            ("Fora do balcao", str(relatorio.get("pedidos_excluidos_cliente", 0))),
             ("NF-e excluidas", str(relatorio.get("pedidos_excluidos_documento", 0))),
             ("Pedidos excluidos", str(relatorio.get("pedidos_excluidos", 0))),
             ("Total do documento", f"R$ {format_number_br(relatorio.get('total_documento', 0.0))}"),
             ("Total excluido", f"R$ {format_number_br(relatorio.get('total_excluido', 0.0))}"),
             ("Total Caixa", f"R$ {format_number_br(relatorio.get('total_caixa', 0.0))}"),
         )
+
+    def _build_davs_table_headers(self, relatorio: dict) -> tuple[str, ...]:
+        if relatorio.get("caixa_modelo") == "MVA":
+            return ("Pedido", "Descricao", "Status", "Valor")
+        return ("Pedido", "Cliente", "Documento", "Valor")
+
+    def _build_davs_table_widths(self, relatorio: dict) -> list[int]:
+        if relatorio.get("caixa_modelo") == "MVA":
+            return [100, 250, 110, 120]
+        return [90, 280, 190, 120]
+
+    def _build_davs_section_title(self, relatorio: dict) -> str:
+        if relatorio.get("caixa_modelo") == "MVA":
+            return "Pedidos nao finalizados"
+        return "Pedidos excluidos do calculo"
+
+    def _build_davs_empty_message(self, relatorio: dict) -> str:
+        if relatorio.get("caixa_modelo") == "MVA":
+            return "Nenhum pedido nao finalizado encontrado."
+        return "Nenhum pedido excluido encontrado."
+
+    def _build_fechamento_subtitle(self, fechamento: dict) -> str:
+        return fechamento.get(
+            "subtitle",
+            "Compara o total de caixa dos DAVs importados com o Resumo NFC-e e aponta as NFC-e faltantes.",
+        )
+
+    def _build_fechamento_summary_items(self, fechamento: dict):
+        items = [
+            ("Arquivo DAVs", fechamento.get("arquivo_caixa") or "-"),
+            (fechamento.get("arquivo_resumo_titulo", "Arquivo Resumo"), fechamento.get("arquivo_resumo") or "-"),
+            ("Periodo", fechamento.get("periodo") or "Nao identificado"),
+            (
+                fechamento.get("total_caixa_titulo", "Total DAVs importados"),
+                f"R$ {format_number_br(fechamento.get('total_caixa', 0.0))}",
+            ),
+            (
+                fechamento.get("total_resumo_titulo", "Total Resumo NFC-e"),
+                f"R$ {format_number_br(fechamento.get('total_resumo_nfce', 0.0))}",
+            ),
+        ]
+        if fechamento.get("nfes_identificadas_count", 0):
+            items.extend(
+                [
+                    ("NF-e identificadas", str(fechamento.get("nfes_identificadas_count", 0))),
+                    (
+                        "Valor identificado em NF-e",
+                        f"R$ {format_number_br(fechamento.get('nfes_identificadas_valor', 0.0))}",
+                    ),
+                ]
+            )
+        items.extend(
+            [
+                (
+                    fechamento.get("faltantes_titulo", "NFC-e faltantes"),
+                    str(fechamento.get("nfces_faltantes_count", 0)),
+                ),
+                ("Valor das faltantes", f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"),
+                ("Status", fechamento.get("status", "-")),
+            ]
+        )
+        return tuple(items)
+
+    def _build_fechamento_section_title(self, fechamento: dict) -> str:
+        return fechamento.get("secao_titulo", "NFC-e faltantes")
+
+    def _build_fechamento_empty_message(self, fechamento: dict) -> str:
+        return fechamento.get("empty_message", "Nenhuma NFC-e faltante encontrada.")
+
+    def _build_davs_tab(self, relatorio: dict) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        summary_items = self._build_davs_summary_items(relatorio)
         layout.addWidget(self._build_summary_frame(summary_items, {"Total Caixa"}))
 
         actions = QtWidgets.QHBoxLayout()
@@ -385,13 +508,13 @@ class CaixaReportDialog(QtWidgets.QDialog):
         actions.addStretch()
         layout.addLayout(actions)
 
-        section_label = QtWidgets.QLabel("Pedidos excluidos do calculo")
+        section_label = QtWidgets.QLabel(self._build_davs_section_title(relatorio))
         section_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(section_label)
 
         table = QtWidgets.QTableWidget()
         table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(("Pedido", "Cliente", "Documento", "Valor"))
+        table.setHorizontalHeaderLabels(self._build_davs_table_headers(relatorio))
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -400,7 +523,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         table.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
         table.setMinimumSize(0, 0)
         table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self._configure_resizable_table(table, [90, 280, 190, 120])
+        self._configure_resizable_table(table, self._build_davs_table_widths(relatorio))
 
         itens_excluidos = relatorio.get("itens_excluidos", [])
         table.setRowCount(len(itens_excluidos))
@@ -422,7 +545,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
 
         if not itens_excluidos:
             table.setRowCount(1)
-            empty_item = QtWidgets.QTableWidgetItem("Nenhum pedido excluido encontrado.")
+            empty_item = QtWidgets.QTableWidgetItem(self._build_davs_empty_message(relatorio))
             empty_item.setTextAlignment(QtCore.Qt.AlignCenter)
             table.setSpan(0, 0, 1, 4)
             table.setItem(0, 0, empty_item)
@@ -441,23 +564,12 @@ class CaixaReportDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setSpacing(12)
 
-        subtitle = QtWidgets.QLabel(
-            "Compara o total de caixa dos DAVs importados com o Resumo NFC-e e aponta as NFC-e faltantes."
-        )
+        subtitle = QtWidgets.QLabel(self._build_fechamento_subtitle(fechamento))
         subtitle.setWordWrap(True)
         subtitle.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(subtitle)
 
-        summary_items = (
-            ("Arquivo DAVs", fechamento.get("arquivo_caixa") or "-"),
-            ("Arquivo Resumo", fechamento.get("arquivo_resumo") or "-"),
-            ("Periodo", fechamento.get("periodo") or "Nao identificado"),
-            ("Total DAVs importados", f"R$ {format_number_br(fechamento.get('total_caixa', 0.0))}"),
-            ("Total Resumo NFC-e", f"R$ {format_number_br(fechamento.get('total_resumo_nfce', 0.0))}"),
-            ("NFC-e faltantes", str(fechamento.get("nfces_faltantes_count", 0))),
-            ("Valor das faltantes", f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"),
-            ("Status", fechamento.get("status", "-")),
-        )
+        summary_items = self._build_fechamento_summary_items(fechamento)
         layout.addWidget(
             self._build_summary_frame(
                 summary_items,
@@ -477,7 +589,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         actions.addStretch()
         layout.addLayout(actions)
 
-        section_label = QtWidgets.QLabel("NFC-e faltantes")
+        section_label = QtWidgets.QLabel(self._build_fechamento_section_title(fechamento))
         section_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(section_label)
 
@@ -531,7 +643,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             table.setItem(row, 1, valor_item)
 
         if not registros:
-            empty_item = QtWidgets.QTableWidgetItem("Nenhuma NFC-e faltante encontrada.")
+            empty_item = QtWidgets.QTableWidgetItem(self._build_fechamento_empty_message(fechamento))
             empty_item.setTextAlignment(QtCore.Qt.AlignCenter)
             empty_item.setFlags(QtCore.Qt.ItemIsEnabled)
             table.setSpan(0, 0, 1, 2)
@@ -627,18 +739,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         table.setFixedWidth(width)
 
     def _export_davs_pdf(self, relatorio: dict) -> None:
-        summary_items = (
-            ("Arquivo", relatorio.get("arquivo") or "-"),
-            ("Periodo", relatorio.get("periodo") or "Nao identificado"),
-            ("Pedidos totais", str(relatorio.get("pedidos_total", 0))),
-            ("Pedidos Caixa", str(relatorio.get("pedidos_caixa", 0))),
-            ("Fora do balcao", str(relatorio.get("pedidos_excluidos_cliente", 0))),
-            ("NF-e excluidas", str(relatorio.get("pedidos_excluidos_documento", 0))),
-            ("Pedidos excluidos", str(relatorio.get("pedidos_excluidos", 0))),
-            ("Total do documento", f"R$ {format_number_br(relatorio.get('total_documento', 0.0))}"),
-            ("Total excluido", f"R$ {format_number_br(relatorio.get('total_excluido', 0.0))}"),
-            ("Total Caixa", f"R$ {format_number_br(relatorio.get('total_caixa', 0.0))}"),
-        )
+        summary_items = self._build_davs_summary_items(relatorio)
         rows = [
             (
                 self._display_numero(item.get("pedido", "")),
@@ -652,22 +753,13 @@ class CaixaReportDialog(QtWidgets.QDialog):
             title="Relatorio de Caixa - DAVs Importados",
             default_name="relatorio_caixa_davs.pdf",
             summary_items=summary_items,
-            headers=("Pedido", "Cliente", "Documento", "Valor"),
+            headers=self._build_davs_table_headers(relatorio),
             rows=rows,
-            empty_message="Nenhum pedido excluido encontrado.",
+            empty_message=self._build_davs_empty_message(relatorio),
         )
 
     def _export_fechamento_pdf(self, fechamento: dict) -> None:
-        summary_items = (
-            ("Arquivo DAVs", fechamento.get("arquivo_caixa") or "-"),
-            ("Arquivo Resumo", fechamento.get("arquivo_resumo") or "-"),
-            ("Periodo", fechamento.get("periodo") or "Nao identificado"),
-            ("Total DAVs importados", f"R$ {format_number_br(fechamento.get('total_caixa', 0.0))}"),
-            ("Total Resumo NFC-e", f"R$ {format_number_br(fechamento.get('total_resumo_nfce', 0.0))}"),
-            ("NFC-e faltantes", str(fechamento.get("nfces_faltantes_count", 0))),
-            ("Valor das faltantes", f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"),
-            ("Status", fechamento.get("status", "-")),
-        )
+        summary_items = self._build_fechamento_summary_items(fechamento)
         rows = [
             (
                 item.get("numero_exibicao", ""),
@@ -688,7 +780,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             summary_items=summary_items,
             headers=("Numero", "Valor"),
             rows=rows,
-            empty_message="Nenhuma divergencia encontrada.",
+            empty_message=self._build_fechamento_empty_message(fechamento),
         )
 
     def _export_report_pdf(
@@ -1337,30 +1429,169 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _handle_caixa_report(self) -> None:
+        cnpj = CaixaCnpjDialog(self).choice()
+        if not cnpj:
+            return
+
+        if cnpj == "MVA":
+            if not InstructionDialog(
+                self,
+                "Caixa MVA - Passo 1 de 3",
+                "Selecione agora o PDF Exportacao de dados.\n\n"
+                "No passo seguinte o sistema vai pedir o relatorio de Orcamentos e depois o relatorio de Cupons.",
+            ).confirmed():
+                return
+
+            path_davs = filedialog.askopenfilename(
+                filetypes=[("Arquivos PDF", "*.pdf")],
+                title="Caixa MVA - Passo 1 de 3: selecionar exportacao de dados",
+            )
+            if not path_davs:
+                return
+
+            if not InstructionDialog(
+                self,
+                "Caixa MVA - Passo 2 de 3",
+                "Agora selecione o PDF de Orcamentos.\n\n"
+                "Ele sera somado aos DAVs finalizados para montar a base de comparacao do caixa.",
+            ).confirmed():
+                return
+
+            path_orcamentos = filedialog.askopenfilename(
+                filetypes=[("Arquivos PDF", "*.pdf")],
+                title="Caixa MVA - Passo 2 de 3: selecionar orcamentos",
+            )
+            if not path_orcamentos:
+                messagebox.showwarning(
+                    "Arquivo obrigatorio",
+                    "O relatorio de Orcamentos da MVA precisa ser selecionado para continuar.",
+                )
+                return
+
+            if not InstructionDialog(
+                self,
+                "Caixa MVA - Passo 3 de 3",
+                "Agora selecione o relatorio de Cupons.\n\n"
+                "Ele sera usado para comparar com os DAVs aptos para cupom e apontar DAVs/CF faltantes.",
+            ).confirmed():
+                return
+
+            path_cupons = filedialog.askopenfilename(
+                filetypes=[("Arquivos PDF", "*.pdf")],
+                title="Caixa MVA - Passo 3 de 3: selecionar relatorio de cupons",
+            )
+            if not path_cupons:
+                continuar_sem_cupons = messagebox.askyesno(
+                    "Relatorio de Cupons nao selecionado",
+                    "O relatorio de Cupons nao foi selecionado.\n\n"
+                    "Deseja continuar somente com a analise dos DAVs da MVA?",
+                )
+                if not continuar_sem_cupons:
+                    return
+
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                relatorio_davs = analisar_pdf_caixa(path_davs)
+                relatorio_orcamentos = analisar_pdf_caixa(path_orcamentos)
+                fechamento = None
+                relatorio_cupons = None
+                if path_cupons:
+                    relatorio_cupons = analisar_pdf_resumo_nfce(path_cupons)
+            except Exception as exc:
+                messagebox.showerror("Erro", f"Erro ao analisar PDF de Caixa:\n{exc}")
+                return
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+
+            davs_ok, davs_msg = validar_arquivo_caixa_mva(
+                relatorio_davs,
+                "exportacao_dados_mva",
+            )
+            if not davs_ok:
+                messagebox.showwarning("Arquivo invalido", davs_msg)
+                return
+
+            orc_ok, orc_msg = validar_arquivo_caixa_mva(
+                relatorio_orcamentos,
+                "orcamentos_mva",
+            )
+            if not orc_ok:
+                messagebox.showwarning("Arquivo invalido", orc_msg)
+                return
+
+            if relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
+                if relatorio_davs.get("periodo") != relatorio_orcamentos.get("periodo"):
+                    messagebox.showwarning(
+                        "Periodo invalido",
+                        "A Exportacao de dados e o relatorio de Orcamentos precisam ser do mesmo periodo.",
+                    )
+                    return
+
+            relatorio = combinar_relatorios_caixa_mva(
+                [relatorio_davs, relatorio_orcamentos]
+            )
+
+            if relatorio.get("pedidos_total", 0) <= 0:
+                messagebox.showwarning("Aviso", "Nenhum pedido foi encontrado neste PDF.")
+                return
+
+            caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(
+                relatorio,
+                modelo_esperado="MVA",
+            )
+            if not caixa_ok:
+                messagebox.showwarning("Arquivo invalido", caixa_msg)
+                return
+
+            if path_cupons and relatorio_cupons and relatorio_cupons.get("quantidade_nfce", 0) <= 0:
+                messagebox.showwarning("Aviso", "Nenhum cupom foi encontrado no relatorio informado.")
+                return
+
+            if path_cupons and relatorio_cupons:
+                resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(
+                    relatorio_cupons,
+                    modelo_esperado="MVA",
+                )
+                if not resumo_ok:
+                    messagebox.showwarning("Arquivo invalido", resumo_msg)
+                    return
+                periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
+                    relatorio,
+                    relatorio_cupons,
+                    titulo_secundario="relatorio de Cupons",
+                )
+                if not periodo_ok:
+                    messagebox.showwarning("Periodo invalido", periodo_msg)
+                    return
+                fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_cupons)
+
+            CaixaReportDialog(self, relatorio, fechamento).exec()
+            return
+
         if not InstructionDialog(
             self,
-            "Caixa - Passo 1 de 2",
+            "Caixa EH - Passo 1 de 2",
             "Selecione agora o PDF de pedidos importados.\n\n"
             "No passo seguinte o sistema vai pedir o Resumo NFC-e para fazer o fechamento do caixa.",
         ).confirmed():
             return
         path_caixa = filedialog.askopenfilename(
             filetypes=[("Arquivos PDF", "*.pdf")],
-            title="Caixa - Passo 1 de 2: selecionar relatorio de pedidos importados",
+            title="Caixa EH - Passo 1 de 2: selecionar relatorio de pedidos importados",
         )
         if not path_caixa:
             return
 
         if not InstructionDialog(
             self,
-            "Caixa - Passo 2 de 2",
+            "Caixa EH - Passo 2 de 2",
             "Agora selecione o PDF Resumo NFC-e.\n\n"
             "Ele sera usado para comparar com os DAVs importados e apontar NFC-e faltantes.",
         ).confirmed():
             return
         path_resumo = filedialog.askopenfilename(
             filetypes=[("Arquivos PDF", "*.pdf")],
-            title="Caixa - Passo 2 de 2: selecionar resumo NFC-e",
+            title="Caixa EH - Passo 2 de 2: selecionar resumo NFC-e",
         )
         if not path_resumo:
             continuar_sem_resumo = messagebox.askyesno(
@@ -1388,7 +1619,10 @@ class MainWindow(QtWidgets.QMainWindow):
             messagebox.showwarning("Aviso", "Nenhum pedido foi encontrado neste PDF.")
             return
 
-        caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(relatorio)
+        caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(
+            relatorio,
+            modelo_esperado="EH",
+        )
         if not caixa_ok:
             messagebox.showwarning("Arquivo invalido", caixa_msg)
             return
@@ -1398,11 +1632,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if path_resumo and relatorio_nfce:
-            resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(relatorio_nfce)
+            resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(
+                relatorio_nfce,
+                modelo_esperado="EH",
+            )
             if not resumo_ok:
                 messagebox.showwarning("Arquivo invalido", resumo_msg)
                 return
-            periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(relatorio, relatorio_nfce)
+            periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
+                relatorio,
+                relatorio_nfce,
+                titulo_secundario="Resumo NFC-e",
+            )
             if not periodo_ok:
                 messagebox.showwarning("Periodo invalido", periodo_msg)
                 return

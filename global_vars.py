@@ -1,6 +1,6 @@
 from library import re
 
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.0.8"
 GITHUB_REPO = "AlleexMartinsT/pdfReader"
 LAST_MVA = None
 LAST_EH = None

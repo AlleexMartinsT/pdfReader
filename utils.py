@@ -4,6 +4,10 @@ import json
 import threading
 import queue
 import difflib
+from datetime import datetime
+
+import requests
+
 from ui_dialogs import filedialog, messagebox
 from global_vars import (
     listFiles, list_results, regex_data, regex_negative, 
@@ -15,6 +19,7 @@ from global_vars import (
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
 LAST_STATE_SPREADSHEET = {}
+_MINHAS_NOTAS_CACHE = {}
 
 _UI_REFS = {
     "btn_cancel": None,
@@ -337,7 +342,7 @@ def _classify_caixa_document(description: str) -> str:
     return description.strip()
 
 
-def analisar_pdf_caixa(caminho_pdf: str) -> dict:
+def _analisar_pdf_caixa_eh(caminho_pdf: str) -> dict:
     pdfplumber = _get_pdfplumber()
     pedidos = []
     cliente_atual = None
@@ -437,6 +442,8 @@ def analisar_pdf_caixa(caminho_pdf: str) -> dict:
 
     return {
         "arquivo": os.path.basename(caminho_pdf),
+        "caixa_modelo": "EH",
+        "arquivo_tipo": "pedidos_importados_eh",
         "periodo": periodo,
         "pedidos_total": len(pedidos),
         "pedidos_balcao": pedidos_balcao,
@@ -456,6 +463,360 @@ def analisar_pdf_caixa(caminho_pdf: str) -> dict:
             key=lambda item: (-item["valor"], item["cliente"].casefold(), item["pedido"]),
         ),
     }
+
+
+def _mva_report_type_from_text(texto: str) -> str:
+    texto_normalizado = _normalize_caixa_client(texto)
+    if "DAV - ORCAMENTO" in texto_normalizado:
+        return "orcamentos_mva"
+    if "DAV - PEDIDOS DE VENDA" in texto_normalizado:
+        return "exportacao_dados_mva"
+    return "mva_desconhecido"
+
+
+def _mva_report_label(arquivo_tipo: str) -> str:
+    if arquivo_tipo == "orcamentos_mva":
+        return "Orcamentos"
+    if arquivo_tipo == "exportacao_dados_mva":
+        return "Exportacao de dados"
+    return "MVA"
+
+
+def _normalize_mva_description(resto_linha: str) -> str:
+    descricao = re.sub(r"^\s*\d+\s+", "", (resto_linha or "").strip())
+    return descricao or "-"
+
+
+def _extract_mva_word_rows(page) -> list[list[dict]]:
+    rows_by_top = {}
+    for word in page.extract_words(use_text_flow=False):
+        rows_by_top.setdefault(round(word["top"], 1), []).append(word)
+
+    grouped_rows = []
+    for top in sorted(rows_by_top):
+        row = sorted(rows_by_top[top], key=lambda item: item["x0"])
+        if any(re.fullmatch(r"\d{6,}", item["text"]) and item["x0"] < 60 for item in row):
+            grouped_rows.append(row)
+    return grouped_rows
+
+
+def _extract_mva_column_bounds(page) -> dict:
+    rows_by_top = {}
+    for word in page.extract_words(use_text_flow=False):
+        rows_by_top.setdefault(round(word["top"], 1), []).append(word)
+
+    header_row = None
+    for top in sorted(rows_by_top):
+        row = sorted(rows_by_top[top], key=lambda item: item["x0"])
+        normalized = [_normalize_caixa_client(item["text"]) for item in row]
+        if "STATUS" in normalized:
+            header_row = row
+            break
+
+    bounds = {
+        "code_x1": 140.0,
+        "vendor_x0": None,
+        "status_x0": None,
+    }
+    if not header_row:
+        return bounds
+
+    for item in header_row:
+        normalized = _normalize_caixa_client(item["text"])
+        if normalized in {"CODIGO", "CÓDIGO"}:
+            bounds["code_x1"] = item["x1"]
+        elif normalized == "VENDEDOR":
+            bounds["vendor_x0"] = item["x0"]
+        elif normalized == "STATUS":
+            bounds["status_x0"] = item["x0"]
+    return bounds
+
+
+def _extract_mva_description_from_row(row_words: list[dict], bounds: dict, fallback: str) -> str:
+    if not row_words:
+        return fallback
+
+    left_bound = float(bounds.get("code_x1") or 140.0) + 2.0
+    right_bound = None
+    vendor_x0 = bounds.get("vendor_x0")
+    status_x0 = bounds.get("status_x0")
+    if vendor_x0 is not None:
+        right_bound = float(vendor_x0) - 32.0
+    elif status_x0 is not None:
+        right_bound = float(status_x0) - 20.0
+
+    descricao = " ".join(
+        item["text"]
+        for item in row_words
+        if item["x0"] >= left_bound and (right_bound is None or item["x1"] <= right_bound)
+    ).strip()
+    return descricao or fallback
+
+
+def _parse_period_bounds(periodo: str) -> tuple[object | None, object | None]:
+    from datetime import datetime
+
+    inicio, fim = _extract_period_range(periodo or "")
+    if not inicio or not fim:
+        return None, None
+    return (
+        datetime.strptime(inicio, "%d/%m/%Y"),
+        datetime.strptime(fim, "%d/%m/%Y"),
+    )
+
+
+def _analisar_pdf_caixa_mva(caminho_pdf: str) -> dict:
+    from datetime import datetime
+
+    pdfplumber = _get_pdfplumber()
+    padrao_linha = re.compile(
+        r"^(?:(?P<pedido>\d{6,})\s+)?"
+        r"(?:(?P<data>\d{2}/\d{2}/\d{4})"
+        r"(?:\s+(?P<hora>\d{2}:\d{2}:\d{2}))?\s+)?"
+        r"(?P<resto>.*?)"
+        r"\s+(?P<status>[A-Za-zÀ-ÿ]+)"
+        r"\s+(?P<valor>[-\d\.,]+)\s*$"
+    )
+    padrao_total = re.compile(r"^[-\d\.,]+$")
+
+    registros = []
+    totais_documento = []
+    datas_encontradas = []
+    arquivo_tipo = "mva_desconhecido"
+
+    with pdfplumber.open(caminho_pdf) as pdf:
+        primeira_pagina = pdf.pages[0].extract_text() or ""
+        arquivo_tipo = _mva_report_type_from_text(primeira_pagina)
+        last_bounds = None
+
+        for pagina in pdf.pages:
+            texto = pagina.extract_text() or ""
+            linhas_palavras = _extract_mva_word_rows(pagina)
+            bounds = _extract_mva_column_bounds(pagina)
+            if bounds.get("status_x0") is None and last_bounds is not None:
+                bounds = last_bounds
+            elif bounds.get("status_x0") is not None:
+                last_bounds = bounds
+            data_row_idx = 0
+
+            for linha in texto.splitlines():
+                linha = linha.strip()
+                match = padrao_linha.match(linha)
+                if match:
+                    data = match.group("data")
+                    if data:
+                        datas_encontradas.append(datetime.strptime(data, "%d/%m/%Y"))
+                    status = match.group("status").strip()
+                    fallback_descricao = _normalize_mva_description(match.group("resto"))
+                    row_words = linhas_palavras[data_row_idx] if data_row_idx < len(linhas_palavras) else []
+                    descricao = _extract_mva_description_from_row(row_words, bounds, fallback_descricao)
+                    data_row_idx += 1
+                    registros.append(
+                        {
+                            "pedido": match.group("pedido"),
+                            "cliente": descricao,
+                            "status": status,
+                            "valor": round(parse_number(match.group("valor")), 2),
+                            "documento": status,
+                            "origem_mva": _mva_report_label(arquivo_tipo),
+                        }
+                    )
+                    continue
+                if padrao_total.fullmatch(linha):
+                    totais_documento.append(round(parse_number(linha), 2))
+
+    periodo = None
+    if datas_encontradas:
+        data_inicial = min(datas_encontradas).strftime("%d/%m/%Y")
+        data_final = max(datas_encontradas).strftime("%d/%m/%Y")
+        periodo = f"{data_inicial} - {data_final}"
+
+    itens_caixa = []
+    itens_excluidos = []
+    total_caixa_bruto = 0.0
+    total_excluido = 0.0
+    pedidos_editando = 0
+    pedidos_outros_status = 0
+
+    for registro in registros:
+        item_base = {
+            "pedido": registro["pedido"],
+            "cliente": registro["cliente"],
+            "documento": registro["status"],
+            "valor": registro["valor"],
+        }
+        if registro["status"] == "Finalizado":
+            total_caixa_bruto += registro["valor"]
+            itens_caixa.append(item_base)
+            continue
+
+        total_excluido += registro["valor"]
+        itens_excluidos.append(item_base)
+        if registro["status"] == "Editando":
+            pedidos_editando += 1
+        else:
+            pedidos_outros_status += 1
+
+    total_documento = totais_documento[-1] if totais_documento else round(
+        sum(item["valor"] for item in registros),
+        2,
+    )
+    total_documento = round(total_documento, 2)
+    total_excluido = round(total_excluido, 2)
+    total_caixa = round(total_caixa_bruto, 2)
+
+    return {
+        "arquivo": os.path.basename(caminho_pdf),
+        "caixa_modelo": "MVA",
+        "arquivo_tipo": arquivo_tipo,
+        "periodo": periodo,
+        "pedidos_total": len(registros),
+        "pedidos_balcao": 0,
+        "pedidos_caixa": len(itens_caixa),
+        "pedidos_excluidos": len(itens_excluidos),
+        "pedidos_excluidos_cliente": 0,
+        "pedidos_excluidos_documento": 0,
+        "pedidos_editando": pedidos_editando,
+        "pedidos_outros_status": pedidos_outros_status,
+        "total_documento": total_documento,
+        "total_excluido": total_excluido,
+        "total_caixa": total_caixa,
+        "itens_caixa": sorted(
+            itens_caixa,
+            key=lambda item: item["pedido"],
+        ),
+        "itens_excluidos": sorted(
+            itens_excluidos,
+            key=lambda item: (item["documento"], item["pedido"]),
+        ),
+    }
+
+
+def combinar_relatorios_caixa_mva(relatorios: list[dict]) -> dict:
+    from datetime import datetime
+
+    relatorios_validos = [
+        rel
+        for rel in relatorios
+        if rel and (rel.get("caixa_modelo") or "").upper() == "MVA"
+    ]
+    if not relatorios_validos:
+        return {
+            "arquivo": "",
+            "caixa_modelo": "MVA",
+            "arquivo_tipo": "mva_davs_combinado",
+            "periodo": None,
+            "pedidos_total": 0,
+            "pedidos_balcao": 0,
+            "pedidos_caixa": 0,
+            "pedidos_excluidos": 0,
+            "pedidos_excluidos_cliente": 0,
+            "pedidos_excluidos_documento": 0,
+            "pedidos_editando": 0,
+            "pedidos_outros_status": 0,
+            "total_documento": 0.0,
+            "total_excluido": 0.0,
+            "total_caixa": 0.0,
+            "itens_caixa": [],
+            "itens_excluidos": [],
+        }
+
+    datas_inicio = []
+    datas_fim = []
+    for relatorio in relatorios_validos:
+        inicio, fim = _parse_period_bounds(relatorio.get("periodo", ""))
+        if inicio:
+            datas_inicio.append(inicio)
+        if fim:
+            datas_fim.append(fim)
+
+    periodo = None
+    if datas_inicio and datas_fim:
+        periodo = (
+            f"{min(datas_inicio).strftime('%d/%m/%Y')} - "
+            f"{max(datas_fim).strftime('%d/%m/%Y')}"
+        )
+
+    itens_caixa = []
+    itens_excluidos = []
+    for relatorio in relatorios_validos:
+        for item in relatorio.get("itens_caixa", []):
+            itens_caixa.append({**item})
+        for item in relatorio.get("itens_excluidos", []):
+            itens_excluidos.append({**item})
+
+    return {
+        "arquivo": " + ".join(relatorio.get("arquivo") or "-" for relatorio in relatorios_validos),
+        "caixa_modelo": "MVA",
+        "arquivo_tipo": "mva_davs_combinado",
+        "periodo": periodo,
+        "pedidos_total": sum(relatorio.get("pedidos_total", 0) for relatorio in relatorios_validos),
+        "pedidos_balcao": 0,
+        "pedidos_caixa": sum(relatorio.get("pedidos_caixa", 0) for relatorio in relatorios_validos),
+        "pedidos_excluidos": sum(relatorio.get("pedidos_excluidos", 0) for relatorio in relatorios_validos),
+        "pedidos_excluidos_cliente": 0,
+        "pedidos_excluidos_documento": 0,
+        "pedidos_editando": sum(relatorio.get("pedidos_editando", 0) for relatorio in relatorios_validos),
+        "pedidos_outros_status": sum(relatorio.get("pedidos_outros_status", 0) for relatorio in relatorios_validos),
+        "total_documento": round(
+            sum(float(relatorio.get("total_documento", 0.0)) for relatorio in relatorios_validos),
+            2,
+        ),
+        "total_excluido": round(
+            sum(float(relatorio.get("total_excluido", 0.0)) for relatorio in relatorios_validos),
+            2,
+        ),
+        "total_caixa": round(
+            sum(float(relatorio.get("total_caixa", 0.0)) for relatorio in relatorios_validos),
+            2,
+        ),
+        "itens_caixa": sorted(
+            itens_caixa,
+            key=lambda item: item.get("pedido", ""),
+        ),
+        "itens_excluidos": sorted(
+            itens_excluidos,
+            key=lambda item: (
+                item.get("documento", ""),
+                item.get("origem_mva", ""),
+                item.get("pedido", ""),
+            ),
+        ),
+    }
+
+
+def validar_arquivo_caixa_mva(relatorio: dict, arquivo_tipo_esperado: str) -> tuple[bool, str]:
+    if not relatorio or (relatorio.get("caixa_modelo") or "").upper() != "MVA":
+        return False, "O arquivo selecionado nao parece ser um relatorio de Caixa MVA."
+
+    if arquivo_tipo_esperado == "exportacao_dados_mva":
+        if relatorio.get("arquivo_tipo") != "exportacao_dados_mva":
+            return False, "O arquivo selecionado no passo 1 nao parece ser a Exportacao de dados da MVA."
+    elif arquivo_tipo_esperado == "orcamentos_mva":
+        if relatorio.get("arquivo_tipo") != "orcamentos_mva":
+            return False, "O arquivo selecionado no passo 2 nao parece ser o relatorio de Orcamentos da MVA."
+
+    if relatorio.get("pedidos_total", 0) <= 0:
+        return False, "O arquivo selecionado nao trouxe nenhum DAV valido."
+    return True, ""
+
+
+def analisar_pdf_caixa(caminho_pdf: str | list[str] | tuple[str, ...]) -> dict:
+    if isinstance(caminho_pdf, (list, tuple)):
+        relatorios = [analisar_pdf_caixa(caminho) for caminho in caminho_pdf if caminho]
+        if relatorios and all((rel.get("caixa_modelo") or "").upper() == "MVA" for rel in relatorios):
+            return combinar_relatorios_caixa_mva(relatorios)
+        if len(relatorios) == 1:
+            return relatorios[0]
+        raise ValueError("Nao foi possivel combinar os relatorios de Caixa informados.")
+
+    pdfplumber = _get_pdfplumber()
+    with pdfplumber.open(caminho_pdf) as pdf:
+        primeira_pagina = pdf.pages[0].extract_text() or ""
+
+    if _mva_report_type_from_text(primeira_pagina) != "mva_desconhecido":
+        return _analisar_pdf_caixa_mva(caminho_pdf)
+    return _analisar_pdf_caixa_eh(caminho_pdf)
 
 
 def _normalize_fiscal_number(numero: str) -> str:
@@ -479,6 +840,175 @@ def _extract_period_range(periodo: str) -> tuple[str | None, str | None]:
     return match.group(1), match.group(2)
 
 
+def _period_to_iso_date(periodo: str) -> str | None:
+    inicio, fim = _extract_period_range(periodo or "")
+    if not inicio or not fim or inicio != fim:
+        return None
+    try:
+        return datetime.strptime(inicio, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _load_minhas_notas_credentials() -> tuple[str, str] | None:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for filename in ("credenciais.txt", "credencias.txt"):
+        caminho = os.path.join(base_dir, filename)
+        if not os.path.isfile(caminho):
+            continue
+        try:
+            with open(caminho, "r", encoding="utf-8") as arquivo:
+                linhas = [linha.strip() for linha in arquivo.readlines() if linha.strip()]
+        except OSError:
+            return None
+        if len(linhas) >= 2:
+            return linhas[0], linhas[1]
+    return None
+
+
+def _authenticate_minhas_notas(login: str, password: str) -> str:
+    resposta = requests.post(
+        "https://api.clippfacil.com.br/rpc/v2/application.authenticate",
+        json={
+            "login": login,
+            "password": password,
+            "isSharedAccess": True,
+        },
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+        },
+        timeout=20,
+    )
+    resposta.raise_for_status()
+    payload = resposta.json() or {}
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise ValueError("Nao foi possivel autenticar no Minhas Notas.")
+    return token
+
+
+def _fetch_minhas_notas_nfes(
+    access_token: str,
+    data_iso: str,
+    cache_namespace: str = "",
+) -> list[dict]:
+    cache_key = ((cache_namespace or access_token[-8:]).lower(), data_iso)
+    if cache_key in _MINHAS_NOTAS_CACHE:
+        return [dict(item) for item in _MINHAS_NOTAS_CACHE[cache_key]]
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt_BR",
+        "Authorization-Compufacil": access_token,
+        "Content-Type": "application/json;charset=UTF-8",
+    }
+    documentos = []
+    pagina = 1
+    max_results = 100
+
+    while True:
+        resposta = requests.post(
+            "https://api.clippfacil.com.br/rpc/v1/clipp.get-xml-by-emissor",
+            json={
+                "page": pagina,
+                "maxResults": max_results,
+                "model": "55",
+                "fromEmission": data_iso,
+                "toEmission": data_iso,
+            },
+            headers=headers,
+            timeout=20,
+        )
+        resposta.raise_for_status()
+        payload = resposta.json() or {}
+        pagina_docs = payload.get("data") or []
+        documentos.extend(pagina_docs)
+
+        total = int(payload.get("total") or 0)
+        if not pagina_docs or len(documentos) >= total or len(pagina_docs) < max_results:
+            break
+        pagina += 1
+
+    normalizados = []
+    for item in documentos:
+        try:
+            valor = round(float(item.get("totalValue", 0.0)), 2)
+        except (TypeError, ValueError):
+            continue
+        normalizados.append(
+            {
+                "numero": str(item.get("number") or "").strip(),
+                "valor": valor,
+                "status": int(item.get("status") or 0),
+                "tipo": str(item.get("type") or "").strip(),
+                "cliente": str(item.get("customerName") or "").strip(),
+                "cpf_cnpj": str(item.get("customerIdentification") or "").strip(),
+                "emissao": str(item.get("emission") or "").strip(),
+            }
+        )
+
+    _MINHAS_NOTAS_CACHE[cache_key] = [dict(item) for item in normalizados]
+    return [dict(item) for item in normalizados]
+
+
+def _match_davs_with_minhas_notas_nfes(
+    davs_sem_cupom: list[dict],
+    periodo: str,
+) -> tuple[list[dict], list[dict], str | None]:
+    data_iso = _period_to_iso_date(periodo)
+    if not data_iso or not davs_sem_cupom:
+        return list(davs_sem_cupom), [], None
+
+    credenciais = _load_minhas_notas_credentials()
+    if not credenciais:
+        return list(davs_sem_cupom), [], None
+
+    try:
+        login, password = credenciais
+        access_token = _authenticate_minhas_notas(login, password)
+        nfes = [
+            item
+            for item in _fetch_minhas_notas_nfes(access_token, data_iso, cache_namespace=login)
+            if item.get("status") == 1 and item.get("tipo") == "1"
+        ]
+    except Exception as exc:
+        return list(davs_sem_cupom), [], str(exc)
+
+    nfes_por_valor = {}
+    for item in sorted(
+        nfes,
+        key=lambda dado: (
+            round(float(dado.get("valor", 0.0)), 2),
+            dado.get("numero", ""),
+        ),
+    ):
+        valor = round(float(item.get("valor", 0.0)), 2)
+        nfes_por_valor.setdefault(valor, []).append(item)
+
+    restantes = []
+    encontrados = []
+    for item in sorted(davs_sem_cupom, key=lambda dado: dado.get("pedido", "")):
+        valor = round(float(item.get("valor", 0.0)), 2)
+        candidatos = nfes_por_valor.get(valor) or []
+        if not candidatos:
+            restantes.append(item)
+            continue
+        nfe = candidatos.pop(0)
+        encontrados.append(
+            {
+                "pedido": str(item.get("pedido") or "").strip(),
+                "valor": valor,
+                "numero_nfe": str(nfe.get("numero") or "").strip(),
+                "cliente_nfe": str(nfe.get("cliente") or "").strip(),
+                "cpf_cnpj_nfe": str(nfe.get("cpf_cnpj") or "").strip(),
+                "emissao_nfe": str(nfe.get("emissao") or "").strip(),
+            }
+        )
+
+    return restantes, encontrados, None
+
+
 def _find_missing_fiscal_numbers(numbers: list[str]) -> list[str]:
     normalized_numbers = [
         _normalize_fiscal_number(numero)
@@ -497,7 +1027,11 @@ def _find_missing_fiscal_numbers(numbers: list[str]) -> list[str]:
     return missing
 
 
-def validar_periodo_relatorios_caixa(relatorio_caixa: dict, relatorio_nfce: dict) -> tuple[bool, str]:
+def validar_periodo_relatorios_caixa(
+    relatorio_caixa: dict,
+    relatorio_nfce: dict,
+    titulo_secundario: str = "Resumo NFC-e",
+) -> tuple[bool, str]:
     inicio_caixa, fim_caixa = _extract_period_range(relatorio_caixa.get("periodo", ""))
     inicio_resumo, fim_resumo = _extract_period_range(relatorio_nfce.get("periodo", ""))
 
@@ -506,37 +1040,69 @@ def validar_periodo_relatorios_caixa(relatorio_caixa: dict, relatorio_nfce: dict
     if inicio_caixa != fim_caixa:
         return False, "O relatorio de pedidos importados precisa ser de um unico dia."
     if inicio_resumo != fim_resumo:
-        return False, "O Resumo NFC-e precisa ser de um unico dia."
+        return False, f"O {titulo_secundario} precisa ser de um unico dia."
     if inicio_caixa != inicio_resumo:
         return False, (
             f"Os relatorios sao de dias diferentes.\n"
             f"Pedidos importados: {inicio_caixa}\n"
-            f"Resumo NFC-e: {inicio_resumo}"
+            f"{titulo_secundario}: {inicio_resumo}"
         )
     return True, inicio_caixa
 
 
-def validar_relatorio_pedidos_importados(relatorio: dict) -> tuple[bool, str]:
+def validar_relatorio_pedidos_importados(
+    relatorio: dict,
+    modelo_esperado: str | None = None,
+) -> tuple[bool, str]:
+    modelo = (relatorio.get("caixa_modelo") or "").upper()
+    modelo_esperado = (modelo_esperado or "").upper()
+
+    if modelo_esperado and modelo and modelo != modelo_esperado:
+        if modelo_esperado == "MVA":
+            return False, "O arquivo selecionado no passo 1 nao parece ser uma Exportacao de dados da MVA."
+        return False, "O arquivo selecionado no passo 1 nao parece ser um relatorio de pedidos importados da EH."
+
     if not relatorio or relatorio.get("pedidos_total", 0) <= 0:
+        if modelo_esperado == "MVA":
+            return False, "O arquivo selecionado no passo 1 nao parece ser uma Exportacao de dados da MVA."
         return False, "O arquivo selecionado no passo 1 nao parece ser um relatorio de pedidos importados."
     if not relatorio.get("periodo"):
+        if modelo_esperado == "MVA":
+            return True, ""
         return False, "Nao foi possivel identificar o periodo no relatorio de pedidos importados."
     if relatorio.get("total_documento", 0.0) <= 0:
+        if modelo_esperado == "MVA":
+            return False, "A Exportacao de dados da MVA nao trouxe um total valido."
         return False, "O relatorio de pedidos importados nao trouxe um total valido."
     return True, ""
 
 
-def validar_relatorio_resumo_nfce(relatorio: dict) -> tuple[bool, str]:
+def validar_relatorio_resumo_nfce(
+    relatorio: dict,
+    modelo_esperado: str | None = None,
+) -> tuple[bool, str]:
+    modelo = (relatorio.get("resumo_modelo") or "EH").upper()
+    modelo_esperado = (modelo_esperado or "").upper()
+    if modelo_esperado and modelo != modelo_esperado:
+        if modelo_esperado == "MVA":
+            return False, "O arquivo selecionado no ultimo passo nao parece ser o relatorio de Cupons da MVA."
+        return False, "O arquivo selecionado no passo 2 nao parece ser um Resumo NFC-e."
     if not relatorio or relatorio.get("quantidade_nfce", 0) <= 0:
+        if modelo_esperado == "MVA":
+            return False, "O arquivo selecionado no ultimo passo nao parece ser o relatorio de Cupons da MVA."
         return False, "O arquivo selecionado no passo 2 nao parece ser um Resumo NFC-e."
     if not relatorio.get("periodo"):
+        if modelo_esperado == "MVA":
+            return False, "Nao foi possivel identificar o periodo no relatorio de Cupons."
         return False, "Nao foi possivel identificar o periodo no Resumo NFC-e."
     if relatorio.get("total_nfce", 0.0) <= 0:
+        if modelo_esperado == "MVA":
+            return False, "O relatorio de Cupons nao trouxe um total valido."
         return False, "O Resumo NFC-e nao trouxe um total valido."
     return True, ""
 
 
-def analisar_pdf_resumo_nfce(caminho_pdf: str) -> dict:
+def _analisar_pdf_resumo_nfce_eh(caminho_pdf: str) -> dict:
     pdfplumber = _get_pdfplumber()
     itens_nfce = []
     periodo = None
@@ -584,6 +1150,7 @@ def analisar_pdf_resumo_nfce(caminho_pdf: str) -> dict:
 
     return {
         "arquivo": os.path.basename(caminho_pdf),
+        "resumo_modelo": "EH",
         "periodo": periodo,
         "quantidade_nfce": len(itens_nfce),
         "total_nfce": total_nfce,
@@ -592,7 +1159,82 @@ def analisar_pdf_resumo_nfce(caminho_pdf: str) -> dict:
     }
 
 
-def comparar_caixa_resumo_nfce(relatorio_caixa: dict, relatorio_nfce: dict) -> dict:
+def _analisar_pdf_resumo_nfce_mva(caminho_pdf: str) -> dict:
+    pdfplumber = _get_pdfplumber()
+    itens_nfce = []
+    periodo = None
+    total_nfce = None
+    quantidade_documentos = None
+
+    with pdfplumber.open(caminho_pdf) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text() or ""
+            for linha in texto.splitlines():
+                linha = linha.strip()
+                linha_normalizada = _normalize_caixa_client(linha)
+
+                if periodo is None:
+                    match_periodo = re.search(
+                        r"PERIODO ANALISADO,\s+DE\s+(\d{2}/\d{2}/\d{4})\s+ATE\s+(\d{2}/\d{2}/\d{4})",
+                        linha_normalizada,
+                    )
+                    if match_periodo:
+                        periodo = f"{match_periodo.group(1)} - {match_periodo.group(2)}"
+
+                match_nfce = re.match(
+                    r"^(\d{6,})\s+\d+\s+\d+\s+\d{2}/\d{2}/\d{4}\s+\d+\s+(.+?)\s+([-\d\.,]+)\s+[-\d\.,]+\s*$",
+                    linha,
+                )
+                if match_nfce:
+                    numero = _normalize_fiscal_number(match_nfce.group(1))
+                    itens_nfce.append(
+                        {
+                            "numero": numero,
+                            "numero_exibicao": _display_fiscal_number(numero),
+                            "descricao": match_nfce.group(2).strip(),
+                            "valor": round(parse_number(match_nfce.group(3)), 2),
+                        }
+                    )
+                    continue
+
+                match_total = re.search(
+                    r"TOTAL DE DOCUMENTOS:\s*(\d+)\s+TOTAIS:\s*([-\d\.,]+)",
+                    linha_normalizada,
+                )
+                if match_total:
+                    quantidade_documentos = int(match_total.group(1))
+                    total_nfce = round(parse_number(match_total.group(2)), 2)
+
+    if total_nfce is None:
+        total_nfce = round(sum(item["valor"] for item in itens_nfce), 2)
+    if quantidade_documentos is None:
+        quantidade_documentos = len(itens_nfce)
+
+    faltantes_sequencia = _find_missing_fiscal_numbers([item["numero"] for item in itens_nfce])
+
+    return {
+        "arquivo": os.path.basename(caminho_pdf),
+        "resumo_modelo": "MVA",
+        "periodo": periodo,
+        "quantidade_nfce": quantidade_documentos,
+        "total_nfce": total_nfce,
+        "nfces": sorted(itens_nfce, key=lambda item: item["numero"]),
+        "nfces_faltantes_sequencia": faltantes_sequencia,
+    }
+
+
+def analisar_pdf_resumo_nfce(caminho_pdf: str) -> dict:
+    pdfplumber = _get_pdfplumber()
+    with pdfplumber.open(caminho_pdf) as pdf:
+        primeira_pagina = pdf.pages[0].extract_text() or ""
+
+    primeira_pagina_normalizada = _normalize_caixa_client(primeira_pagina)
+    if "RELATORIO DE VENDAS" in primeira_pagina_normalizada and "PERIODO ANALISADO" in primeira_pagina_normalizada:
+        return _analisar_pdf_resumo_nfce_mva(caminho_pdf)
+    return _analisar_pdf_resumo_nfce_eh(caminho_pdf)
+
+
+def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) -> dict:
     itens_caixa = relatorio_caixa.get("itens_caixa", [])
     itens_nfce = relatorio_nfce.get("nfces", [])
 
@@ -660,6 +1302,174 @@ def comparar_caixa_resumo_nfce(relatorio_caixa: dict, relatorio_nfce: dict) -> d
             ),
         ),
     }
+
+
+def _is_mva_cupom_client(cliente: str) -> bool:
+    return _normalize_caixa_client(cliente) in {"CLIENTE BALCAO", "CLIENTES DIVERSOS"}
+
+
+def _infer_mva_davs_sem_cupom(itens_caixa: list[dict], itens_nfce: list[dict]) -> list[dict]:
+    elegiveis = [
+        item
+        for item in itens_caixa
+        if _is_mva_cupom_client(item.get("cliente", ""))
+    ]
+    if not elegiveis or not itens_nfce:
+        return sorted(elegiveis, key=lambda item: item.get("pedido", ""))
+
+    davs_sorted = sorted(
+        enumerate(elegiveis),
+        key=lambda pair: (round(float(pair[1].get("valor", 0.0)), 2), pair[1].get("pedido", "")),
+    )
+    nfce_sorted = sorted(
+        itens_nfce,
+        key=lambda item: (round(float(item.get("valor", 0.0)), 2), item.get("numero", "")),
+    )
+    n = len(davs_sorted)
+    m = len(nfce_sorted)
+
+    inf = float("inf")
+    dp = [[inf] * (m + 1) for _ in range(n + 1)]
+    keep = [[False] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = 0.0
+
+    for i in range(1, n + 1):
+        for j in range(0, min(i, m) + 1):
+            melhor = dp[i - 1][j]
+            usar = False
+            if j > 0:
+                custo = dp[i - 1][j - 1] + abs(
+                    round(float(davs_sorted[i - 1][1].get("valor", 0.0)), 2)
+                    - round(float(nfce_sorted[j - 1].get("valor", 0.0)), 2)
+                )
+                if custo < melhor or (j == i and not usar):
+                    melhor = custo
+                    usar = True
+            dp[i][j] = melhor
+            keep[i][j] = usar
+
+    faltantes = []
+    i = n
+    j = m
+    while i > 0:
+        if j > 0 and keep[i][j]:
+            i -= 1
+            j -= 1
+            continue
+        faltantes.append(davs_sorted[i - 1][1])
+        i -= 1
+
+    return sorted(faltantes, key=lambda item: item.get("pedido", ""))
+
+
+def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict) -> dict:
+    itens_caixa = relatorio_caixa.get("itens_caixa", [])
+    itens_nfce = relatorio_nfce.get("nfces", [])
+    itens_cupom_base = [
+        item
+        for item in itens_caixa
+        if _is_mva_cupom_client(item.get("cliente", ""))
+    ]
+
+    davs_sem_cupom = _infer_mva_davs_sem_cupom(itens_caixa, itens_nfce)
+    davs_sem_cupom, nfes_identificadas, erro_minhas_notas = _match_davs_with_minhas_notas_nfes(
+        davs_sem_cupom,
+        relatorio_caixa.get("periodo", ""),
+    )
+    cfs_faltantes = sorted(
+        {
+            _normalize_fiscal_number(numero)
+            for numero in relatorio_nfce.get("nfces_faltantes_sequencia", [])
+            if _normalize_fiscal_number(numero)
+        },
+        key=int,
+    )
+
+    registros = []
+    for item in davs_sem_cupom:
+        pedido = re.sub(r"\D", "", str(item.get("pedido", "")))
+        registros.append(
+            {
+                "numero": pedido,
+                "numero_exibicao": f"DAV {_display_fiscal_number(pedido) if pedido else item.get('pedido', '-')}",
+                "origem": "DAV",
+                "observacao": "DAV sem cupom",
+                "valor": round(float(item.get("valor", 0.0)), 2),
+            }
+        )
+    for numero in cfs_faltantes:
+        registros.append(
+            {
+                "numero": numero,
+                "numero_exibicao": f"CF {_display_fiscal_number(numero)}",
+                "origem": "CF",
+                "observacao": "Cupom faltante na sequencia",
+                "valor": None,
+            }
+        )
+
+    total_caixa = round(sum(float(item.get("valor", 0.0)) for item in itens_cupom_base), 2)
+    total_resumo = round(float(relatorio_nfce.get("total_nfce", 0.0)), 2)
+    if nfes_identificadas:
+        valor_faltantes = round(
+            sum(float(item.get("valor", 0.0)) for item in davs_sem_cupom),
+            2,
+        )
+    else:
+        valor_faltantes = round(total_caixa - total_resumo, 2)
+    status = "Confere" if abs(valor_faltantes) < 0.01 and not registros else "Faltante"
+    periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
+    subtitle = (
+        "Compara os DAVs aptos para cupom com o relatorio de Cupons e aponta DAVs/CF para conferencia."
+    )
+    if nfes_identificadas:
+        subtitle += (
+            f" NF-e identificadas automaticamente no Minhas Notas: {len(nfes_identificadas)}."
+        )
+    elif erro_minhas_notas:
+        subtitle += " Consulta ao Minhas Notas indisponivel nesta analise."
+
+    return {
+        "fechamento_modelo": "MVA",
+        "subtitle": subtitle,
+        "arquivo_caixa": relatorio_caixa.get("arquivo"),
+        "arquivo_resumo": relatorio_nfce.get("arquivo"),
+        "arquivo_resumo_titulo": "Arquivo Cupons",
+        "periodo": periodo_unico or relatorio_caixa.get("periodo"),
+        "total_caixa": total_caixa,
+        "total_caixa_titulo": "Total DAVs para cupom",
+        "total_resumo_nfce": total_resumo,
+        "total_resumo_titulo": "Total Cupons",
+        "nfces_faltantes_count": len(registros),
+        "faltantes_titulo": "DAVs/CF faltantes",
+        "valor_faltantes": valor_faltantes,
+        "nfes_identificadas_count": len(nfes_identificadas),
+        "nfes_identificadas_valor": round(
+            sum(float(item.get("valor", 0.0)) for item in nfes_identificadas),
+            2,
+        ),
+        "status": status,
+        "secao_titulo": "DAVs/CF para conferencia",
+        "empty_message": "Nenhum DAV/CF faltante encontrado.",
+        "registros_conferencia": sorted(
+            registros,
+            key=lambda item: (
+                0 if item.get("origem") == "DAV" else 1,
+                int(item["numero"]) if item.get("numero") else 0,
+            ),
+        ),
+        "nfes_identificadas": nfes_identificadas,
+        "erro_minhas_notas": erro_minhas_notas,
+    }
+
+
+def comparar_caixa_resumo_nfce(relatorio_caixa: dict, relatorio_nfce: dict) -> dict:
+    if (relatorio_caixa.get("caixa_modelo") or "").upper() == "MVA" or (
+        relatorio_nfce.get("resumo_modelo") or ""
+    ).upper() == "MVA":
+        return _comparar_caixa_resumo_nfce_mva(relatorio_caixa, relatorio_nfce)
+    return _comparar_caixa_resumo_nfce_eh(relatorio_caixa, relatorio_nfce)
 
 def canonicalize_name(raw: str) -> str:
     _ensure_mapping_loaded()

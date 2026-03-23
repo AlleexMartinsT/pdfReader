@@ -12,7 +12,7 @@ from ui_dialogs import filedialog, messagebox
 from global_vars import (
     listFiles, list_results, regex_data, regex_negative, 
     APP_VERSION, GITHUB_REPO, LAST_EH, LAST_MVA , LAST_HASH_MERGE,
-    SALES_PERIOD
+    SALES_PERIOD, MINHAS_NOTAS_LOGIN, MINHAS_NOTAS_PASSWORD
 ) 
 
 # Configuração de logging mais leve (somente avisos e erros)
@@ -851,6 +851,11 @@ def _period_to_iso_date(periodo: str) -> str | None:
 
 
 def _load_minhas_notas_credentials() -> tuple[str, str] | None:
+    login = str(MINHAS_NOTAS_LOGIN or "").strip()
+    password = str(MINHAS_NOTAS_PASSWORD or "").strip()
+    if login and password:
+        return login, password
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     for filename in ("credenciais.txt", "credencias.txt"):
         caminho = os.path.join(base_dir, filename)
@@ -1123,6 +1128,22 @@ def _analisar_pdf_resumo_nfce_eh(caminho_pdf: str) -> dict:
                     if match_periodo:
                         periodo = f"{match_periodo.group(1)} - {match_periodo.group(2)}"
 
+                match_nfce_fechamento = re.match(
+                    r"^(\d{6,})\s+\d{2}/\d{2}/\d{2}\s+R\$\s+([-\d\.,]+)\s*$",
+                    linha,
+                )
+                if match_nfce_fechamento:
+                    numero = _normalize_fiscal_number(match_nfce_fechamento.group(1))
+                    itens_nfce.append(
+                        {
+                            "numero": numero,
+                            "numero_exibicao": _display_fiscal_number(numero),
+                            "descricao": "Fechamento de caixa",
+                            "valor": round(parse_number(match_nfce_fechamento.group(2)), 2),
+                        }
+                    )
+                    continue
+
                 match_nfce = re.match(
                     r"^(\d{6,})\s+Autorizada\s+\d+\s+65\s+\d{2}/\d{2}/\d{4}\s+(.+?)\s+([-\d\.,]+)\s*$",
                     linha,
@@ -1140,8 +1161,11 @@ def _analisar_pdf_resumo_nfce_eh(caminho_pdf: str) -> dict:
                     continue
 
                 match_total = re.match(r"^Totais?\s+R\$\s+([-\d\.,]+)\s*$", linha)
+                if not match_total:
+                    match_total = re.match(r"^Total\s+R\$\s+([-\d\.,]+)\s*$", linha)
                 if match_total:
-                    total_nfce = round(parse_number(match_total.group(1)), 2)
+                    valor_total = round(parse_number(match_total.group(1)), 2)
+                    total_nfce = round((total_nfce or 0.0) + valor_total, 2)
 
     if total_nfce is None:
         total_nfce = round(sum(item["valor"] for item in itens_nfce), 2)
@@ -1318,8 +1342,8 @@ def _infer_mva_davs_sem_cupom(itens_caixa: list[dict], itens_nfce: list[dict]) -
         return sorted(elegiveis, key=lambda item: item.get("pedido", ""))
 
     davs_sorted = sorted(
-        enumerate(elegiveis),
-        key=lambda pair: (round(float(pair[1].get("valor", 0.0)), 2), pair[1].get("pedido", "")),
+        elegiveis,
+        key=lambda item: (round(float(item.get("valor", 0.0)), 2), item.get("pedido", "")),
     )
     nfce_sorted = sorted(
         itens_nfce,
@@ -1328,37 +1352,54 @@ def _infer_mva_davs_sem_cupom(itens_caixa: list[dict], itens_nfce: list[dict]) -
     n = len(davs_sorted)
     m = len(nfce_sorted)
 
-    inf = float("inf")
-    dp = [[inf] * (m + 1) for _ in range(n + 1)]
-    keep = [[False] * (m + 1) for _ in range(n + 1)]
-    for i in range(n + 1):
-        dp[i][0] = 0.0
+    def _melhor_estado(candidatos):
+        prioridade = {"match": 0, "skip_nfce": 1, "skip_dav": 2}
+        return min(
+            candidatos,
+            key=lambda candidato: (
+                candidato[0][0],
+                candidato[0][1],
+                prioridade[candidato[1]],
+            ),
+        )
+
+    dp = [[(0, 0.0)] * (m + 1) for _ in range(n + 1)]
+    caminho = [[""] * (m + 1) for _ in range(n + 1)]
 
     for i in range(1, n + 1):
-        for j in range(0, min(i, m) + 1):
-            melhor = dp[i - 1][j]
-            usar = False
-            if j > 0:
-                custo = dp[i - 1][j - 1] + abs(
-                    round(float(davs_sorted[i - 1][1].get("valor", 0.0)), 2)
-                    - round(float(nfce_sorted[j - 1].get("valor", 0.0)), 2)
-                )
-                if custo < melhor or (j == i and not usar):
-                    melhor = custo
-                    usar = True
-            dp[i][j] = melhor
-            keep[i][j] = usar
+        dp[i][0] = (i, 0.0)
+        caminho[i][0] = "skip_dav"
+    for j in range(1, m + 1):
+        dp[0][j] = (0, 0.0)
+        caminho[0][j] = "skip_nfce"
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            valor_dav = round(float(davs_sorted[i - 1].get("valor", 0.0)), 2)
+            valor_nfce = round(float(nfce_sorted[j - 1].get("valor", 0.0)), 2)
+            candidatos = [
+                ((dp[i - 1][j][0] + 1, dp[i - 1][j][1]), "skip_dav"),
+                (dp[i][j - 1], "skip_nfce"),
+                ((dp[i - 1][j - 1][0], dp[i - 1][j - 1][1] + abs(valor_dav - valor_nfce)), "match"),
+            ]
+            melhor_estado, decisao = _melhor_estado(candidatos)
+            dp[i][j] = melhor_estado
+            caminho[i][j] = decisao
 
     faltantes = []
     i = n
     j = m
-    while i > 0:
-        if j > 0 and keep[i][j]:
+    while i > 0 or j > 0:
+        decisao = caminho[i][j] if i >= 0 and j >= 0 else ""
+        if decisao == "match":
             i -= 1
             j -= 1
-            continue
-        faltantes.append(davs_sorted[i - 1][1])
-        i -= 1
+        elif decisao == "skip_nfce":
+            j -= 1
+        else:
+            if i > 0:
+                faltantes.append(davs_sorted[i - 1])
+            i -= 1
 
     return sorted(faltantes, key=lambda item: item.get("pedido", ""))
 

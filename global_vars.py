@@ -2,6 +2,8 @@ from library import re
 
 APP_VERSION = "2.0.10"
 GITHUB_REPO = "AlleexMartinsT/pdfReader"
+MINHAS_NOTAS_LOGIN = "mvacomercio@gmail.com"
+MINHAS_NOTAS_PASSWORD = "Mva@0134"
 LAST_MVA = None
 LAST_EH = None
 LAST_HASH_MERGE = None

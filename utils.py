@@ -1418,7 +1418,7 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         )
     else:
         valor_faltantes = round(total_caixa - total_resumo, 2)
-    status = "Confere" if abs(valor_faltantes) < 0.01 and not registros else "Faltante"
+    status = "Confere" if abs(valor_faltantes) < 0.01 else "Faltante"
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
     subtitle = (
         "Compara os DAVs aptos para cupom com o relatorio de Cupons e aponta DAVs/CF para conferencia."

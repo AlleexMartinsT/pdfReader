@@ -1,9 +1,12 @@
 from library import re
 
-APP_VERSION = "2.0.10"
+APP_VERSION = "3.0"
 GITHUB_REPO = "AlleexMartinsT/pdfReader"
 MINHAS_NOTAS_LOGIN = "mvacomercio@gmail.com"
 MINHAS_NOTAS_PASSWORD = "Mva@0134"
+ZWEB_USERNAME = "horizonteeletronica@gmail.com"
+ZWEB_PASSWORD = "Mva@2026"
+ZWEB_BASE_URL = "https://zweb.com.br"
 LAST_MVA = None
 LAST_EH = None
 LAST_HASH_MERGE = None

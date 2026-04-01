@@ -1,13 +1,47 @@
-# Arquivos sensíveis
-credenciais.json
-mapping.json
-*.ico
+# Sensitive local files
+credenciais.txt
+data/credenciaisAPI.json
+data/credenciaisDB.json
+data/caixa_pix_cache.json
+data/zweb_debug_profile/
+data/zweb_debug_profile3/
+data/zweb_debug_profile5/
 
-# Build / distribuição
+# Build output
 dist/
 build/
-data/
-*.exe
-*.spec
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.exe
+*.spec
+
+# Python environments and caches
+.venv/
+.venv64/
+.pytest_cache/
+
+# Local runtime artifacts
+*.log
+debug_*.txt
+debug_*.html
+debug_*.json
+portal_*.html
+test_*.txt
+status_*.txt
+found_html.txt
+
+# Temporary local bank reports
+Relatorio_de_Vendas_Pix_*.csv
+Relatorio_de_Vendas_Pix_*.xlsx
+relatório pix.pdf
+relatório cartoes.pdf
+
+# Temporary PDFs and ad-hoc files
+*.pdf
+passo-a-passo.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db

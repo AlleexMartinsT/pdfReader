@@ -2,21 +2,22 @@ import re
 
 
 def _read_app_version() -> str:
-    with open("global_vars.py", "r", encoding="utf-8") as f:
-        data = f.read()
+    with open("global_vars.py", "r", encoding="utf-8") as file:
+        data = file.read()
     match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', data)
     if not match:
-        raise RuntimeError("APP_VERSION não encontrado em global_vars.py")
+        raise RuntimeError("APP_VERSION not found in global_vars.py")
     return match.group(1)
 
+
 def _version_tuple(version: str) -> str:
-    parts = [int(p) for p in version.split(".") if p.strip().isdigit()]
+    parts = [int(part) for part in version.split(".") if part.strip().isdigit()]
     while len(parts) < 4:
         parts.append(0)
-    return ", ".join(str(p) for p in parts[:4])
+    return ", ".join(str(part) for part in parts[:4])
 
 
-def versionfile_generator():
+def versionfile_generator() -> None:
     app_version = _read_app_version()
     ver_tuple = _version_tuple(app_version)
     template = f"""
@@ -37,20 +38,21 @@ VSVersionInfo(
       StringTable(
         '040904B0',
         [StringStruct('CompanyName', 'MVA'),
-        StringStruct('FileDescription', 'Relatório de Clientes por Vendedor'),
+        StringStruct('FileDescription', 'Customer Sales Report'),
         StringStruct('FileVersion', '{app_version}'),
         StringStruct('InternalName', 'RelatorioClientes'),
-        StringStruct('LegalCopyright', '© 2025 MVA'),
+        StringStruct('LegalCopyright', '(c) 2026 MVA'),
         StringStruct('OriginalFilename', 'RelatorioClientes.exe'),
-        StringStruct('ProductName', 'Sistema de Relatórios'),
+        StringStruct('ProductName', 'Sales Report System'),
         StringStruct('ProductVersion', '{app_version}')])
       ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]
 )
 """
-    with open("version.txt", "w", encoding="utf-8") as f:
-        f.write(template)
+    with open("version.txt", "w", encoding="utf-8") as file:
+        file.write(template)
+
 
 if __name__ == "__main__":
     versionfile_generator()

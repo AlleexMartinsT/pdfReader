@@ -1,6 +1,7 @@
 altgraph==0.17.4
 annotated-types==0.7.0
 anyio==4.11.0
+beautifulsoup4
 cachetools==6.2.2
 certifi==2025.11.12
 cffi==2.0.0

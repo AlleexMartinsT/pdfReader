@@ -23,6 +23,7 @@ Desktop application for reconciling sales reports from two business flows:
   - The Caixa/Azulzinha browser now starts minimized and off-screen so the login screen stays less visible during automation.
   - Auto-downloaded EH PIX/card reports named with `_auto` are deleted after they are parsed, so temporary reports do not stay in the workspace.
   - If the portal asks for a token, the app reads the latest code sent by `no-reply@fiserv.com` to the configured Gmail account.
+  - Gmail OAuth client credentials can also be loaded from a local `gmail_oauth_client.json` file in the app root.
   - If Caixa/Azulzinha is unavailable and PIX is confirmed through `Financeiro > Movimentações` in Zweb, the report marks that fallback explicitly.
   - If Caixa rejects the token as invalid, the app discards the code it just used and waits longer for a newer email before retrying.
   - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.

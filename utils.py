@@ -1327,7 +1327,7 @@ def _load_gmail_oauth_client_credentials() -> tuple[str, str] | None:
         return None
 
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
 

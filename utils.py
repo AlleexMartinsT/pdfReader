@@ -9,15 +9,22 @@ import shutil
 import tempfile
 import zipfile
 import asyncio
+import base64
 import threading
 import subprocess
 import queue
 import difflib
 import unicodedata
+from urllib.parse import urljoin
 from datetime import datetime
 from pathlib import Path
 
 import requests
+
+try:
+    from ftfy import fix_text as _ftfy_fix_text
+except Exception:
+    _ftfy_fix_text = None
 
 from ui_dialogs import filedialog, messagebox
 from global_vars import (
@@ -25,6 +32,7 @@ from global_vars import (
     APP_VERSION, GITHUB_REPO, LAST_EH, LAST_MVA , LAST_HASH_MERGE,
     SALES_PERIOD, MINHAS_NOTAS_LOGIN, MINHAS_NOTAS_PASSWORD,
     ZWEB_USERNAME, ZWEB_PASSWORD, ZWEB_BASE_URL,
+    GMAIL_OAUTH_CLIENT_ID, GMAIL_OAUTH_CLIENT_SECRET,
 ) 
 
 # ConfiguraÃ§Ã£o de logging mais leve (somente avisos e erros)
@@ -52,13 +60,87 @@ REGEX_NEW_SALE_AMOUNT = re.compile(r"^\s*(?:NFC|NF)-e\s+\d+\s+\d{2}/\d{2}/\d{4}\
 REGEX_ANY_DATE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
 REGEX_D_MARKER = re.compile(r"\(\s*d\s*\)", re.IGNORECASE)
 
+_MOJIBAKE_MARKERS = ("\u00c3", "\u00c2", "\u00e2", "\ud83d")
+_TEXT_FALLBACK_REPLACEMENTS = {
+    "Relat?rio": "Relatório",
+    "relat?rio": "relatório",
+    "N?o": "Não",
+    "n?o": "não",
+    "m?quina": "máquina",
+    "M?quina": "Máquina",
+    "Per?odo": "Período",
+    "Pend?ncias": "Pendências",
+    "Transa??o": "Transação",
+    "Transa??es": "Transações",
+    "transa??o": "transação",
+    "transa??es": "transações",
+    "Cart?o": "Cartão",
+    "cart?o": "cartão",
+    "Cr?dito": "Crédito",
+    "cr?dito": "crédito",
+    "D?bito": "Débito",
+    "d?bito": "débito",
+    "Eletr?nica": "Eletrônica",
+    "eletr?nica": "eletrônica",
+    "Impress?o": "Impressão",
+    "impress?o": "impressão",
+    "Confirma??o": "Confirmação",
+    "conclu?da": "concluída",
+    "selec??o": "seleção",
+}
 
 
+def corrigir_texto(texto: str) -> str:
+    """Corrige mojibake comum em textos PT-BR usando ftfy e fallback manual."""
+    if not texto or not isinstance(texto, str):
+        return texto
+
+    corrigido = texto
+    if _ftfy_fix_text is not None:
+        try:
+            corrigido = _ftfy_fix_text(corrigido)
+        except Exception:
+            pass
+
+    if any(marker in corrigido for marker in _MOJIBAKE_MARKERS):
+        for _ in range(2):
+            try:
+                candidato = corrigido.encode("latin1").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                break
+            if candidato == corrigido:
+                break
+            corrigido = candidato
+            if _ftfy_fix_text is not None:
+                try:
+                    corrigido = _ftfy_fix_text(corrigido)
+                except Exception:
+                    pass
+
+    for origem, destino in _TEXT_FALLBACK_REPLACEMENTS.items():
+        corrigido = corrigido.replace(origem, destino)
+
+    return corrigido
 
 
+def corrigir_estrutura_texto(valor):
+    if isinstance(valor, str):
+        return corrigir_texto(valor)
+    if isinstance(valor, list):
+        return [corrigir_estrutura_texto(item) for item in valor]
+    if isinstance(valor, tuple):
+        return tuple(corrigir_estrutura_texto(item) for item in valor)
+    if isinstance(valor, dict):
+        return {
+            corrigir_estrutura_texto(chave) if isinstance(chave, str) else chave: corrigir_estrutura_texto(item)
+            for chave, item in valor.items()
+        }
+    return valor
 
 
-
+# Compatibilidade com chamadas legadas.
+globals()["corrigirCodifica\u00e7\u00e3o"] = corrigir_texto
+globals()[corrigir_texto("corrigirCodifica????o")] = corrigir_texto
 
 
 def _empty_caixa_report(caminho_pdf: str, pdf_info: dict | None = None) -> dict:
@@ -297,15 +379,35 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
     # Sempre agenda a prÃ³xima checagem, exceto se houve erro (onde damos return acima)
     root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, label_files_var, path_var))
 
+def _project_base_dir() -> str:
+    import sys
+
+    candidates = [
+        Path(r"D:\pdfReader"),
+    ]
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(os.path.dirname(os.path.abspath(sys.executable))))
+    candidates.append(Path(os.path.dirname(os.path.abspath(__file__))))
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return str(candidate)
+    return str(candidates[-1])
+
+
 def resource_path(relative_path): 
     import sys
-    
+
     """Retorna o caminho absoluto do recurso, compatÃ­vel com PyInstaller."""
+    preferred_base = _project_base_dir()
+    preferred_path = os.path.join(preferred_base, relative_path)
+    if os.path.exists(preferred_path):
+        return preferred_path
     if hasattr(sys, '_MEIPASS'):  # Executando empacotado
-        base_path = sys._MEIPASS
-    else:
-        base_path = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
-    return os.path.join(base_path, relative_path)
+        bundled_path = os.path.join(sys._MEIPASS, relative_path)
+        if os.path.exists(bundled_path):
+            return bundled_path
+    return preferred_path
 
 def load_mapping(path='mapping.json'): 
   
@@ -371,17 +473,29 @@ def parse_number(num_str: str) -> float:
     return float(s)
 
 def format_number_br(num: float) -> str:
-    """Formata nÃºmero no padrÃ£o brasileiro com duas casas decimais."""
+    """Formata número no padrão brasileiro com duas casas decimais."""
     return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _normalize_caixa_client(name: str) -> str:
+def normalizarClienteCaixa(nome: str, mantemAcentos: bool = False) -> str:
+    """
+    Normaliza o nome do cliente para comparações, opcionalmente mantendo acentuações.
+    """
     import unicodedata
 
-    normalized = unicodedata.normalize("NFKD", name or "")
-    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    normalized = re.sub(r"\s+", " ", normalized).strip().upper()
-    return normalized
+    if not nome:
+        return ""
+
+    normalizado = unicodedata.normalize("NFKD", nome)
+    if not mantemAcentos:
+        normalizado = "".join(ch for ch in normalizado if not unicodedata.combining(ch))
+
+    return normalizado.strip().upper()
+
+# Alias para compatibilidade legada
+def _normalize_caixa_client(name: str) -> str:
+    return normalizarClienteCaixa(name, mantemAcentos=False)
+
 
 
 def _classify_caixa_document(description: str) -> str:
@@ -824,11 +938,136 @@ def _read_text_file(path: str | Path) -> str:
     return Path(path).read_text(encoding="utf-8", errors="ignore")
 
 
-def _find_eh_local_payment_reports(data_br: str) -> dict[str, str | None]:
+def _read_xlsx_rows_fallback(path: str | Path) -> list[tuple[str, list[list[str]]]]:
+    import posixpath
+    import xml.etree.ElementTree as ET
+    from zipfile import ZipFile
+
+    ns_main = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    ns_pkg = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+
+    def _xlsx_col_index(ref: str) -> int:
+        letters = re.match(r"([A-Z]+)", str(ref or "").upper())
+        if not letters:
+            return 0
+        value = 0
+        for ch in letters.group(1):
+            value = (value * 26) + (ord(ch) - 64)
+        return value
+
+    def _shared_strings(archive: ZipFile) -> list[str]:
+        if "xl/sharedStrings.xml" not in archive.namelist():
+            return []
+        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+        items: list[str] = []
+        for si in root.findall("x:si", ns_main):
+            texts = [node.text or "" for node in si.findall(".//x:t", ns_main)]
+            items.append("".join(texts))
+        return items
+
+    def _sheet_paths(archive: ZipFile) -> list[tuple[str, str]]:
+        workbook_name = "xl/workbook.xml"
+        rels_name = "xl/_rels/workbook.xml.rels"
+        if workbook_name not in archive.namelist():
+            return [("sheet1", "xl/worksheets/sheet1.xml")] if "xl/worksheets/sheet1.xml" in archive.namelist() else []
+        workbook_root = ET.fromstring(archive.read(workbook_name))
+        rel_map: dict[str, str] = {}
+        if rels_name in archive.namelist():
+            rel_root = ET.fromstring(archive.read(rels_name))
+            for rel in rel_root.findall("r:Relationship", ns_pkg):
+                rel_id = str(rel.attrib.get("Id") or "")
+                target = str(rel.attrib.get("Target") or "")
+                if rel_id and target:
+                    rel_map[rel_id] = posixpath.normpath(posixpath.join("xl", target))
+        sheets: list[tuple[str, str]] = []
+        for sheet in workbook_root.findall(".//x:sheets/x:sheet", ns_main):
+            name = str(sheet.attrib.get("name") or "sheet")
+            rel_id = str(sheet.attrib.get(rel_ns) or "")
+            target = rel_map.get(rel_id)
+            if target and target in archive.namelist():
+                sheets.append((name, target))
+        if not sheets and "xl/worksheets/sheet1.xml" in archive.namelist():
+            sheets.append(("sheet1", "xl/worksheets/sheet1.xml"))
+        return sheets
+
+    def _sheet_rows(archive: ZipFile, sheet_path: str, shared: list[str]) -> list[list[str]]:
+        root = ET.fromstring(archive.read(sheet_path))
+        rows: list[list[str]] = []
+        for row in root.findall(".//x:sheetData/x:row", ns_main):
+            values: dict[int, str] = {}
+            max_col = 0
+            for cell in row.findall("x:c", ns_main):
+                ref = str(cell.attrib.get("r") or "")
+                col = _xlsx_col_index(ref)
+                max_col = max(max_col, col)
+                cell_type = str(cell.attrib.get("t") or "")
+                if cell_type == "inlineStr":
+                    value = "".join(node.text or "" for node in cell.findall(".//x:t", ns_main))
+                else:
+                    node = cell.find("x:v", ns_main)
+                    raw = str(node.text or "") if node is not None else ""
+                    if cell_type == "s" and raw.isdigit():
+                        idx = int(raw)
+                        value = shared[idx] if 0 <= idx < len(shared) else raw
+                    else:
+                        value = raw
+                if col:
+                    values[col] = value
+            if max_col:
+                rows.append([values.get(idx, "") for idx in range(1, max_col + 1)])
+        return rows
+
+    with ZipFile(path) as archive:
+        shared = _shared_strings(archive)
+        return [(sheet_name, _sheet_rows(archive, sheet_path, shared)) for sheet_name, sheet_path in _sheet_paths(archive)]
+
+
+def _read_excel_text(path: str | Path) -> str:
+    import pandas as pd
+
+    chunks: list[str] = []
+    try:
+        xls = pd.ExcelFile(path)
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str)
+            if df.empty:
+                continue
+            chunks.append(sheet_name)
+            chunks.extend(" ".join(str(value or "").strip() for value in row if str(value or "").strip()) for row in df.fillna("").values.tolist())
+    except Exception:
+        for sheet_name, rows in _read_xlsx_rows_fallback(path):
+            if not rows:
+                continue
+            chunks.append(sheet_name)
+            chunks.extend(
+                " ".join(str(value or "").strip() for value in row if str(value or "").strip())
+                for row in rows
+                if any(str(value or "").strip() for value in row)
+            )
+    return "\n".join(chunks)
+
+
+def _extract_local_report_date_br(text: str) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"(\d{2}/\d{2}/\d{4})\s+a\s+(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict[str, object]:
     pix_csv_matches: list[Path] = []
+    pix_xlsx_matches: list[Path] = []
     pix_pdf_matches: list[Path] = []
     card_matches: list[Path] = []
-    patterns = ("*.pdf", "*.csv")
+    avisos: list[str] = []
+    patterns = ("*.pdf", "*.csv", "*.xlsx")
+    company_norm = _normalize_ascii_text(company) or "eh"
 
     preferred_dirs: list[Path] = []
     seen = set()
@@ -843,36 +1082,2779 @@ def _find_eh_local_payment_reports(data_br: str) -> dict[str, str | None]:
     for directory in preferred_dirs:
         for pattern in patterns:
             for path in directory.glob(pattern):
-                name_norm = _normalize_ascii_text(path.name)
-                if "pix" not in name_norm and "cart" not in name_norm:
-                    continue
                 try:
                     if path.suffix.lower() == ".csv":
                         text = _read_text_file(path)
+                    elif path.suffix.lower() == ".xlsx":
+                        text = _read_excel_text(path)
                     else:
                         text = _read_pdf_text(path)
                 except Exception:
                     continue
+
                 text_norm = _normalize_ascii_text(text)
-                if data_br not in text:
-                    continue
+                detected_date = _extract_local_report_date_br(text)
+                report_kind = None
                 if path.suffix.lower() == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm:
-                    pix_csv_matches.append(path)
+                    report_kind = "pix_csv"
+                elif path.suffix.lower() == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm:
+                    report_kind = "pix_xlsx"
                 elif "extrato pix" in text_norm:
-                    pix_pdf_matches.append(path)
+                    report_kind = "pix_pdf"
+                elif path.suffix.lower() == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm:
+                    report_kind = "cartoes"
                 elif "relatorio de historico de vendas" in text_norm and "periodo de venda" in text_norm:
+                    report_kind = "cartoes"
+                else:
+                    continue
+
+                if detected_date and detected_date != data_br:
+                    tipo = "PIX" if report_kind.startswith("pix") else "cart?es"
+                    avisos.append(
+                        f'O arquivo "{path.name}" foi identificado como relat?rio de {tipo}, mas o conte?do ? de {detected_date} e n?o de {data_br}. '
+                        f'Ele foi ignorado.'
+                    )
+                    continue
+
+                if report_kind == "pix_csv":
+                    pix_csv_matches.append(path)
+                elif report_kind == "pix_xlsx":
+                    pix_xlsx_matches.append(path)
+                elif report_kind == "pix_pdf":
+                    pix_pdf_matches.append(path)
+                else:
                     card_matches.append(path)
 
     def _pick_latest(paths: list[Path]) -> str | None:
         if not paths:
             return None
-        latest = max(paths, key=lambda item: item.stat().st_mtime)
+        def _score(item: Path) -> tuple[int, float]:
+            name = item.stem.casefold()
+            if f"_{company_norm}_auto" in name:
+                company_score = 3
+            elif "_auto" in name and any(f"_{other}_auto" in name for other in ("eh", "mva") if other != company_norm):
+                company_score = -1
+            elif "_auto" in name:
+                company_score = 1
+            else:
+                company_score = 0
+            return (company_score, item.stat().st_mtime)
+
+        latest = max(paths, key=_score)
         return str(latest)
 
     return {
-        "pix": _pick_latest(pix_csv_matches) or _pick_latest(pix_pdf_matches),
+        "pix": _pick_latest(pix_csv_matches + pix_xlsx_matches) or _pick_latest(pix_pdf_matches),
         "cartoes": _pick_latest(card_matches),
+        "avisos": list(dict.fromkeys(avisos)),
     }
+
+
+def _integrate_local_payment_reports(
+    relatorio_fechamento: dict,
+    data_br: str,
+    *,
+    avisos_usuario: list[str] | None = None,
+    relatorio_pix_padrao: dict | None = None,
+    company: str = "EH",
+) -> tuple[dict, dict | None, list[str]]:
+    avisos = list(avisos_usuario or [])
+    local_payment_reports = _find_eh_local_payment_reports(data_br, company=company)
+    local_pix_pdf = local_payment_reports.get("pix")
+    local_card_pdf = local_payment_reports.get("cartoes")
+    avisos.extend(local_payment_reports.get("avisos") or [])
+
+    relatorios_pagamento = dict(relatorio_fechamento.get("relatorios_pagamento") or {})
+    relatorio_pix = relatorio_pix_padrao
+
+    if local_card_pdf:
+        try:
+            relatorios_cartao = _build_card_reports_from_caixa(local_card_pdf, data_br)
+            relatorios_validos = {
+                key: report
+                for key, report in relatorios_cartao.items()
+                if report.get("itens_autorizados")
+            }
+            if relatorios_validos:
+                relatorios_pagamento.update(relatorios_validos)
+            else:
+                avisos.append(
+                    f'O arquivo "{os.path.basename(local_card_pdf)}" não trouxe transações de cartão para {data_br} e foi ignorado.'
+                )
+        except Exception as exc:
+            avisos.append(
+                f'Não foi possível ler o arquivo "{os.path.basename(local_card_pdf)}" para {data_br}: {exc}'
+            )
+
+    if local_pix_pdf:
+        try:
+            if str(local_pix_pdf).lower().endswith(".csv"):
+                relatorio_pix = _build_pix_report_from_caixa_csv(local_pix_pdf, data_br)
+            elif str(local_pix_pdf).lower().endswith(".xlsx"):
+                relatorio_pix = _build_pix_report_from_caixa_xlsx(local_pix_pdf, data_br)
+            else:
+                relatorio_pix = _build_pix_report_from_caixa_pdf(local_pix_pdf, data_br)
+            if relatorio_pix.get("quantidade_autorizados", 0) <= 0:
+                avisos.append(
+                    f'O arquivo "{os.path.basename(local_pix_pdf)}" não trouxe transações PIX para {data_br} e foi ignorado.'
+                )
+                relatorio_pix = relatorio_pix_padrao
+        except Exception as exc:
+            avisos.append(
+                f'Não foi possível ler o arquivo "{os.path.basename(local_pix_pdf)}" para {data_br}: {exc}'
+            )
+            relatorio_pix = relatorio_pix_padrao
+
+    relatorio_fechamento["relatorios_pagamento"] = relatorios_pagamento
+    if relatorio_pix:
+        relatorios_pagamento[str(relatorio_pix.get("categoria") or "pagamentos_digitais_nfce")] = relatorio_pix
+
+    avisos = list(dict.fromkeys(avisos))
+    if avisos:
+        relatorio_fechamento["avisos_usuario"] = avisos
+        if relatorio_pix is not None:
+            relatorio_pix["avisos_usuario"] = avisos
+
+    _cleanup_eh_auto_payment_reports(local_pix_pdf, local_card_pdf)
+    return relatorio_fechamento, relatorio_pix, avisos
+
+
+def _load_azulzinha_credentials(company: str = "EH") -> dict | None:
+    company_norm = _normalize_ascii_text(company)
+    target_cnpj = "34.636.193/0001-93" if company_norm == "eh" else "18.471.209/0001-07"
+    env_user = os.environ.get(f"AZULZINHA_{company_norm.upper()}_CNPJ")
+    env_password = os.environ.get(f"AZULZINHA_{company_norm.upper()}_PASSWORD")
+    if env_user and env_password:
+        return {
+            "cnpj": str(env_user).strip(),
+            "password": str(env_password).strip(),
+            "base_url": "https://portal.azulzinhadacaixa.com.br",
+            "login_url": "https://portal.azulzinhadacaixa.com.br/",
+            "sales_url": "https://portal.azulzinhadacaixa.com.br/MinhasVendas?Router=0",
+        }
+
+    base_dir = Path(_runtime_user_dir())
+    candidate_files = [base_dir / "credenciais.txt", base_dir / "credencias.txt", base_dir / "passo-a-passo.txt"]
+    cnpj_pattern = re.compile(r"^\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}$")
+
+    for caminho in candidate_files:
+        if not caminho.is_file():
+            continue
+        try:
+            linhas = [corrigir_texto(linha.strip()) for linha in caminho.read_text(encoding="utf-8", errors="ignore").splitlines()]
+        except OSError:
+            continue
+        for idx, linha in enumerate(linhas):
+            if not cnpj_pattern.match(linha):
+                continue
+            senha = str(linhas[idx + 1] if len(linhas) > idx + 1 else "").strip()
+            if linha == target_cnpj and senha:
+                return {
+                    "cnpj": linha,
+                    "password": senha,
+                    "base_url": "https://portal.azulzinhadacaixa.com.br",
+                    "login_url": "https://portal.azulzinhadacaixa.com.br/",
+                    "sales_url": "https://portal.azulzinhadacaixa.com.br/MinhasVendas?Router=0",
+                }
+    return None
+
+
+def _azulzinha_browser_profile_dir(company: str = "EH") -> str:
+    root = os.path.join(_runtime_user_dir(), "azulzinha_browser")
+    profile = os.path.join(root, _normalize_ascii_text(company) or "eh")
+    os.makedirs(profile, exist_ok=True)
+    return profile
+
+
+def _azulzinha_device_aliases(company: str = "EH") -> list[str]:
+    company_norm = _normalize_ascii_text(company)
+    if company_norm == "mva":
+        return [
+            "MVA COMERCIO",
+            "MVA COMÉRCIO",
+            "MVA FINANCEIRO",
+            "MVA 01",
+            "MVA",
+        ]
+    return [
+        "EH FINANCEIRO",
+        "EH 01",
+        "ELETRONICA HORIZONTE",
+        "HORIZONTE",
+        "EH VAL",
+        "MARIA EDUARDA",
+    ]
+
+
+def _load_gmail_token_credentials() -> tuple[str, str] | None:
+    login = str(MINHAS_NOTAS_LOGIN or "").strip()
+    password = str(MINHAS_NOTAS_PASSWORD or "").strip()
+    if login and password:
+        return login, password
+
+    base_dir = Path(_runtime_user_dir())
+    for filename in ("credenciais.txt", "credencias.txt"):
+        caminho = base_dir / filename
+        if not caminho.is_file():
+            continue
+        try:
+            linhas = [linha.strip() for linha in caminho.read_text(encoding="utf-8", errors="ignore").splitlines() if linha.strip()]
+        except OSError:
+            continue
+        for idx, linha in enumerate(linhas):
+            if "@" in linha and idx + 1 < len(linhas):
+                return linha, linhas[idx + 1]
+    return None
+
+
+def _gmail_oauth_token_path() -> Path:
+    return Path(_runtime_user_dir()) / "gmail_oauth_token.json"
+
+
+def _load_gmail_oauth_client_credentials() -> tuple[str, str] | None:
+    client_id = str(GMAIL_OAUTH_CLIENT_ID or "").strip()
+    client_secret = str(GMAIL_OAUTH_CLIENT_SECRET or "").strip()
+    if client_id and client_secret:
+        return client_id, client_secret
+
+    env_client_id = str(os.environ.get("GMAIL_OAUTH_CLIENT_ID") or "").strip()
+    env_client_secret = str(os.environ.get("GMAIL_OAUTH_CLIENT_SECRET") or "").strip()
+    if env_client_id and env_client_secret:
+        return env_client_id, env_client_secret
+
+    config_path = Path(_runtime_user_dir()) / "gmail_oauth_client.json"
+    if not config_path.is_file():
+        return None
+
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if isinstance(payload, dict):
+        for candidate in (payload, payload.get("installed"), payload.get("web")):
+            if not isinstance(candidate, dict):
+                continue
+            file_client_id = str(candidate.get("client_id") or "").strip()
+            file_client_secret = str(candidate.get("client_secret") or "").strip()
+            if file_client_id and file_client_secret:
+                return file_client_id, file_client_secret
+    return None
+
+
+def _get_gmail_api_credentials(on_status=None):
+    client_credentials = _load_gmail_oauth_client_credentials()
+    if not client_credentials:
+        return None
+    client_id, client_secret = client_credentials
+
+    try:
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.transport.requests import Request
+    except Exception as exc:
+        _emit_pix_status(on_status, f"Bibliotecas OAuth do Google indisponiveis: {exc}")
+        return None
+
+    scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
+    token_path = _gmail_oauth_token_path()
+    creds = None
+    if token_path.is_file():
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), scopes=scopes)
+        except Exception:
+            creds = None
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+        except Exception:
+            creds = None
+
+    if creds and creds.valid:
+        return creds
+
+    _emit_pix_status(on_status, "Autorizando leitura do Gmail no navegador...")
+    flow = InstalledAppFlow.from_client_config(
+        {
+            "installed": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": ["http://localhost"],
+            }
+        },
+        scopes=scopes,
+    )
+    creds = flow.run_local_server(
+        host="127.0.0.1",
+        port=0,
+        authorization_prompt_message="Abra o link abaixo no navegador para autorizar o Gmail, se ele nao abrir sozinho:\n{url}",
+        success_message="Autorizacao do Gmail concluida. Pode voltar ao aplicativo.",
+        open_browser=True,
+    )
+    if creds:
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def _extract_gmail_api_body(payload: dict) -> str:
+    chunks = []
+
+    def _walk(part: dict) -> None:
+        mime = str(part.get("mimeType") or "")
+        body = part.get("body") or {}
+        data = body.get("data")
+        if mime in {"text/plain", "text/html"} and data:
+            try:
+                chunks.append(base64.urlsafe_b64decode(data + "===").decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+        for child in part.get("parts") or []:
+            _walk(child)
+
+    _walk(payload or {})
+    return "\n".join(chunks)
+
+
+def _extract_fiserv_email_token(text: str) -> str | None:
+    texto = corrigir_texto(str(text or ""))
+    texto_sem_style = re.sub(r"(?is)<style\b.*?>.*?</style>", " ", texto)
+    texto_sem_script = re.sub(r"(?is)<script\b.*?>.*?</script>", " ", texto_sem_style)
+    texto_visivel = re.sub(r"(?is)<[^>]+>", " ", texto_sem_script)
+    texto_visivel = html.unescape(texto_visivel)
+    texto_visivel = re.sub(r"\s+", " ", texto_visivel).strip()
+
+    candidatos_prioritarios = []
+    candidatos_contexto = []
+
+    for match in re.finditer(r"(?<!\d)(\d{6,8})(?!\d)", texto_visivel):
+        inicio = max(0, match.start() - 120)
+        fim = min(len(texto_visivel), match.end() + 120)
+        contexto = _normalize_ascii_text(texto_visivel[inicio:fim])
+        codigo = match.group(1)
+        if any(
+            frase in contexto
+            for frase in (
+                "seu codigo de verificacao",
+                "codigo de verificacao",
+                "codigo enviado",
+                "codigo que enviamos",
+            )
+        ):
+            candidatos_prioritarios.append(codigo)
+            continue
+        if any(palavra in contexto for palavra in ("token", "codigo", "verificacao", "validacao", "acesso", "seguranca")):
+            candidatos_contexto.append(codigo)
+
+    if candidatos_prioritarios:
+        return candidatos_prioritarios[0]
+    if candidatos_contexto:
+        return candidatos_contexto[0]
+
+    match = re.search(r"(?<!\d)(\d{6})(?!\d)", texto_visivel)
+    return match.group(1) if match else None
+
+
+def _is_likely_login_token_email(sender: str, subject: str, body: str) -> bool:
+    texto = _normalize_ascii_text("\n".join([str(sender or ""), str(subject or ""), str(body or "")]))
+    return any(
+        marker in texto
+        for marker in (
+            "fiserv",
+            "codigo de verificacao",
+            "codigo de verificação",
+            "verificacao de login",
+            "verificação de login",
+            "validar o login",
+            "codigo enviado",
+            "seguranca desta conta",
+        )
+    )
+
+
+def _write_gmail_body_debug(
+    entries: list[dict[str, object]],
+    *,
+    title: str | None = None,
+    summary_lines: list[str] | None = None,
+    note: str | None = None,
+) -> None:
+    try:
+        linhas = []
+        if title:
+            linhas.extend([title, "=" * 100, ""])
+        if summary_lines:
+            linhas.append("Últimos e-mails identificados:")
+            for line in summary_lines[:5]:
+                linhas.append(f"- {line}")
+            linhas.append("")
+        if note:
+            linhas.append(note)
+            linhas.append("")
+        for idx, entry in enumerate(entries[:5], start=1):
+            msg_ts = float(entry.get("timestamp") or 0.0)
+            horario = "--:--:--"
+            if msg_ts:
+                try:
+                    horario = datetime.fromtimestamp(msg_ts).strftime("%d/%m/%Y %H:%M:%S")
+                except Exception:
+                    pass
+            remetente = str(entry.get("sender") or "Remetente desconhecido")
+            assunto = str(entry.get("subject") or "Sem assunto")
+            corpo = corrigir_texto(str(entry.get("body") or "")).strip()
+            linhas.extend(
+                [
+                    "=" * 100,
+                    f"Email #{idx}",
+                    f"Horário: {horario}",
+                    f"Remetente: {remetente}",
+                    f"Assunto: {assunto}",
+                    "",
+                    "Corpo visível analisado pelo parser:",
+                    corpo or "(vazio)",
+                    "",
+                ]
+            )
+        destino = Path(_runtime_user_dir()) / "body_email.txt"
+        destino.write_text("\n".join(linhas), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _fetch_fiserv_token_from_gmail(
+    sent_after: float,
+    timeout: float = 90.0,
+    on_status=None,
+    ignored_tokens: set[str] | None = None,
+    allow_recent_fallback: bool = True,
+) -> str | None:
+    credenciais = _load_gmail_token_credentials()
+    if not credenciais:
+        return None
+
+    ignored_tokens_normalized = {
+        str(token or "").strip()
+        for token in (ignored_tokens or set())
+        if str(token or "").strip()
+    }
+    fresh_cutoff = max(0.0, float(sent_after or 0.0))
+    fresh_cutoff_grace = 5.0
+
+    _write_gmail_body_debug(
+        [],
+        title="Debug do Gmail - nova tentativa",
+        note="Aguardando leitura dos últimos e-mails pelo aplicativo.",
+    )
+
+    deadline = time.time() + timeout
+    last_error = None
+    fallback_recent_token: tuple[float, str] | None = None
+    checked_full_ids: set[str] = set()
+
+    def _format_candidate_summary(msg_ts: float, sender: str, subject: str) -> str:
+        horario = "--:--:--"
+        if msg_ts:
+            try:
+                horario = datetime.fromtimestamp(msg_ts).strftime("%H:%M:%S")
+            except Exception:
+                pass
+        remetente = (sender or "Remetente desconhecido").strip()
+        if len(remetente) > 45:
+            remetente = remetente[:42] + "..."
+        assunto = (subject or "Sem assunto").strip()
+        if len(assunto) > 55:
+            assunto = assunto[:52] + "..."
+        return f"{horario} | {remetente} | {assunto}"
+
+    def _compute_poll_interval() -> float:
+        remaining = max(0.0, deadline - time.time())
+        elapsed = max(0.0, timeout - remaining)
+        if elapsed < 30.0:
+            return 3.0
+        if elapsed < 90.0:
+            return 5.0
+        return 10.0
+
+    def _is_recent_enough(msg_ts: float) -> bool:
+        if not fresh_cutoff:
+            return True
+        return msg_ts >= max(0.0, fresh_cutoff - fresh_cutoff_grace)
+
+    try:
+        creds = _get_gmail_api_credentials(on_status=on_status)
+        if not creds:
+            raise RuntimeError("Credenciais OAuth do Gmail indisponíveis.")
+        session = requests.Session()
+        session.headers.update({"Authorization": f"Bearer {creds.token}"})
+        while time.time() < deadline:
+            _emit_pix_status(on_status, "Consultando e-mails recentes no Gmail via API...")
+            response = session.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                params={
+                    "q": "",
+                    "maxResults": 20,
+                    "includeSpamTrash": "false",
+                    "fields": "messages/id,resultSizeEstimate",
+                },
+                timeout=15.0,
+            )
+            if response.status_code == 401 and getattr(creds, "refresh_token", None):
+                try:
+                    from google.auth.transport.requests import Request
+                    creds.refresh(Request())
+                    _gmail_oauth_token_path().write_text(creds.to_json(), encoding="utf-8")
+                    session.headers.update({"Authorization": f"Bearer {creds.token}"})
+                    _emit_pix_status(on_status, "Token OAuth do Gmail renovado. Repetindo consulta...")
+                    continue
+                except Exception:
+                    pass
+            response.raise_for_status()
+            messages = (response.json() or {}).get("messages") or []
+            _emit_pix_status(
+                on_status,
+                f"Gmail API retornou {len(messages)} e-mail(s) recente(s). Exibindo os 5 mais recentes.",
+            )
+            newest_match: tuple[float, str] | None = None
+            ignored_marker_seen = False
+            candidates: list[tuple[float, str, str, str]] = []
+            api_debug_entries: list[dict[str, object]] = []
+            for item in messages:
+                msg_id = str(item.get("id") or "").strip()
+                if not msg_id:
+                    continue
+                msg_resp = session.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    params={
+                        "format": "metadata",
+                        "metadataHeaders": ["Subject", "From"],
+                        "fields": "id,internalDate,payload/headers",
+                    },
+                    timeout=15.0,
+                )
+                msg_resp.raise_for_status()
+                payload = msg_resp.json() or {}
+                internal_date_ms = float(payload.get("internalDate") or 0.0)
+                msg_ts = internal_date_ms / 1000.0 if internal_date_ms else 0.0
+                headers = payload.get("payload", {}).get("headers") or []
+                subject = next((str(h.get("value") or "") for h in headers if str(h.get("name") or "").lower() == "subject"), "")
+                sender = next((str(h.get("value") or "") for h in headers if str(h.get("name") or "").lower() == "from"), "")
+                candidates.append((msg_ts, msg_id, subject, sender))
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            candidate_summaries = [
+                _format_candidate_summary(msg_ts, sender, subject)
+                for msg_ts, _msg_id, subject, sender in candidates[:5]
+            ]
+            _emit_pix_status(
+                on_status,
+                f"Validando os {min(len(candidates), 5)} e-mail(s) mais recente(s).",
+            )
+            if candidates:
+                for idx, (msg_ts, _msg_id, subject, sender) in enumerate(candidates[:5], start=1):
+                    _emit_pix_status(
+                        on_status,
+                        f"Email recente #{idx}: {_format_candidate_summary(msg_ts, sender, subject)}",
+                    )
+            for msg_ts, msg_id, subject, sender in candidates[:5]:
+                if msg_id in checked_full_ids:
+                    continue
+                assunto_resumido = (subject or "Sem assunto").strip()
+                if len(assunto_resumido) > 70:
+                    assunto_resumido = assunto_resumido[:67] + "..."
+                remetente_resumido = (sender or "Remetente desconhecido").strip()
+                if len(remetente_resumido) > 60:
+                    remetente_resumido = remetente_resumido[:57] + "..."
+                _emit_pix_status(
+                    on_status,
+                    f"Lendo e-mail {msg_id[-6:]} de {remetente_resumido} ({assunto_resumido}).",
+                )
+                msg_resp = session.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    params={"format": "full", "fields": "id,internalDate,payload"},
+                    timeout=15.0,
+                )
+                msg_resp.raise_for_status()
+                payload = msg_resp.json() or {}
+                checked_full_ids.add(msg_id)
+                body = _extract_gmail_api_body(payload.get("payload") or {})
+                api_debug_entries.append(
+                    {
+                        "timestamp": msg_ts,
+                        "sender": sender,
+                        "subject": subject,
+                        "body": body,
+                    }
+                )
+                token = _extract_fiserv_email_token(f"{subject}\n{body}")
+                if token and _is_likely_login_token_email(sender, subject, body):
+                    if token in ignored_tokens_normalized:
+                        ignored_marker_seen = True
+                        _emit_pix_status(
+                            on_status,
+                            f"Token do e-mail {msg_id[-6:]} ja foi descartado; aguardando um codigo novo.",
+                        )
+                        continue
+                    if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
+                        fallback_recent_token = (msg_ts, token)
+                    if ignored_marker_seen and ignored_tokens_normalized and not allow_recent_fallback:
+                        _emit_pix_status(
+                            on_status,
+                            f"O token do e-mail {msg_id[-6:]} e mais antigo que o codigo rejeitado; aguardando um e-mail mais novo.",
+                        )
+                        continue
+                    if not newest_match or msg_ts > newest_match[0]:
+                        newest_match = (msg_ts, token)
+                    _emit_pix_status(
+                        on_status,
+                        f"Token compativel com login encontrado no e-mail {msg_id[-6:]}.",
+                    )
+                    continue
+                    if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
+                        fallback_recent_token = (msg_ts, token)
+                    if not newest_match or msg_ts > newest_match[0]:
+                        newest_match = (msg_ts, token)
+                    _emit_pix_status(
+                        on_status,
+                        f"Token compatível com login encontrado no e-mail {msg_id[-6:]}.",
+                    )
+            _write_gmail_body_debug(
+                api_debug_entries,
+                title="Debug do Gmail via API",
+                summary_lines=candidate_summaries,
+                note=(
+                    None
+                    if api_debug_entries
+                    else "Nenhum corpo de e-mail foi lido nesta tentativa da API."
+                ),
+            )
+            if newest_match:
+                _emit_pix_status(on_status, f"Token encontrado no Gmail: {newest_match[1]}.")
+                return newest_match[1]
+            wait_seconds = _compute_poll_interval()
+            _emit_pix_status(
+                on_status,
+                f"Nenhum token novo ainda. Nova tentativa em {int(wait_seconds)}s.",
+            )
+            time.sleep(wait_seconds)
+    except Exception as exc:
+        last_error = exc
+        _emit_pix_status(on_status, f"Nao foi possivel ler o token no Gmail via OAuth: {exc}")
+
+    import email
+    import imaplib
+    from email.header import decode_header
+    from email.utils import parsedate_to_datetime
+
+    login, password = credenciais
+
+    def _decode_mime(value: str) -> str:
+        partes = []
+        for chunk, charset in decode_header(value or ""):
+            if isinstance(chunk, bytes):
+                partes.append(chunk.decode(charset or "utf-8", errors="ignore"))
+            else:
+                partes.append(str(chunk or ""))
+        return "".join(partes)
+
+    def _message_text(message) -> str:
+        chunks = []
+        if message.is_multipart():
+            for part in message.walk():
+                content_type = part.get_content_type()
+                disposition = str(part.get("Content-Disposition") or "").lower()
+                if "attachment" in disposition or content_type not in {"text/plain", "text/html"}:
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                chunks.append(payload.decode(part.get_content_charset() or "utf-8", errors="ignore"))
+        else:
+            payload = message.get_payload(decode=True)
+            if payload is not None:
+                chunks.append(payload.decode(message.get_content_charset() or "utf-8", errors="ignore"))
+        return "\n".join(chunks)
+
+    while time.time() < deadline:
+        try:
+            _emit_pix_status(on_status, "Lendo e-mails recentes no Gmail via IMAP...")
+            with imaplib.IMAP4_SSL("imap.gmail.com", 993) as mail:
+                mail.login(login, password)
+                mail.select("INBOX")
+                status, data = mail.uid(
+                    "search",
+                    None,
+                    "X-GM-RAW",
+                    '"in:inbox"',
+                )
+                if status != "OK":
+                    status, data = mail.uid("search", None, "ALL")
+                ids = (data[0] or b"").split()[-20:]
+                _emit_pix_status(
+                    on_status,
+                    f"IMAP retornou {len(ids)} e-mail(s) recente(s). Exibindo os 5 mais recentes.",
+                )
+                newest_match: tuple[float, str] | None = None
+                ignored_marker_seen = False
+                imap_candidates: list[tuple[float, str, str]] = []
+                imap_debug_entries: list[dict[str, object]] = []
+                for uid in reversed(ids):
+                    status, msg_data = mail.uid("fetch", uid, "(RFC822)")
+                    if status != "OK" or not msg_data:
+                        continue
+                    raw = next((item[1] for item in msg_data if isinstance(item, tuple) and len(item) > 1), None)
+                    if not raw:
+                        continue
+                    msg = email.message_from_bytes(raw)
+                    try:
+                        msg_dt = parsedate_to_datetime(msg.get("Date") or "")
+                        msg_ts = msg_dt.timestamp()
+                    except Exception:
+                        msg_ts = 0.0
+                    remetente = _normalize_ascii_text(msg.get("From") or "")
+                    assunto = _decode_mime(msg.get("Subject") or "")
+                    corpo = _message_text(msg)
+                    imap_candidates.append((msg_ts, msg.get("From") or "", assunto))
+                    remetente_resumido = (msg.get("From") or "Remetente desconhecido").strip()
+                    if len(remetente_resumido) > 60:
+                        remetente_resumido = remetente_resumido[:57] + "..."
+                    assunto_resumido = (assunto or "Sem assunto").strip()
+                    if len(assunto_resumido) > 70:
+                        assunto_resumido = assunto_resumido[:67] + "..."
+                    _emit_pix_status(
+                        on_status,
+                        f"Validando e-mail IMAP de {remetente_resumido} ({assunto_resumido}).",
+                    )
+                    imap_debug_entries.append(
+                        {
+                            "timestamp": msg_ts,
+                            "sender": msg.get("From") or "",
+                            "subject": assunto,
+                            "body": corpo,
+                        }
+                    )
+                    token = _extract_fiserv_email_token(f"{assunto}\n{corpo}")
+                    if token and _is_likely_login_token_email(remetente, assunto, corpo):
+                        if token in ignored_tokens_normalized:
+                            ignored_marker_seen = True
+                            _emit_pix_status(
+                                on_status,
+                                "O token retornado via IMAP ja foi descartado; aguardando um novo codigo.",
+                            )
+                            continue
+                        if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
+                            fallback_recent_token = (msg_ts, token)
+                        if ignored_marker_seen and ignored_tokens_normalized and not allow_recent_fallback:
+                            _emit_pix_status(
+                                on_status,
+                                "O token encontrado via IMAP e mais antigo que o codigo rejeitado; aguardando um e-mail mais novo.",
+                            )
+                            continue
+                        if not newest_match or msg_ts > newest_match[0]:
+                            newest_match = (msg_ts, token)
+                        _emit_pix_status(
+                            on_status,
+                            f"Token compativel com login encontrado via IMAP ({assunto_resumido}).",
+                        )
+                        continue
+                        if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
+                            fallback_recent_token = (msg_ts, token)
+                        if not newest_match or msg_ts > newest_match[0]:
+                            newest_match = (msg_ts, token)
+                        _emit_pix_status(
+                            on_status,
+                            f"Token compatível com login encontrado via IMAP ({assunto_resumido}).",
+                        )
+                if imap_candidates:
+                    imap_candidates.sort(key=lambda item: item[0], reverse=True)
+                    for idx, (msg_ts, sender, subject) in enumerate(imap_candidates[:5], start=1):
+                        _emit_pix_status(
+                            on_status,
+                            f"Email IMAP #{idx}: {_format_candidate_summary(msg_ts, sender, subject)}",
+                        )
+                _write_gmail_body_debug(
+                    imap_debug_entries,
+                    title="Debug do Gmail via IMAP",
+                    summary_lines=[
+                        _format_candidate_summary(msg_ts, sender, subject)
+                        for msg_ts, sender, subject in imap_candidates[:5]
+                    ],
+                    note=(
+                        None
+                        if imap_debug_entries
+                        else "Nenhum corpo de e-mail foi lido nesta tentativa do IMAP."
+                    ),
+                )
+                if newest_match:
+                    _emit_pix_status(on_status, f"Token encontrado via IMAP: {newest_match[1]}.")
+                    return newest_match[1]
+        except Exception as exc:
+            last_error = exc
+        wait_seconds = _compute_poll_interval()
+        _emit_pix_status(
+            on_status,
+            f"IMAP ainda sem token novo. Nova tentativa em {int(wait_seconds)}s.",
+        )
+        time.sleep(wait_seconds)
+
+    if fallback_recent_token and not allow_recent_fallback:
+        _emit_pix_status(
+            on_status,
+            "Nenhum token novo chegou a tempo; codigos antigos nao serao reutilizados nesta tentativa.",
+        )
+        fallback_recent_token = None
+
+    if fallback_recent_token:
+        _emit_pix_status(on_status, "Nenhum e-mail novo da Fiserv chegou a tempo; reutilizando o código mais recente do Gmail.")
+        return fallback_recent_token[1]
+
+    if last_error:
+        _emit_pix_status(on_status, f"Falha final ao ler token no Gmail: {last_error}")
+    return None
+
+
+def _wait_for_downloaded_report(
+    download_dir: str,
+    data_br: str,
+    kind: str,
+    started_at: float,
+    timeout: float = 90.0,
+) -> str | None:
+    deadline = time.time() + timeout
+    suffixes = ("*.csv", "*.xlsx") if kind == "pix" else ("*.pdf", "*.xlsx")
+    while time.time() < deadline:
+        for pattern in suffixes:
+            candidates = sorted(
+                Path(download_dir).glob(pattern),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            for path in candidates:
+                try:
+                    if path.stat().st_mtime < started_at - 1:
+                        continue
+                    if path.name.endswith(".crdownload") or path.name.endswith(".tmp"):
+                        continue
+                    if path.suffix.lower() == ".csv":
+                        text = _read_text_file(path)
+                    elif path.suffix.lower() == ".xlsx":
+                        text = _read_excel_text(path)
+                    else:
+                        text = _read_pdf_text(path)
+                    text_norm = _normalize_ascii_text(text)
+                    detected_date = _extract_local_report_date_br(text)
+                    if detected_date and detected_date != data_br:
+                        continue
+                    if kind == "pix" and (
+                        (path.suffix.lower() == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm)
+                        or (path.suffix.lower() == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm)
+                    ):
+                        if path.suffix.lower() == ".xlsx":
+                            converted = _convert_pix_xlsx_to_csv(str(path))
+                            return converted or str(path)
+                        return str(path)
+                    if kind == "cartoes" and (
+                        "relatorio de historico de vendas" in text_norm and "periodo de venda" in text_norm
+                        or (path.suffix.lower() == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm)
+                    ):
+                        return str(path)
+                except Exception:
+                    continue
+        time.sleep(0.6)
+    return None
+
+
+_AZULZINHA_DEBUG_ARTIFACT_PATTERNS = (
+    "azulzinha_export_payload_*.json",
+    "azulzinha_network_candidates_*.json",
+    "azulzinha_export_signals_*.json",
+    "azulzinha_export_ready_debug_*.html",
+    "azulzinha_export_ready_state_*.json",
+    "azulzinha_export_popup_*.html",
+    "azulzinha_export_state_*.json",
+    "azulzinha_export_debug_*.html",
+)
+
+
+def _cleanup_azulzinha_debug_artifacts() -> None:
+    base_dir = Path(_runtime_user_dir())
+    visited: set[Path] = set()
+    for pattern in _AZULZINHA_DEBUG_ARTIFACT_PATTERNS:
+        try:
+            matches = list(base_dir.glob(pattern))
+        except Exception:
+            continue
+        for path in matches:
+            if path in visited or not path.is_file():
+                continue
+            visited.add(path)
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+
+_EH_AUTO_PAYMENT_REPORT_PREFIXES = (
+    "relatorio_de_vendas_pix_",
+    "historico_simplificado_de_vendas_",
+)
+_EH_AUTO_PAYMENT_REPORT_SUFFIXES = (".csv", ".xlsx", ".pdf")
+
+
+def _is_eh_auto_payment_report_path(path_like: str | os.PathLike | None) -> bool:
+    if not path_like:
+        return False
+    try:
+        path = Path(path_like)
+    except TypeError:
+        return False
+    name = path.name.casefold()
+    if not any(name.startswith(prefix) for prefix in _EH_AUTO_PAYMENT_REPORT_PREFIXES):
+        return False
+    if path.suffix.lower() not in _EH_AUTO_PAYMENT_REPORT_SUFFIXES:
+        return False
+    return "_auto" in path.stem.casefold()
+
+
+def _cleanup_eh_auto_payment_reports(*paths_like: str | os.PathLike | None) -> None:
+    targets: dict[str, Path] = {}
+    for raw_path in paths_like:
+        if not _is_eh_auto_payment_report_path(raw_path):
+            continue
+        path = Path(str(raw_path))
+        for suffix in _EH_AUTO_PAYMENT_REPORT_SUFFIXES:
+            candidate = path.with_suffix(suffix)
+            if not candidate.is_file() or not _is_eh_auto_payment_report_path(candidate):
+                continue
+            targets[str(candidate).casefold()] = candidate
+
+    for candidate in targets.values():
+        try:
+            candidate.unlink()
+        except Exception:
+            pass
+
+
+def baixar_relatorios_caixa_eh_azulzinha(
+    data_br: str,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+    token_callback=None,
+    need_pix: bool = True,
+    need_cartoes: bool = True,
+    company: str = "EH",
+) -> dict[str, object]:
+    cancel_event = cancel_event or threading.Event()
+    company_norm = _normalize_ascii_text(company) or "eh"
+    company_label = "MVA" if company_norm == "mva" else "EH"
+
+    def _check_cancelled() -> None:
+        if cancel_event.is_set():
+            raise RuntimeError("__cancelled__")
+
+    if not need_pix and not need_cartoes:
+        return {"pix": None, "cartoes": None, "avisos": []}
+
+    credenciais = _load_azulzinha_credentials(company_label)
+    if not credenciais:
+        return {
+            "pix": None,
+            "cartoes": None,
+            "avisos": [f"As credenciais da Azulzinha/Caixa da {company_label} nao foram encontradas no credenciais.txt ou passo-a-passo.txt."],
+        }
+
+    navegador = _find_chromium_browser_path()
+    if not navegador:
+        return {
+            "pix": None,
+            "cartoes": None,
+            "avisos": ["Nenhum navegador Chromium compativel foi encontrado para baixar os relatorios da Azulzinha/Caixa."],
+        }
+
+    download_dir = _runtime_user_dir()
+    profile_dir = _azulzinha_browser_profile_dir(company_label)
+    _prepare_chromium_profile(profile_dir, download_dir)
+    _cleanup_azulzinha_debug_artifacts()
+    port = _pick_free_local_port()
+    chrome_args = [
+        navegador,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-popup-blocking",
+        "--disable-notifications",
+        "--deny-permission-prompts",
+        "--disable-save-password-bubble",
+        "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication",
+        "--window-size=1400,900",
+        "--window-position=-32000,-32000",
+        "--start-minimized",
+        "--disable-gpu",
+        "about:blank",
+    ]
+
+    def _download_start_time() -> float:
+        return time.time() - 1.0
+
+    async def _run() -> dict[str, object]:
+        import websockets
+
+        _check_cancelled()
+        meta = _wait_for_devtools_ready(port)
+        ws_url = str(meta.get("webSocketDebuggerUrl") or "").strip()
+        if not ws_url:
+            raise RuntimeError("Nao foi possivel conectar ao Chromium para acessar a Azulzinha/Caixa.")
+
+        async with websockets.connect(ws_url, max_size=50_000_000) as conn:
+            next_id = 0
+            pending = {}
+            event_log: list[dict] = []
+            event_cond = asyncio.Condition()
+
+            async def recv_loop():
+                while True:
+                    _check_cancelled()
+                    mensagem = json.loads(await conn.recv())
+                    if "id" in mensagem and mensagem["id"] in pending:
+                        pending.pop(mensagem["id"]).set_result(mensagem)
+                    elif "method" in mensagem:
+                        async with event_cond:
+                            event_log.append(mensagem)
+                            if len(event_log) > 400:
+                                del event_log[:200]
+                            event_cond.notify_all()
+
+            recv_task = asyncio.create_task(recv_loop())
+
+            async def cdp(method: str, params: dict | None = None, session_id: str | None = None, timeout: float = 60.0):
+                nonlocal next_id
+                _check_cancelled()
+                next_id += 1
+                future = asyncio.get_running_loop().create_future()
+                pending[next_id] = future
+                mensagem = {"id": next_id, "method": method}
+                if params:
+                    mensagem["params"] = params
+                if session_id:
+                    mensagem["sessionId"] = session_id
+                await conn.send(json.dumps(mensagem))
+                resposta = await asyncio.wait_for(future, timeout)
+                if "error" in resposta:
+                    raise RuntimeError(resposta["error"])
+                return resposta.get("result", {})
+
+            async def eval_js(session_id: str, expression: str, timeout: float = 60.0):
+                resposta = await cdp(
+                    "Runtime.evaluate",
+                    {"expression": expression, "returnByValue": True, "awaitPromise": True},
+                    session_id=session_id,
+                    timeout=timeout,
+                )
+                return resposta.get("result", {}).get("value")
+
+            async def wait_for_condition(
+                session_id: str,
+                expression: str,
+                timeout: float = 60.0,
+                step: float = 0.5,
+                description: str | None = None,
+            ):
+                deadline = time.time() + timeout
+                last_value = None
+                while time.time() < deadline:
+                    _check_cancelled()
+                    try:
+                        last_value = await eval_js(session_id, expression, timeout=15.0)
+                        if last_value:
+                            return last_value
+                    except Exception as exc:
+                        last_value = str(exc)
+                    await asyncio.sleep(step)
+                detail = f" :: ultimo retorno={last_value!r}" if last_value not in (None, "") else ""
+                if description:
+                    raise TimeoutError(f"{description}{detail}")
+                raise TimeoutError(f"{expression}{detail}")
+
+            async def wait_for_event(
+                predicate,
+                timeout: float = 30.0,
+                start_index: int = 0,
+            ) -> dict | None:
+                deadline = time.time() + timeout
+                cursor = start_index
+                while time.time() < deadline:
+                    async with event_cond:
+                        for idx in range(cursor, len(event_log)):
+                            mensagem = event_log[idx]
+                            if predicate(mensagem):
+                                return mensagem
+                        cursor = len(event_log)
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            await asyncio.wait_for(event_cond.wait(), timeout=min(1.0, remaining))
+                        except asyncio.TimeoutError:
+                            pass
+                return None
+
+            def _save_captured_report_bytes(
+                payload: bytes,
+                kind: str,
+                suffix: str,
+                source_name: str,
+            ) -> str | None:
+                safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+                filename = (
+                    f"Relatorio_de_Vendas_Pix_{data_br.replace('/', '-')}_{company_norm}_auto{safe_suffix}"
+                    if kind == "pix"
+                    else f"Historico_Simplificado_de_vendas_{data_br.replace('/', '-')}_{company_norm}_auto{safe_suffix}"
+                )
+                target = Path(download_dir) / filename
+                try:
+                    target.write_bytes(payload)
+                except Exception:
+                    return None
+                try:
+                    if safe_suffix.lower() == ".csv":
+                        text = _read_text_file(target)
+                    elif safe_suffix.lower() == ".xlsx":
+                        text = _read_excel_text(target)
+                    else:
+                        text = _read_pdf_text(target)
+                    text_norm = _normalize_ascii_text(text)
+                    detected_date = _extract_local_report_date_br(text)
+                    if detected_date and detected_date != data_br:
+                        return None
+                    if kind == "pix":
+                        if safe_suffix.lower() == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm:
+                            return str(target)
+                        if safe_suffix.lower() == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm:
+                            converted = _convert_pix_xlsx_to_csv(str(target))
+                            return converted or str(target)
+                        if safe_suffix.lower() == ".pdf" and "valor bruto" in text_norm and "pix" in text_norm:
+                            return str(target)
+                    else:
+                        if safe_suffix.lower() == ".xlsx":
+                            text = _read_excel_text(target)
+                            text_norm = _normalize_ascii_text(text)
+                        if (
+                            "relatorio de historico de vendas" in text_norm and "periodo de venda" in text_norm
+                            or (safe_suffix.lower() == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm)
+                        ):
+                            return str(target)
+                except Exception:
+                    pass
+                return None
+
+            def _persist_downloaded_report(path_like: str | None, kind: str) -> str | None:
+                if not path_like:
+                    return None
+                try:
+                    source_path = Path(str(path_like))
+                except Exception:
+                    return path_like
+                try:
+                    payload = source_path.read_bytes()
+                except Exception:
+                    return str(source_path)
+                saved = _save_captured_report_bytes(payload, kind, source_path.suffix or ".pdf", str(source_path))
+                if saved:
+                    try:
+                        if source_path.exists() and source_path.resolve() != Path(saved).resolve():
+                            source_path.unlink()
+                    except Exception:
+                        pass
+                    return saved
+                return str(source_path)
+
+            def _find_export_url_in_payload(payload):
+                if isinstance(payload, dict):
+                    for value in payload.values():
+                        found = _find_export_url_in_payload(value)
+                        if found:
+                            return found
+                elif isinstance(payload, list):
+                    for value in payload:
+                        found = _find_export_url_in_payload(value)
+                        if found:
+                            return found
+                elif isinstance(payload, str):
+                    text = payload.strip()
+                    if text.startswith("http://") or text.startswith("https://"):
+                        return text
+                    if "/screenservices/" in text or "/download" in text.lower():
+                        return text
+                return None
+
+            def _extract_binary_payload_from_json(payload):
+                if isinstance(payload, dict):
+                    binary_data = payload.get("BinaryData")
+                    if isinstance(binary_data, str) and binary_data.strip():
+                        raw = base64.b64decode(binary_data)
+                        header = raw[:8]
+                        if header.startswith(b"PK"):
+                            suffix = ".xlsx"
+                        elif header.startswith(b"%PDF"):
+                            suffix = ".pdf"
+                        else:
+                            try:
+                                preview = raw[:512].decode("utf-8", errors="ignore").lower()
+                            except Exception:
+                                preview = ""
+                            suffix = ".csv" if (";" in preview or "," in preview or "valor bruto" in preview) else ".bin"
+                        return raw, suffix
+                    for value in payload.values():
+                        found = _extract_binary_payload_from_json(value)
+                        if found:
+                            return found
+                elif isinstance(payload, list):
+                    for value in payload:
+                        found = _extract_binary_payload_from_json(value)
+                        if found:
+                            return found
+                return None
+
+            async def wait_for_captured_report(
+                session_id: str,
+                kind: str,
+                event_start_index: int,
+                timeout: float = 40.0,
+            ) -> str | None:
+                seen_candidates: list[dict[str, object]] = []
+                seen_export_urls: set[str] = set()
+
+                def is_candidate(message: dict) -> bool:
+                    method = str(message.get("method") or "")
+                    params = message.get("params") or {}
+                    if method == "Browser.downloadWillBegin":
+                        suggested = str(params.get("suggestedFilename") or "").lower()
+                        url = str(params.get("url") or "").lower()
+                        if kind == "pix":
+                            return suggested.endswith(".csv") or "csv" in suggested or "pix" in url
+                        return suggested.endswith(".pdf") or "pdf" in suggested or "historico" in url
+                    if method == "Network.requestWillBeSent":
+                        if str(message.get("sessionId") or "") != str(session_id):
+                            return False
+                        request = params.get("request") or {}
+                        url = str(request.get("url") or "").lower()
+                        if kind == "pix":
+                            return "pix" in url and ("export" in url or "download" in url or "csv" in url)
+                        return "historico" in url and ("export" in url or "download" in url or "pdf" in url)
+                    if method != "Network.responseReceived":
+                        return False
+                    if str(message.get("sessionId") or "") != str(session_id):
+                        return False
+                    response = params.get("response") or {}
+                    url = str(response.get("url") or "").lower()
+                    mime_type = str(response.get("mimeType") or "").lower()
+                    headers = {str(k).lower(): str(v) for k, v in (response.get("headers") or {}).items()}
+                    content_disposition = headers.get("content-disposition", "").lower()
+                    if kind == "pix":
+                        return (
+                            "text/csv" in mime_type
+                            or "csv" in content_disposition
+                            or ("pix" in url and ("export" in url or "download" in url))
+                        )
+                    return (
+                        "application/pdf" in mime_type
+                        or ".pdf" in url
+                        or "pdf" in content_disposition
+                        or ("historico" in url and ("export" in url or "download" in url))
+                    )
+
+                deadline = time.time() + timeout
+                processed_request_ids: set[str] = set()
+                browser_download_seen = False
+
+                async def try_browser_export_urls() -> str | None:
+                    try:
+                        captured_urls = await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const data = window.__codexExportSignals || {};
+                                const urls = [];
+                                for (const value of [
+                                    ...(data.openedUrls || []),
+                                    ...(data.anchorUrls || []),
+                                    ...(data.iframeUrls || []),
+                                    data.lastUrl || '',
+                                ]) {
+                                    const text = String(value || '').trim();
+                                    if (text) urls.push(text);
+                                }
+                                return [...new Set(urls)];
+                            })()
+                            """,
+                            timeout=5.0,
+                        ) or []
+                    except Exception:
+                        captured_urls = []
+                    for export_url in captured_urls:
+                        export_url = str(export_url or "").strip()
+                        if not export_url or export_url in seen_export_urls:
+                            continue
+                        seen_export_urls.add(export_url)
+                        try:
+                            fetched = await eval_js(
+                                session_id,
+                                f"""
+                                (async () => {{
+                                    const url = {export_url!r};
+                                    const response = await fetch(url, {{ credentials: 'include' }});
+                                    const buffer = await response.arrayBuffer();
+                                    const bytes = new Uint8Array(buffer);
+                                    let binary = '';
+                                    const chunk = 0x8000;
+                                    for (let i = 0; i < bytes.length; i += chunk) {{
+                                        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+                                    }}
+                                    return {{
+                                        ok: response.ok,
+                                        status: response.status,
+                                        mimeType: response.headers.get('content-type') || '',
+                                        contentDisposition: response.headers.get('content-disposition') || '',
+                                        body: btoa(binary),
+                                    }};
+                                }})()
+                                """,
+                                timeout=60.0,
+                            ) or {}
+                            if fetched.get("ok") and fetched.get("body"):
+                                fetched_mime = str(fetched.get("mimeType") or "").lower()
+                                fetched_disp = str(fetched.get("contentDisposition") or "").lower()
+                                fetched_suffix = ".csv" if ("csv" in fetched_mime or "csv" in fetched_disp) else ".pdf"
+                                fetched_payload = base64.b64decode(str(fetched.get("body") or ""))
+                                saved = _save_captured_report_bytes(fetched_payload, kind, fetched_suffix, export_url)
+                                if saved:
+                                    return saved
+                        except Exception:
+                            pass
+                    return None
+
+                while time.time() < deadline:
+                    direct_saved = await try_browser_export_urls()
+                    if direct_saved:
+                        return direct_saved
+                    event = await wait_for_event(is_candidate, timeout=min(5.0, max(0.5, deadline - time.time())), start_index=event_start_index)
+                    if not event:
+                        break
+                    method = str(event.get("method") or "")
+                    params = event.get("params") or {}
+                    if method == "Browser.downloadWillBegin":
+                        browser_download_seen = True
+                        await asyncio.sleep(2.0)
+                        found = _wait_for_downloaded_report(download_dir, data_br, kind, time.time() - 5.0, timeout=10.0)
+                        if found:
+                            return _persist_downloaded_report(found, kind)
+                        event_start_index = len(event_log)
+                        continue
+
+                    if method == "Network.requestWillBeSent":
+                        request = params.get("request") or {}
+                        seen_candidates.append(
+                            {
+                                "method": method,
+                                "requestId": str(params.get("requestId") or ""),
+                                "url": str(request.get("url") or ""),
+                                "postData": str(request.get("postData") or "")[:4000],
+                            }
+                        )
+                        event_start_index = len(event_log)
+                        continue
+
+                    request_id = str(params.get("requestId") or "")
+                    if not request_id or request_id in processed_request_ids:
+                        event_start_index = len(event_log)
+                        continue
+                    processed_request_ids.add(request_id)
+                    response = params.get("response") or {}
+                    seen_candidates.append(
+                        {
+                            "method": method,
+                            "requestId": request_id,
+                            "url": str(response.get("url") or ""),
+                            "status": response.get("status"),
+                            "mimeType": str(response.get("mimeType") or ""),
+                            "headers": {str(k): str(v) for k, v in (response.get("headers") or {}).items()},
+                        }
+                    )
+                    headers = {str(k).lower(): str(v) for k, v in (response.get("headers") or {}).items()}
+                    content_disposition = headers.get("content-disposition", "")
+                    mime_type = str(response.get("mimeType") or "").lower()
+                    disposition_norm = content_disposition.lower()
+                    if "csv" in mime_type or "csv" in disposition_norm:
+                        suffix = ".csv"
+                    elif (
+                        "spreadsheet" in mime_type
+                        or "excel" in mime_type
+                        or ".xlsx" in disposition_norm
+                        or "sheet" in disposition_norm
+                    ):
+                        suffix = ".xlsx"
+                    else:
+                        suffix = ".pdf"
+                    try:
+                        body = await cdp("Network.getResponseBody", {"requestId": request_id}, session_id=session_id, timeout=20.0)
+                        raw_body = body.get("body") or ""
+                        payload = base64.b64decode(raw_body) if body.get("base64Encoded") else str(raw_body).encode("utf-8", errors="ignore")
+                        if "application/json" in mime_type:
+                            try:
+                                json_text = payload.decode("utf-8", errors="ignore")
+                                json_payload = json.loads(json_text)
+                                try:
+                                    debug_path = Path(_runtime_user_dir()) / f"azulzinha_export_payload_{kind}.json"
+                                    debug_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                                except Exception:
+                                    pass
+                                embedded_binary = _extract_binary_payload_from_json(json_payload)
+                                if embedded_binary:
+                                    _emit_pix_status(
+                                        on_status,
+                                        f"Resposta JSON com arquivo embutido detectada para {kind}.",
+                                    )
+                                    embedded_payload, embedded_suffix = embedded_binary
+                                    saved = _save_captured_report_bytes(
+                                        embedded_payload,
+                                        kind,
+                                        embedded_suffix,
+                                        str(response.get("url") or ""),
+                                    )
+                                    if saved:
+                                        return saved
+                                export_url = _find_export_url_in_payload(json_payload)
+                                if export_url:
+                                    if export_url.startswith("/"):
+                                        base_url = str(response.get("url") or "")
+                                        export_url = urljoin(base_url, export_url)
+                                    fetched = await eval_js(
+                                        session_id,
+                                        f"""
+                                        (async () => {{
+                                            const url = {export_url!r};
+                                            const response = await fetch(url, {{ credentials: 'include' }});
+                                            const buffer = await response.arrayBuffer();
+                                            const bytes = new Uint8Array(buffer);
+                                            let binary = '';
+                                            const chunk = 0x8000;
+                                            for (let i = 0; i < bytes.length; i += chunk) {{
+                                                binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+                                            }}
+                                            return {{
+                                                ok: response.ok,
+                                                status: response.status,
+                                                mimeType: response.headers.get('content-type') || '',
+                                                contentDisposition: response.headers.get('content-disposition') || '',
+                                                body: btoa(binary),
+                                            }};
+                                        }})()
+                                        """,
+                                        timeout=60.0,
+                                    ) or {}
+                                    if fetched.get("ok") and fetched.get("body"):
+                                        fetched_mime = str(fetched.get("mimeType") or "").lower()
+                                        fetched_disp = str(fetched.get("contentDisposition") or "").lower()
+                                        if "csv" in fetched_mime or "csv" in fetched_disp:
+                                            fetched_suffix = ".csv"
+                                        elif (
+                                            "spreadsheet" in fetched_mime
+                                            or "excel" in fetched_mime
+                                            or ".xlsx" in fetched_disp
+                                            or "sheet" in fetched_disp
+                                        ):
+                                            fetched_suffix = ".xlsx"
+                                        else:
+                                            fetched_suffix = ".pdf"
+                                        fetched_payload = base64.b64decode(str(fetched.get("body") or ""))
+                                        saved = _save_captured_report_bytes(fetched_payload, kind, fetched_suffix, export_url)
+                                        if saved:
+                                            return saved
+                            except Exception:
+                                pass
+                        saved = _save_captured_report_bytes(payload, kind, suffix, str(response.get("url") or ""))
+                        if saved:
+                            return saved
+                    except Exception:
+                        pass
+                    event_start_index = len(event_log)
+
+                if browser_download_seen:
+                    return _persist_downloaded_report(
+                        _wait_for_downloaded_report(download_dir, data_br, kind, time.time() - 10.0, timeout=10.0),
+                        kind,
+                    )
+                direct_saved = await try_browser_export_urls()
+                if direct_saved:
+                    return direct_saved
+                try:
+                    debug_path = Path(_runtime_user_dir()) / f"azulzinha_network_candidates_{kind}.json"
+                    debug_path.write_text(json.dumps(seen_candidates, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    export_signals = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const data = window.__codexExportSignals || {};
+                            return {
+                                openedUrls: data.openedUrls || [],
+                                anchorUrls: data.anchorUrls || [],
+                                iframeUrls: data.iframeUrls || [],
+                                lastUrl: data.lastUrl || '',
+                            };
+                        })()
+                        """,
+                        timeout=5.0,
+                    )
+                    debug_signals_path = Path(_runtime_user_dir()) / f"azulzinha_export_signals_{kind}.json"
+                    debug_signals_path.write_text(json.dumps(export_signals, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+                return None
+
+            async def navigate(session_id: str, url: str) -> None:
+                await cdp("Page.navigate", {"url": url}, session_id=session_id)
+                await wait_for_condition(session_id, "document.readyState === 'complete' || document.readyState === 'interactive'", timeout=80.0)
+
+            async def click_by_text(session_id: str, text_options: list[str], timeout: float = 30.0) -> bool:
+                options = [_normalize_ascii_text(item).upper() for item in text_options]
+                expression = f"""
+                (() => {{
+                    const targets = {json.dumps(options)};
+                    const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                    const visible = (el) => {{
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const nodes = [...document.querySelectorAll('button, a, [role="button"], li, span, div, label')].filter(visible);
+                    for (const target of targets) {{
+                        const node = nodes.find((el) => norm(el.innerText || el.textContent).includes(target));
+                        if (node) {{
+                            const clickable = node.closest('button, a, [role="button"], label, li, div') || node;
+                            clickable.scrollIntoView({{ block: 'center', inline: 'center' }});
+                            clickable.click();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }})()
+                """
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    if await eval_js(session_id, expression):
+                        return True
+                    await asyncio.sleep(0.5)
+                return False
+
+            async def click_card_by_text(session_id: str, text_options: list[str], timeout: float = 30.0) -> bool:
+                options = [_normalize_ascii_text(item).upper() for item in text_options]
+                expression = f"""
+                (() => {{
+                    const targets = {json.dumps(options)};
+                    const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                    const visible = (el) => {{
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const nodes = [...document.querySelectorAll('[id$="-Content"], .card-content, .ph.card.card-content')].filter(visible);
+                    for (const target of targets) {{
+                        const matches = nodes
+                            .map((el) => {{
+                                const text = norm(el.innerText || el.textContent);
+                                if (!text.includes(target)) return null;
+                                const className = (el.className || '').toString().toUpperCase();
+                                const id = (el.id || '').toUpperCase();
+                                const isCard = className.includes('CARD-CONTENT') || className.includes('PH CARD');
+                                const exact = text === target || text.endsWith(target);
+                                return {{
+                                    el,
+                                    score: (exact ? 1000 : 0) + (isCard ? 200 : 0) - text.length,
+                                }};
+                            }})
+                            .filter(Boolean)
+                            .sort((a, b) => b.score - a.score);
+                        const node = matches.length ? matches[0].el : null;
+                        if (node) {{
+                            node.scrollIntoView({{ block: 'center', inline: 'center' }});
+                            node.click();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }})()
+                """
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    if await eval_js(session_id, expression):
+                        return True
+                    await asyncio.sleep(0.5)
+                return False
+
+            async def activate_sales_tab(session_id: str, tab_id: str, timeout: float = 40.0) -> None:
+                expected_content = f"{tab_id}Content"
+                expression = f"""
+                (() => {{
+                    const root = document.getElementById({tab_id!r});
+                    if (!root) return 'missing-tab';
+                    const button = root.querySelector('button[role="tab"]');
+                    if (!button) return 'missing-button';
+                    const content = document.getElementById({expected_content!r})?.querySelector('[role="tabpanel"]');
+                    if (button.getAttribute('aria-selected') === 'true' && content && content.getAttribute('aria-hidden') === 'false') {{
+                        return 'ready';
+                    }}
+                    button.scrollIntoView({{ block: 'center', inline: 'center' }});
+                    button.focus();
+                    button.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
+                    button.click();
+                    button.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
+                    return 'clicked';
+                }})()
+                """
+                deadline = time.time() + timeout
+                last_state = ""
+                while time.time() < deadline:
+                    _check_cancelled()
+                    state = await eval_js(session_id, expression)
+                    last_state = str(state or "")
+                    if state in {"missing-tab", "missing-button"}:
+                        await asyncio.sleep(0.5)
+                        continue
+                    try:
+                        await wait_for_condition(
+                            session_id,
+                            f"""
+                            (() => {{
+                                const button = document.querySelector("#{tab_id} button[role='tab']");
+                                const content = document.querySelector("#{expected_content} [role='tabpanel']");
+                                return !!button && !!content &&
+                                    button.getAttribute('aria-selected') === 'true' &&
+                                    content.getAttribute('aria-hidden') === 'false';
+                            }})()
+                            """,
+                            timeout=2.5,
+                            step=0.25,
+                        )
+                        return
+                    except Exception:
+                        await asyncio.sleep(0.5)
+                try:
+                    html_debug = await eval_js(
+                        session_id,
+                        "document.documentElement ? document.documentElement.outerHTML : ''",
+                        timeout=15.0,
+                    )
+                    if html_debug:
+                        debug_path = Path(_runtime_user_dir()) / f"azulzinha_tabs_debug_{tab_id}.html"
+                        debug_path.write_text(str(html_debug), encoding="utf-8")
+                except Exception:
+                    pass
+                if last_state == "missing-tab":
+                    raise RuntimeError(f"Nao foi possivel localizar a aba {tab_id} no portal Azulzinha/Caixa.")
+                if last_state == "missing-button":
+                    raise RuntimeError(f"Nao foi possivel localizar o botao da aba {tab_id} no portal Azulzinha/Caixa.")
+                raise RuntimeError(f"Nao foi possivel abrir a aba {tab_id} no portal Azulzinha/Caixa.")
+
+            async def wait_for_tab_content(session_id: str, tab_id: str, timeout: float = 45.0) -> None:
+                content_id = f"{tab_id}Content"
+                await wait_for_condition(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const content = document.querySelector("#{content_id} [role='tabpanel']");
+                        if (!content || content.getAttribute('aria-hidden') !== 'false') return false;
+                        const body = content.innerText || content.textContent || '';
+                        const html = content.innerHTML || '';
+                        return body.trim().length > 40 || html.includes('data-testid') || html.includes('Exportar') || html.includes('Filtro');
+                    }})()
+                    """,
+                    timeout=timeout,
+                    step=0.5,
+                )
+
+            async def focus_selector(session_id: str, selector: str) -> bool:
+                return bool(
+                    await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                            const el = document.querySelector({selector!r});
+                            if (!el) return false;
+                            el.focus();
+                            if ('value' in el) el.value = '';
+                            return true;
+                        }})()
+                        """,
+                    )
+                )
+
+            async def insert_text(session_id: str, selector: str, text: str) -> None:
+                if not await focus_selector(session_id, selector):
+                    raise RuntimeError(f"Nao foi possivel localizar o campo {selector} na Azulzinha/Caixa.")
+                for char in str(text or ""):
+                    await cdp("Input.insertText", {"text": char}, session_id=session_id)
+                    await asyncio.sleep(0.04)
+                await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const el = document.querySelector({selector!r});
+                        if (!el) return false;
+                        el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: '0' }}));
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return true;
+                    }})()
+                    """,
+                )
+
+            async def press_tab(session_id: str) -> None:
+                await cdp(
+                    "Input.dispatchKeyEvent",
+                    {"type": "keyDown", "windowsVirtualKeyCode": 9, "nativeVirtualKeyCode": 9, "key": "Tab", "code": "Tab"},
+                    session_id=session_id,
+                )
+                await cdp(
+                    "Input.dispatchKeyEvent",
+                    {"type": "keyUp", "windowsVirtualKeyCode": 9, "nativeVirtualKeyCode": 9, "key": "Tab", "code": "Tab"},
+                    session_id=session_id,
+                )
+
+            async def click_selector_native(session_id: str, selector: str) -> bool:
+                rect = await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const el = document.querySelector({selector!r});
+                        if (!el) return null;
+                        const r = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        if (r.width <= 0 || r.height <= 0 || style.visibility === 'hidden' || style.display === 'none') return null;
+                        return {{
+                            x: r.left + (r.width / 2),
+                            y: r.top + (r.height / 2),
+                        }};
+                    }})()
+                    """,
+                )
+                if not rect:
+                    return False
+                await cdp(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mousePressed", "x": rect["x"], "y": rect["y"], "button": "left", "clickCount": 1},
+                    session_id=session_id,
+                )
+                await cdp(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left", "clickCount": 1},
+                    session_id=session_id,
+                )
+                return True
+
+            async def set_date_inputs(session_id: str) -> None:
+                ok = await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const value = {data_br!r};
+                        const isoValue = value.split('/').reverse().join('-');
+                        const digits = value.replace(/\\D/g, '');
+                        const setNativeValue = (el, val) => {{
+                            const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                            if (setter) setter.call(el, val); else el.value = val;
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                        }};
+                        const inputs = [...document.querySelectorAll('input')]
+                            .filter((el) => {{
+                                const type = (el.type || '').toLowerCase();
+                                const name = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+                                return type !== 'hidden' && !el.disabled && (
+                                    type === 'date' || name.includes('data') || name.includes('periodo') || /\\d{{2}}\\/\\d{{2}}\\/\\d{{4}}/.test(el.value || '')
+                                );
+                            }});
+                        if (!inputs.length) return false;
+                        const flatpickrInput = document.querySelector('input[id$="InputPicker"]');
+                        if (flatpickrInput && flatpickrInput._flatpickr) {{
+                            try {{
+                                flatpickrInput._flatpickr.setDate([isoValue, isoValue], true, 'Y-m-d');
+                            }} catch (_err) {{}}
+                        }}
+                        for (const input of inputs.slice(0, 2)) {{
+                            input.focus();
+                            setNativeValue(input, (input.type || '').toLowerCase() === 'date' ? isoValue : digits);
+                            setNativeValue(input, (input.type || '').toLowerCase() === 'date' ? isoValue : value);
+                        }}
+                        return true;
+                    }})()
+                    """,
+                )
+                if not ok:
+                    ok = await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                            const value = {data_br!r};
+                            const visible = (el) => {{
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            }};
+                            const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                            const clickable = [...document.querySelectorAll('input, button, a, [role="button"], div, span')]
+                                .filter(visible)
+                                .find((el) => {{
+                                    const text = norm(el.innerText || el.textContent || el.placeholder || el.getAttribute('aria-label') || '');
+                                    const id = norm(el.id || '');
+                                    return text.includes('DATA') || text.includes('PERIODO') || id.includes('DATA') || id.includes('PERIODO');
+                                }});
+                            if (!clickable) return false;
+                            clickable.click();
+                            const candidates = [...document.querySelectorAll('input')]
+                                .filter((el) => visible(el) && (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                            const target = candidates.find((el) => {{
+                                const meta = norm((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || ''));
+                                return meta.includes('DATA') || meta.includes('PERIODO');
+                            }}) || candidates[0];
+                            if (!target) return false;
+                            const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                            const finalValue = (target.type || '').toLowerCase() === 'date' ? value.split('/').reverse().join('-') : value;
+                            target.focus();
+                            if (setter) setter.call(target, finalValue); else target.value = finalValue;
+                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                            return true;
+                        }})()
+                        """,
+                    )
+                if not ok:
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = Path(_runtime_user_dir()) / "azulzinha_pix_date_debug.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    raise RuntimeError("Nao foi possivel preencher a data no portal Azulzinha/Caixa.")
+                await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const visible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const button = document.querySelector('[data-testid="generic-calendar-button-aplicar"]');
+                        if (!button || !visible(button)) return false;
+                        button.scrollIntoView({ block: 'center', inline: 'center' });
+                        button.click();
+                        return true;
+                    })()
+                    """,
+                )
+                try:
+                    await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const wrapper = document.querySelector('[data-testid="calendar-main-div"]')?.closest('[aria-hidden]');
+                            return !wrapper || wrapper.getAttribute('aria-hidden') === 'true';
+                        })()
+                        """,
+                        timeout=15.0,
+                        step=0.25,
+                    )
+                except Exception:
+                    pass
+
+            async def wait_for_export_ready(session_id: str, kind: str, timeout: float = 60.0) -> None:
+                export_selector = '[data-testid="exportar-pix-van"]' if kind == "pix" else '[data-testid^="exportar-"]'
+                content_id = "PixContent" if kind == "pix" else "HistoricoVendasContent"
+                expression = f"""
+                (() => {{
+                    const content = document.querySelector("#{content_id} [role='tabpanel']");
+                    if (!content || content.getAttribute('aria-hidden') === 'true') return false;
+                    const exportBtn = document.querySelector({export_selector!r});
+                    if (!exportBtn) return false;
+                    return !exportBtn.disabled;
+                }})()
+                """
+                try:
+                    await wait_for_condition(
+                        session_id,
+                        expression,
+                        timeout=timeout,
+                        step=0.5,
+                    )
+                except Exception:
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = Path(_runtime_user_dir()) / f"azulzinha_export_ready_debug_{kind}.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    try:
+                        state_debug = await eval_js(
+                            session_id,
+                            f"""
+                            (() => {{
+                                const content = document.querySelector("#{content_id} [role='tabpanel']");
+                                const exportBtn = document.querySelector({export_selector!r});
+                                const placeholderNodes = content ? [...content.querySelectorAll('.ph-item, .ph-picture, .ph-picture-small')] : [];
+                                return {{
+                                    contentFound: !!content,
+                                    contentHidden: content ? content.getAttribute('aria-hidden') : null,
+                                    exportFound: !!exportBtn,
+                                    exportDisabled: exportBtn ? !!exportBtn.disabled : null,
+                                    exportText: exportBtn ? (exportBtn.innerText || exportBtn.textContent || '').trim() : '',
+                                    placeholderCount: placeholderNodes.length,
+                                    visibleButtons: [...document.querySelectorAll('button, a, [role="button"]')].map((el) => {{
+                                        const rect = el.getBoundingClientRect();
+                                        const style = getComputedStyle(el);
+                                        return {{
+                                            text: (el.innerText || el.textContent || '').trim(),
+                                            testid: el.getAttribute('data-testid') || '',
+                                            disabled: !!el.disabled,
+                                            visible: rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none',
+                                        }};
+                                    }}).filter((item) => item.visible),
+                                }};
+                            }})()
+                            """,
+                            timeout=15.0,
+                        )
+                        if state_debug is not None:
+                            debug_state_path = Path(_runtime_user_dir()) / f"azulzinha_export_ready_state_{kind}.json"
+                            debug_state_path.write_text(json.dumps(state_debug, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                    raise
+
+            async def click_export(session_id: str, kind: str) -> None:
+                await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        if (window.__codexExportHookInstalled) {
+                            if (window.__codexExportSignals) {
+                                window.__codexExportSignals.openedUrls = [];
+                                window.__codexExportSignals.anchorUrls = [];
+                                window.__codexExportSignals.iframeUrls = [];
+                                window.__codexExportSignals.lastUrl = '';
+                            }
+                            return true;
+                        }
+                        const data = window.__codexExportSignals = {
+                            openedUrls: [],
+                            anchorUrls: [],
+                            iframeUrls: [],
+                            lastUrl: '',
+                        };
+                        const pushUrl = (value) => {
+                            const text = String(value || '').trim();
+                            if (!text) return;
+                            data.lastUrl = text;
+                            if (/^https?:/i.test(text) || text.startsWith('/')) {
+                                data.openedUrls.push(text);
+                            }
+                        };
+                        const originalOpen = window.open;
+                        window.open = function(url, ...args) {
+                            pushUrl(url);
+                            return originalOpen ? originalOpen.call(this, url, ...args) : null;
+                        };
+                        const anchorClick = HTMLAnchorElement.prototype.click;
+                        HTMLAnchorElement.prototype.click = function(...args) {
+                            pushUrl(this.href || this.getAttribute('href') || '');
+                            return anchorClick.apply(this, args);
+                        };
+                        const observer = new MutationObserver(() => {
+                            document.querySelectorAll('iframe, embed, object, a[href], a[download]').forEach((el) => {
+                                const url = el.src || el.data || el.href || el.getAttribute('href') || '';
+                                if (!url) return;
+                                if (el.tagName === 'A') data.anchorUrls.push(url);
+                                else data.iframeUrls.push(url);
+                                data.lastUrl = String(url);
+                            });
+                        });
+                        observer.observe(document.documentElement || document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data', 'href'] });
+                        window.__codexExportHookInstalled = true;
+                        return true;
+                    })()
+                    """,
+                )
+                await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                        const visible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const buttons = [...document.querySelectorAll('button, a, [role="button"], div.btn')].filter(visible);
+                        const applyButton = buttons.find((el) => {
+                            const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                            return text.includes('MOSTRAR RESULTADOS') || text === 'APLICAR';
+                        });
+                        if (!applyButton) return false;
+                        applyButton.scrollIntoView({ block: 'center', inline: 'center' });
+                        applyButton.click();
+                        return true;
+                    })()
+                    """,
+                )
+                try:
+                    await wait_for_export_ready(session_id, kind, timeout=45.0)
+                except Exception:
+                    pass
+                direct_selectors = (
+                    ['button[data-testid="exportar-pix-van"]', '[data-testid="exportar-pix-van"]']
+                    if kind == "pix"
+                    else [
+                        'button[data-testid="exportar-historicovendas"]',
+                        '[data-testid="exportar-historicovendas"]',
+                        'button[data-testid^="exportar-"]',
+                        '[data-testid^="exportar-"]',
+                    ]
+                )
+                for selector in direct_selectors:
+                    if await click_selector_native(session_id, selector):
+                        if kind == "pix":
+                            try:
+                                await wait_for_condition(
+                                    session_id,
+                                    """
+                                    (() => {
+                                        const text = (document.body?.innerText || '')
+                                            .normalize('NFD')
+                                            .replace(/[\\u0300-\\u036f]/g, '')
+                                            .toUpperCase();
+                                        return text.includes('ESCOLHA COMO DESEJA EXPORTAR O RELATORIO') ||
+                                            !!document.querySelector('[data-testid="pix-van-gerar-arquivo"]');
+                                    })()
+                                    """,
+                                    timeout=8.0,
+                                    step=0.25,
+                                )
+                                await eval_js(
+                                    session_id,
+                                    """
+                                    (() => {
+                                        const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                                        const visible = (el) => {
+                                            const rect = el.getBoundingClientRect();
+                                            const style = getComputedStyle(el);
+                                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                        };
+                                        const all = [...document.querySelectorAll('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span')].filter(visible);
+                                        const openSelector = all.find((el) => {
+                                            const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                                            return text.includes('TIPO DE ARQUIVO') || text === 'EXCEL' || text.includes('FORMATO');
+                                        });
+                                        (openSelector?.closest('button, a, [role="button"], label, div, span') || openSelector)?.click();
+                                        return true;
+                                    })()
+                                    """,
+                                )
+                                await asyncio.sleep(0.5)
+                                await eval_js(
+                                    session_id,
+                                    """
+                                    (() => {
+                                        const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                                        const visible = (el) => {
+                                            const rect = el.getBoundingClientRect();
+                                            const style = getComputedStyle(el);
+                                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                        };
+                                        const csvNode = [...document.querySelectorAll('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span, input')]
+                                            .filter(visible)
+                                            .find((el) => {
+                                                const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('value') || '');
+                                                const attrs = norm(`${el.id || ''} ${el.name || ''} ${el.value || ''}`);
+                                                return text === 'CSV' || text.includes(' CSV') || attrs.includes('CSV');
+                                            });
+                                        const target = csvNode?.closest('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span') || csvNode;
+                                        target?.click();
+                                        if (csvNode && csvNode.tagName === 'INPUT') {
+                                            csvNode.checked = true;
+                                            csvNode.dispatchEvent(new Event('input', { bubbles: true }));
+                                            csvNode.dispatchEvent(new Event('change', { bubbles: true }));
+                                        }
+                                        return !!target;
+                                    })()
+                                    """,
+                                )
+                                await asyncio.sleep(0.6)
+                                if await click_selector_native(session_id, '[data-testid="pix-van-gerar-arquivo"]'):
+                                    await asyncio.sleep(1.0)
+                                    return
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1.0)
+                            return
+                        else:
+                            try:
+                                await wait_for_condition(
+                                    session_id,
+                                    """
+                                    (() => {
+                                        const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                                        const visible = (el) => {
+                                            const rect = el.getBoundingClientRect();
+                                            const style = getComputedStyle(el);
+                                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                        };
+                                        const text = norm(document.body?.innerText || '');
+                                        if (text.includes('ESCOLHA COMO DESEJA EXPORTAR')) return true;
+                                        return [...document.querySelectorAll('button, a, [role="button"]')]
+                                            .filter(visible)
+                                            .some((el) => {
+                                                const value = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.title || '');
+                                                return value.includes('PDF') || value.includes('GERAR ARQUIVO') || value.includes('BAIXAR ARQUIVO');
+                                            });
+                                    })()
+                                    """,
+                                    timeout=6.0,
+                                    step=0.25,
+                                )
+                                await asyncio.sleep(0.5)
+                                await eval_js(
+                                    session_id,
+                                    """
+                                    (() => {
+                                        const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                                        const visible = (el) => {
+                                            const rect = el.getBoundingClientRect();
+                                            const style = getComputedStyle(el);
+                                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                        };
+                                        const clickBest = (targets) => {
+                                            const nodes = [...document.querySelectorAll('button, a, [role="button"], label, div, span')].filter(visible);
+                                            for (const target of targets) {
+                                                const node = nodes.find((el) => norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '').includes(target));
+                                                if (node) {
+                                                    (node.closest('button, a, [role="button"], label, div') || node).click();
+                                                    return true;
+                                                }
+                                            }
+                                            return false;
+                                        };
+                                        return (
+                                            clickBest(['PDF']) ||
+                                            clickBest(['EXCEL', 'XLSX', 'PLANILHA']) ||
+                                            false
+                                        );
+                                    })()
+                                    """,
+                                )
+                                await asyncio.sleep(0.7)
+                                if not await click_selector_native(session_id, '[data-testid*="gerar-arquivo"]'):
+                                    if not await click_selector_native(session_id, '[data-testid*="baixar-arquivo"]'):
+                                        if not await click_selector_native(session_id, '[data-testid*="download"]'):
+                                            await click_by_text(session_id, ["Gerar arquivo", "Baixar arquivo", "Download"], timeout=4.0)
+                                await asyncio.sleep(1.0)
+                                return
+                            except Exception:
+                                try:
+                                    html_debug = await eval_js(
+                                        session_id,
+                                        "document.documentElement ? document.documentElement.outerHTML : ''",
+                                        timeout=15.0,
+                                    )
+                                    if html_debug:
+                                        debug_path = Path(_runtime_user_dir()) / "azulzinha_export_popup_cartoes.html"
+                                        debug_path.write_text(str(html_debug), encoding="utf-8")
+                                except Exception:
+                                    pass
+                                continue
+                clicked = await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                        const visible = (el) => {{
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const wantCsv = {kind == 'pix'};
+                        const directSelectors = wantCsv
+                            ? ['button[data-testid="exportar-pix-van"]', '[data-testid="exportar-pix-van"]']
+                            : ['button[data-testid^="exportar-"]', '[data-testid^="exportar-"]'];
+                        const explicit = directSelectors
+                            .map((selector) => document.querySelector(selector))
+                            .find((el) => el && !el.disabled);
+                        if (explicit) {{
+                            explicit.scrollIntoView({{ block: 'center', inline: 'center' }});
+                            explicit.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
+                            explicit.click();
+                            explicit.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
+                            return true;
+                        }}
+                        const buttons = [...document.querySelectorAll('button, a, [role="button"]')].filter(visible);
+                        const preferred = buttons.find((el) => {{
+                            const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('mattooltip') || el.title || '');
+                            return !el.disabled && (text.includes('EXPORTAR') || text.includes('IMPRIMIR') || text.includes(wantCsv ? 'CSV' : 'PDF'));
+                        }}) || buttons.find((el) => {{
+                            const text = norm(el.getAttribute('aria-label') || el.getAttribute('mattooltip') || el.title || '');
+                            return !el.disabled && (wantCsv ? text.includes('CSV') || text.includes('DATABASE') : text.includes('PDF') || text.includes('DOWNLOAD'));
+                        }});
+                        if (!preferred) return false;
+                        preferred.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        preferred.click();
+                        return true;
+                    }})()
+                    """,
+                )
+                if not clicked:
+                    try:
+                        state_debug = await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const items = [...document.querySelectorAll('button, a, [role="button"]')].map((el) => {
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return {
+                                        tag: el.tagName,
+                                        text: (el.innerText || el.textContent || '').trim(),
+                                        testid: el.getAttribute('data-testid') || '',
+                                        disabled: !!el.disabled,
+                                        ariaLabel: el.getAttribute('aria-label') || '',
+                                        title: el.title || '',
+                                        visible: rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none',
+                                        width: rect.width,
+                                        height: rect.height,
+                                    };
+                                });
+                                return items.filter((item) =>
+                                    (item.testid || '').toLowerCase().includes('export') ||
+                                    (item.text || '').toUpperCase().includes('EXPORT') ||
+                                    (item.text || '').toUpperCase().includes('CSV') ||
+                                    (item.text || '').toUpperCase().includes('PDF')
+                                );
+                            })()
+                            """,
+                            timeout=15.0,
+                        )
+                        if state_debug is not None:
+                            debug_state_path = Path(_runtime_user_dir()) / f"azulzinha_export_state_{kind}.json"
+                            debug_state_path.write_text(json.dumps(state_debug, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = Path(_runtime_user_dir()) / f"azulzinha_export_debug_{kind}.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    raise RuntimeError("Nao foi possivel acionar o botao de exportacao no portal Azulzinha/Caixa.")
+
+            async def ensure_login(session_id: str) -> None:
+                _emit_pix_status(on_status, "Acessando Azulzinha/Caixa...")
+                await navigate(session_id, credenciais["login_url"])
+                if await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const hasSalesTabs = Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                        return location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs;
+                    })()
+                    """,
+                ):
+                    return
+                _emit_pix_status(on_status, "Autenticando na Azulzinha/Caixa...")
+                await wait_for_condition(
+                    session_id,
+                    "Boolean(document.querySelector('#b2-b1-b4-InputMask') && document.querySelector('#b2-b1-Input_Password'))",
+                    timeout=60.0,
+                )
+                await insert_text(session_id, "#b2-b1-b4-InputMask", re.sub(r"\D", "", str(credenciais["cnpj"] or "")))
+                await insert_text(session_id, "#b2-b1-Input_Password", str(credenciais["password"] or ""))
+                await press_tab(session_id)
+                await wait_for_condition(
+                    session_id,
+                    """
+                    (() => {
+                        const botao = document.querySelector('#b2-b1-confirmar');
+                        return botao && !botao.disabled;
+                    })()
+                    """,
+                    timeout=20.0,
+                )
+                clicou = await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const botao = document.querySelector('#b2-b1-confirmar');
+                        if (!botao || botao.disabled) return false;
+                        botao.click();
+                        return true;
+                    })()
+                    """,
+                )
+                if not clicou:
+                    raise RuntimeError("Nao foi possivel confirmar o login da Azulzinha/Caixa.")
+
+                state = await wait_for_condition(
+                    session_id,
+                    """
+                    (() => {
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const hasSalesTabs = Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                        if (location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs) return 'logged';
+                        if (text.includes('SELECIONE O DISPOSITIVO')) return 'device';
+                        if (text.includes('TOKEN') || text.includes('CODIGO') || text.includes('E-MAIL') || text.includes('EMAIL')) return 'token';
+                        return '';
+                    })()
+                    """,
+                    timeout=90.0,
+                    description="A Caixa nao concluiu a etapa inicial do login",
+                )
+                if state == "logged":
+                    return
+                if state == "device":
+                    _emit_pix_status(on_status, "Selecionando dispositivo da Caixa...")
+                    if not await click_card_by_text(session_id, _azulzinha_device_aliases(company_label), timeout=30.0):
+                        raise RuntimeError(f"Nao foi possivel selecionar o dispositivo da {company_label} na Azulzinha/Caixa.")
+                    state = await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const text = (document.body?.innerText || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const hasSalesTabs = Boolean(
+                                document.querySelector('header[role="tablist"]') ||
+                                document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                                document.querySelector('#Pix button[role="tab"]')
+                            );
+                            if (location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs) return 'logged';
+                            if (text.includes('INFORME O TOKEN DO APLICATIVO')) return 'token_app';
+                            if (text.includes('ESCOLHA POR ONDE DESEJA RECEBER')) return 'token_delivery';
+                            if (text.includes('TOKEN') || text.includes('CODIGO') || text.includes('E-MAIL') || text.includes('EMAIL')) return 'token';
+                            return '';
+                        })()
+                        """,
+                        timeout=45.0,
+                        description="A Caixa nao avancou apos a selecao do dispositivo",
+                    )
+                if state == "logged":
+                    return
+
+                _emit_pix_status(on_status, "Solicitando token por e-mail...")
+                token_requested_at = time.time()
+                if state in {"token", "token_app"}:
+                    abriu = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const link = document.querySelector('a.bold.font-universe.cor-preto');
+                            if (!link) return false;
+                            link.click();
+                            return true;
+                        })()
+                        """,
+                    )
+                    if not abriu and not await click_by_text(
+                        session_id,
+                        [
+                            "Receber codigo por e-mail ou SMS",
+                            "Receber c??digo por e-mail ou SMS",
+                            "Receber código por e-mail ou SMS",
+                        ],
+                        timeout=20.0,
+                    ):
+                        raise RuntimeError("Nao foi possivel abrir a escolha de envio do token na Azulzinha/Caixa.")
+                    state = await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const text = (document.body?.innerText || '').toUpperCase();
+                            if (text.includes('ESCOLHA POR ONDE DESEJA RECEBER')) return 'token_delivery';
+                            if (text.includes('RECEBER POR E-MAIL') || text.includes('@GMAIL.COM')) return 'token_delivery';
+                            return '';
+                        })()
+                        """,
+                        timeout=30.0,
+                    )
+                    await asyncio.sleep(1.0)
+                if state == "token_delivery":
+                    selecionou_email = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                            const visible = (el) => {
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const candidates = [...document.querySelectorAll('[id$="-Content"], .card-content, .ph.card.card-content')]
+                                .filter(visible)
+                                .map((el) => {
+                                    const text = norm(el.innerText || el.textContent || '');
+                                    if (!text.includes('RECEBER POR E-MAIL') && !text.includes('@GMAIL.COM')) return null;
+                                    const className = (el.className || '').toString().toUpperCase();
+                                    const isCard = className.includes('CARD-CONTENT') || className.includes('PH CARD');
+                                    const textLength = text.length || 9999;
+                                    return { el, score: (isCard ? 1000 : 0) - textLength };
+                                })
+                                .filter(Boolean)
+                                .sort((a, b) => b.score - a.score);
+                            const match = candidates.length ? candidates[0].el : null;
+                            if (!match) return false;
+                            const text = norm(match.innerText || match.textContent || '');
+                            if (!text.includes('RECEBER POR E-MAIL') && !text.includes('@GMAIL.COM')) return false;
+                            const clickable = match.closest('[id$="-Content"], .card-content, .ph.card.card-content') || match;
+                            clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                            clickable.click();
+                            return true;
+                        })()
+                        """,
+                    )
+                    if not selecionou_email and not await click_card_by_text(session_id, ["RECEBER POR E-MAIL", "@GMAIL.COM"], timeout=20.0):
+                        if not await click_by_text(session_id, ["Receber por e-mail", "@gmail.com"], timeout=20.0):
+                            raise RuntimeError("Nao foi possivel selecionar o envio do token por e-mail na Azulzinha/Caixa.")
+                    await asyncio.sleep(1.0)
+                    await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const text = (document.body?.innerText || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const inputs = [...document.querySelectorAll('input')].filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                            return inputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'));
+                        })()
+                        """,
+                        timeout=30.0,
+                    )
+                await wait_for_condition(
+                    session_id,
+                    """
+                    (() => {
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const inputs = [...document.querySelectorAll('input')].filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                        return location.href.includes('/Home') || location.href.includes('/MinhasVendas') || inputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'));
+                    })()
+                    """,
+                    timeout=60.0,
+                )
+                if await eval_js(session_id, "location.href.includes('/Home') || location.href.includes('/MinhasVendas')"):
+                    return
+                ultimo_token_usado = ""
+                tokens_descartados: set[str] = set()
+                for tentativa_token in range(3):
+                    if tentativa_token > 0:
+                        espera_extra_apos_rejeicao = 20.0
+                        _emit_pix_status(
+                            on_status,
+                            f"Token rejeitado pela Caixa; descartando o codigo anterior e aguardando {int(espera_extra_apos_rejeicao)}s por um novo e-mail...",
+                        )
+                        await asyncio.sleep(espera_extra_apos_rejeicao)
+                    inicio_busca_token = token_requested_at
+                    espera_token = 180.0 if tentativa_token == 0 else 150.0
+                    token = str(
+                        await asyncio.to_thread(
+                            _fetch_fiserv_token_from_gmail,
+                            inicio_busca_token,
+                            espera_token,
+                            on_status,
+                            tokens_descartados,
+                            tentativa_token == 0,
+                        )
+                        or ""
+                    ).strip()
+                    if (not token or token == ultimo_token_usado or token in tokens_descartados) and callable(token_callback):
+                        token = str(token_callback("Informe o token enviado por e-mail pela Azulzinha/Caixa") or "").strip()
+                    if token in tokens_descartados:
+                        _emit_pix_status(on_status, "O token informado ja foi rejeitado anteriormente pela Caixa.")
+                        token = ""
+                    if not token:
+                        if tentativa_token >= 2:
+                            raise RuntimeError("Nao foi possivel obter um token novo enviado por e-mail pela Caixa.")
+                        _emit_pix_status(on_status, "Ainda nao chegou um token novo da Caixa; aguardando mais um pouco antes da proxima tentativa.")
+                        continue
+
+                    ultimo_token_usado = token
+                    _emit_pix_status(on_status, "Confirmando token da Caixa...")
+                    confirmed = False
+                    token_inputs = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            return [...document.querySelectorAll('input')]
+                                .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled)
+                                .map((el) => ({
+                                    selector: el.id ? `#${el.id}` : '',
+                                    maxLength: Number(el.maxLength || 0),
+                                }));
+                        })()
+                        """,
+                    ) or []
+                    token_selectors = [
+                        str(item.get("selector") or "").strip()
+                        for item in token_inputs
+                        if str(item.get("selector") or "").strip()
+                    ]
+                    token_digitos = list(str(token))
+                    if token_selectors and len(token_selectors) > 1 and len(token_digitos) >= len(token_selectors):
+                        for idx, selector in enumerate(token_selectors):
+                            if not await focus_selector(session_id, selector):
+                                continue
+                            await eval_js(
+                                session_id,
+                                f"""
+                                (() => {{
+                                    const el = document.querySelector({selector!r});
+                                    if (!el) return false;
+                                    el.value = '';
+                                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                    return true;
+                                }})()
+                                """,
+                            )
+                            await cdp("Input.insertText", {"text": token_digitos[idx]}, session_id=session_id)
+                            await asyncio.sleep(0.08)
+                        confirmed = True
+                    else:
+                        confirmed = await eval_js(
+                            session_id,
+                            f"""
+                            (() => {{
+                                const token = {token!r};
+                                const setNativeValue = (el, value) => {{
+                                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                                    if (setter) setter.call(el, value); else el.value = value;
+                                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                                }};
+                                const inputs = [...document.querySelectorAll('input')].filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                                if (inputs.length) {{
+                                    setNativeValue(inputs[inputs.length - 1], '');
+                                    setNativeValue(inputs[inputs.length - 1], token);
+                                    return true;
+                                }}
+                                return false;
+                            }})()
+                            """,
+                        )
+                    if not confirmed:
+                        raise RuntimeError("Nao foi possivel preencher o token da Azulzinha/Caixa.")
+                    await asyncio.sleep(0.4)
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const buttons = [...document.querySelectorAll('button, input[type="submit"], a')];
+                            const button = buttons.find((el) => /CONFIRMAR|VALIDAR|ENTRAR|CONTINUAR/i.test(el.innerText || el.value || '')) || buttons[0];
+                            button?.click();
+                            return true;
+                        })()
+                        """,
+                    )
+
+                    _emit_pix_status(on_status, "Aguardando a Caixa validar o token...")
+                    resultado_token = await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const text = (document.body?.innerText || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const hasSalesTabs = Boolean(
+                                document.querySelector('header[role="tablist"]') ||
+                                document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                                document.querySelector('#Pix button[role="tab"]')
+                            );
+                            if (location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs) return 'logged';
+                            if (
+                                text.includes('CODIGO INVALIDO') ||
+                                text.includes('TOKEN INVALIDO') ||
+                                text.includes('TOKEN EXPIRADO') ||
+                                text.includes('TENTATIVAS')
+                            ) return 'invalid';
+                            return '';
+                        })()
+                        """,
+                        timeout=45.0,
+                        description="A Caixa nao concluiu a validacao do token",
+                    )
+                    if resultado_token == "logged":
+                        break
+                    if tentativa_token >= 2:
+                        raise RuntimeError("O token informado pela Caixa nao foi aceito apos multiplas tentativas.")
+                    tokens_descartados.add(token)
+                    _emit_pix_status(on_status, "Token rejeitado pela Caixa; o codigo usado foi descartado e a busca vai aguardar um e-mail novo.")
+                await wait_for_condition(
+                    session_id,
+                    """
+                    (() => {
+                        const hasSalesTabs = Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                        return location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs;
+                    })()
+                    """,
+                    timeout=90.0,
+                    description="A Caixa nao abriu a area de vendas apos validar o token",
+                )
+
+            async def download_report(session_id: str, kind: str) -> str | None:
+                await navigate(session_id, credenciais["sales_url"])
+                await wait_for_condition(session_id, "document.body && document.body.innerText.length > 20", timeout=60.0)
+                await wait_for_condition(
+                    session_id,
+                    """
+                    (() => {
+                        return Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                    })()
+                    """,
+                    timeout=60.0,
+                    step=0.5,
+                )
+                if kind == "cartoes":
+                    _emit_pix_status(on_status, "Baixando relatorio de cartoes da Caixa...")
+                    await activate_sales_tab(session_id, "HistoricoVendas", timeout=35.0)
+                    await wait_for_tab_content(session_id, "HistoricoVendas", timeout=45.0)
+                else:
+                    _emit_pix_status(on_status, "Baixando relatorio PIX da Caixa...")
+                    await activate_sales_tab(session_id, "Pix", timeout=35.0)
+                    await wait_for_tab_content(session_id, "Pix", timeout=45.0)
+                await asyncio.sleep(1.0)
+                _emit_pix_status(on_status, f"Aplicando filtro de data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                await set_date_inputs(session_id)
+                _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                await wait_for_export_ready(session_id, kind, timeout=60.0)
+                started_at = _download_start_time()
+                event_start_index = len(event_log)
+                _emit_pix_status(on_status, f"Solicitando arquivo de {'cartoes' if kind == 'cartoes' else 'PIX'} para a Caixa...")
+                await click_export(session_id, "pix" if kind == "pix" else "cartoes")
+                captured = await wait_for_captured_report(session_id, kind, event_start_index, timeout=35.0)
+                if captured:
+                    _emit_pix_status(on_status, f"Relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} recebido e validado.")
+                    return captured
+                _emit_pix_status(on_status, f"Aguardando o download final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                return _persist_downloaded_report(
+                    _wait_for_downloaded_report(download_dir, data_br, kind, started_at, timeout=100.0),
+                    kind,
+                )
+
+            try:
+                target_id = (await cdp("Target.createTarget", {"url": "about:blank"})).get("targetId")
+                if not target_id:
+                    raise RuntimeError("Nao foi possivel abrir a aba oculta da Azulzinha/Caixa.")
+                await _hide_chromium_window(cdp, target_id)
+                session_id = (await cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True})).get("sessionId")
+                if not session_id:
+                    raise RuntimeError("Nao foi possivel anexar a aba oculta da Azulzinha/Caixa.")
+                await cdp("Page.enable", session_id=session_id)
+                await cdp("Runtime.enable", session_id=session_id)
+                try:
+                    await cdp("Network.enable", {}, session_id=session_id)
+                except Exception:
+                    pass
+                try:
+                    await cdp("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": download_dir, "eventsEnabled": True})
+                except Exception:
+                    pass
+                try:
+                    await cdp(
+                        "Page.setDownloadBehavior",
+                        {"behavior": "allow", "downloadPath": download_dir},
+                        session_id=session_id,
+                    )
+                except Exception:
+                    pass
+                await ensure_login(session_id)
+                await _hide_chromium_window(cdp, target_id)
+                resultado = {"pix": None, "cartoes": None, "avisos": []}
+                if need_cartoes:
+                    resultado["cartoes"] = await download_report(session_id, "cartoes")
+                    if not resultado["cartoes"]:
+                        resultado["avisos"].append("Nao foi possivel baixar o relatorio de cartoes da Azulzinha/Caixa.")
+                if need_pix:
+                    resultado["pix"] = await download_report(session_id, "pix")
+                    if not resultado["pix"]:
+                        resultado["avisos"].append("Nao foi possivel baixar o relatorio PIX da Azulzinha/Caixa.")
+                return resultado
+            finally:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except BaseException:
+                    pass
+
+    _emit_pix_status(on_status, "Abrindo portal da Caixa...")
+    proc = _launch_browser_process(chrome_args)
+    try:
+        return asyncio.run(asyncio.wait_for(_run(), timeout=300.0))
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _cleanup_azulzinha_debug_artifacts()
 
 
 def _build_pix_report_from_caixa_pdf(caminho_pdf: str, data_br: str) -> dict:
@@ -928,9 +3910,9 @@ def _build_pix_report_from_caixa_pdf(caminho_pdf: str, data_br: str) -> dict:
         "origem": "caixa_pix_pdf",
         "mensagem": None if itens else "Nenhuma transação PIX recebida encontrada no relatório local para este dia.",
         "itens_todos": itens_todos,
-        "tab_title": "PIX CAIXA",
+        "tab_title": "PIX",
         "menu_text": "Abrir PIX CAIXA",
-        "summary_label": "PIX CAIXA",
+        "summary_label": "PIX",
         "total_label": "Total PIX CAIXA",
         "section_label": "Transações PIX recebidas na CAIXA",
         "empty_message": "Nenhuma transação PIX recebida encontrada para este dia.",
@@ -1004,9 +3986,9 @@ def _build_pix_report_from_caixa_csv(caminho_csv: str, data_br: str) -> dict:
         "origem": "caixa_pix_csv",
         "mensagem": None if itens else "Nenhuma transação PIX recebida encontrada no relatório local para este dia.",
         "itens_todos": itens_todos,
-        "tab_title": "PIX CAIXA",
+        "tab_title": "PIX",
         "menu_text": "Abrir PIX CAIXA",
-        "summary_label": "PIX CAIXA",
+        "summary_label": "PIX",
         "total_label": "Total PIX CAIXA",
         "section_label": "Transações PIX recebidas na CAIXA",
         "empty_message": "Nenhuma transação PIX recebida encontrada para este dia.",
@@ -1014,6 +3996,107 @@ def _build_pix_report_from_caixa_csv(caminho_csv: str, data_br: str) -> dict:
         "table_mode": "data_valor",
         "categoria": "pix_caixa",
     }
+
+
+def _build_pix_report_from_caixa_xlsx(caminho_xlsx: str, data_br: str) -> dict:
+    itens = []
+    itens_todos = []
+    for row in _collect_card_rows_from_caixa_xlsx(caminho_xlsx):
+        normalized_row = {_normalize_ascii_text(key): str(value or "").strip() for key, value in row.items()}
+        data_raw = normalized_row.get("data da venda", "")
+        valor_raw = normalized_row.get("valor bruto", "")
+        situacao_raw = str(normalized_row.get("status", "")).upper()
+        codigo_raw = normalized_row.get("cod. de autorizacao", "")
+        if not data_raw or not valor_raw:
+            continue
+        match = re.match(
+            r"^(\d{2}/\d{2}/\d{4})\s+(?:as|às)\s+(\d{2}:\d{2})(?::(\d{2}))?$",
+            _normalize_ascii_text(data_raw),
+        )
+        if not match:
+            continue
+        data_venda = match.group(1)
+        if data_venda != data_br:
+            continue
+        hora = f"{match.group(2)}:{match.group(3) or '00'}"
+        item = {
+            "data_venda": f"{data_venda} às {hora[:5]}",
+            "ordem": datetime.strptime(f"{data_venda} {hora}", "%d/%m/%Y %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S"),
+            "tipo_pix": "RECEBIDO",
+            "situacao": situacao_raw,
+            "nome": str(codigo_raw or "").strip(),
+            "valor_bruto": round(parse_number(valor_raw), 2),
+        }
+        itens_todos.append(item)
+        if _normalize_ascii_text(item["situacao"]) in {
+            _normalize_ascii_text("APROVADA"),
+            _normalize_ascii_text("AUTORIZADA"),
+            _normalize_ascii_text("EFETIVADO"),
+        }:
+            itens.append(
+                {
+                    "data_venda": item["data_venda"],
+                    "ordem": item["ordem"],
+                    "tipo_pix": item["tipo_pix"],
+                    "situacao": item["situacao"],
+                    "nome": item["nome"],
+                    "valor_bruto": item["valor_bruto"],
+                }
+            )
+
+    itens.sort(key=lambda item: item.get("ordem", ""))
+    total = round(sum(float(item.get("valor_bruto", 0.0)) for item in itens), 2)
+    periodo = f"{data_br} - {data_br}"
+    return {
+        "arquivo": os.path.basename(caminho_xlsx),
+        "caminho": caminho_xlsx,
+        "periodo": periodo,
+        "quantidade_autorizados": len(itens),
+        "total_autorizado": total,
+        "itens_autorizados": itens,
+        "quantidade_relatorio": len(itens),
+        "total_relatorio": total,
+        "consistente": True,
+        "origem": "caixa_pix_xlsx",
+        "mensagem": None if itens else "Nenhuma transação PIX recebida encontrada no relatório local para este dia.",
+        "itens_todos": itens_todos,
+        "tab_title": "PIX",
+        "menu_text": "Abrir PIX CAIXA",
+        "summary_label": "PIX",
+        "total_label": "Total PIX CAIXA",
+        "section_label": "Transações PIX recebidas na CAIXA",
+        "empty_message": "Nenhuma transação PIX recebida encontrada para este dia.",
+        "table_headers": ("Data da venda", "Valor bruto"),
+        "table_mode": "data_valor",
+        "categoria": "pix_caixa",
+    }
+
+
+def _convert_pix_xlsx_to_csv(caminho_xlsx: str) -> str | None:
+    try:
+        rows = _collect_card_rows_from_caixa_xlsx(caminho_xlsx)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    csv_path = str(Path(caminho_xlsx).with_suffix(".csv"))
+    ordered_headers = [
+        "Data da venda",
+        "Cód. de autorização",
+        "Valor bruto",
+        "Terminal",
+        "Número do estabelecimento",
+        "Status",
+    ]
+    try:
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=ordered_headers, delimiter=";")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({header: str(row.get(header, "") or "").strip() for header in ordered_headers})
+        return csv_path
+    except Exception:
+        return None
 
 
 def _build_card_reports_from_caixa_pdf(caminho_pdf: str, data_br: str) -> dict[str, dict]:
@@ -1102,6 +4185,152 @@ def _build_card_reports_from_caixa_pdf(caminho_pdf: str, data_br: str) -> dict[s
         }
 
     return reports
+
+
+def _collect_card_rows_from_caixa_xlsx(caminho_xlsx: str) -> list[dict[str, str]]:
+    import pandas as pd
+
+    rows_out: list[dict[str, str]] = []
+    try:
+        xls = pd.ExcelFile(caminho_xlsx)
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
+            for _, row in df.iterrows():
+                rows_out.append({str(key or ""): str(value or "").strip() for key, value in row.items()})
+        if rows_out:
+            return rows_out
+    except Exception:
+        pass
+
+    for _sheet_name, rows in _read_xlsx_rows_fallback(caminho_xlsx):
+        if not rows:
+            continue
+        headers: list[str] = []
+        header_idx = -1
+        for idx, row in enumerate(rows):
+            normalized = [_normalize_ascii_text(cell) for cell in row]
+            if "data da venda" in normalized and "valor bruto" in normalized and "status" in normalized:
+                headers = [str(cell or "").strip() for cell in row]
+                header_idx = idx
+                break
+        if header_idx < 0 or not headers:
+            continue
+        for row in rows[header_idx + 1 :]:
+            if not any(str(value or "").strip() for value in row):
+                continue
+            row_map = {
+                headers[idx]: str(row[idx] or "").strip()
+                for idx in range(min(len(headers), len(row)))
+                if str(headers[idx] or "").strip()
+            }
+            if any(str(value or "").strip() for value in row_map.values()):
+                rows_out.append(row_map)
+    return rows_out
+
+
+def _build_card_reports_from_caixa_xlsx(caminho_xlsx: str, data_br: str) -> dict[str, dict]:
+    import pandas as pd
+
+    sheet_rows = _collect_card_rows_from_caixa_xlsx(caminho_xlsx)
+    buckets = {
+        "cartao_credito_caixa": [],
+        "cartao_debito_caixa": [],
+    }
+
+    for row in sheet_rows:
+        normalized_row = {_normalize_ascii_text(key): str(value or "").strip() for key, value in row.items()}
+        data_raw = normalized_row.get("data da venda", "")
+        valor_raw = normalized_row.get("valor bruto", "")
+        status_raw = normalized_row.get("status", "")
+        produto_raw = normalized_row.get("produto", "")
+        numero_raw = normalized_row.get("cod. de autorizacao", "") or normalized_row.get("comprovante de venda", "")
+        if not data_raw or not valor_raw:
+            continue
+        match = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(?:as|a?s)\s+(\d{2}:\d{2})(?::(\d{2}))?$", _normalize_ascii_text(data_raw))
+        if not match:
+            match = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})(?::(\d{2}))?$", _normalize_ascii_text(data_raw))
+        if not match:
+            continue
+        data_venda = match.group(1)
+        if data_venda != data_br:
+            continue
+        if _normalize_ascii_text(status_raw) not in {
+            _normalize_ascii_text("Aprovada"),
+            _normalize_ascii_text("Autorizada"),
+        }:
+            continue
+        produto_norm = _normalize_ascii_text(produto_raw)
+        if "debito" in produto_norm:
+            key = "cartao_debito_caixa"
+        elif "credito" in produto_norm or "parcelado" in produto_norm:
+            key = "cartao_credito_caixa"
+        else:
+            continue
+        hora = f"{match.group(2)}:{match.group(3) or '00'}"
+        numero = str(numero_raw or "").strip()
+        buckets[key].append(
+            {
+                    "numero": numero,
+                    "numero_exibicao": numero.lstrip("0") or numero or "-",
+                    "data_venda": f"{data_venda} às {hora[:5]}",
+                    "valor_bruto": round(parse_number(valor_raw), 2),
+            }
+        )
+
+    reports: dict[str, dict] = {}
+    periodo = f"{data_br} - {data_br}"
+    meta_by_key = {
+        "cartao_credito_caixa": {
+            "tab_title": "Cartão de Crédito CAIXA",
+            "menu_text": "Abrir cartão de crédito CAIXA",
+            "summary_label": "Cartão de crédito CAIXA",
+            "total_label": "Total cartão de crédito CAIXA",
+            "section_label": "Transações em cartão de crédito na CAIXA",
+            "empty_message": "Nenhuma transação em cartão de crédito da CAIXA encontrada para este dia.",
+        },
+        "cartao_debito_caixa": {
+            "tab_title": "Cartão de Débito CAIXA",
+            "menu_text": "Abrir cartão de débito CAIXA",
+            "summary_label": "Cartão de débito CAIXA",
+            "total_label": "Total cartão de débito CAIXA",
+            "section_label": "Transações em cartão de débito na CAIXA",
+            "empty_message": "Nenhuma transação em cartão de débito da CAIXA encontrada para este dia.",
+        },
+    }
+    for key, itens in buckets.items():
+        itens.sort(key=lambda item: (item.get("data_venda", ""), item.get("numero", "")))
+        total = round(sum(float(item.get("valor_bruto", 0.0)) for item in itens), 2)
+        meta = meta_by_key[key]
+        reports[key] = {
+            "arquivo": os.path.basename(caminho_xlsx),
+            "caminho": caminho_xlsx,
+            "periodo": periodo,
+            "quantidade_autorizados": len(itens),
+            "total_autorizado": total,
+            "itens_autorizados": itens,
+            "quantidade_relatorio": len(itens),
+            "total_relatorio": total,
+            "consistente": True,
+            "origem": "caixa_cartoes_xlsx",
+            "mensagem": None if itens else meta["empty_message"],
+            "categoria": key,
+            "tab_title": meta["tab_title"],
+            "menu_text": meta["menu_text"],
+            "summary_label": meta["summary_label"],
+            "total_label": meta["total_label"],
+            "section_label": meta["section_label"],
+            "empty_message": meta["empty_message"],
+            "table_headers": ("Comprovante", "Data", "Valor"),
+            "table_mode": "numero_data_valor",
+        }
+    return reports
+
+
+def _build_card_reports_from_caixa(caminho: str, data_br: str) -> dict[str, dict]:
+    suffix = Path(caminho).suffix.lower()
+    if suffix == ".xlsx":
+        return _build_card_reports_from_caixa_xlsx(caminho, data_br)
+    return _build_card_reports_from_caixa_pdf(caminho, data_br)
 
 
 def _build_generic_aux_report(
@@ -1241,6 +4470,7 @@ def _build_eh_alerts_report(
     pix_maquina_rows: list[tuple[str, str]] | None = None,
     cartao_fechamento_rows: list[tuple[str, str]] | None = None,
     cartao_maquina_rows: list[tuple[str, str]] | None = None,
+    allow_empty: bool = False,
 ) -> dict | None:
     pix_fechamento_rows = list(pix_fechamento_rows or [])
     pix_maquina_rows = list(pix_maquina_rows or [])
@@ -1259,7 +4489,7 @@ def _build_eh_alerts_report(
         + len(cartao_maquina_rows)
         + len(observacao_rows)
     )
-    if total_rows <= 0:
+    if total_rows <= 0 and not allow_empty:
         return None
 
     table_rows: list[tuple[str, ...]] = []
@@ -1277,7 +4507,10 @@ def _build_eh_alerts_report(
 
     total = 0.0
     for collection in (pix_fechamento_rows, pix_maquina_rows, cartao_fechamento_rows, cartao_maquina_rows):
-        for _desc, valor in collection:
+        for row in collection:
+            if not row:
+                continue
+            valor = row[-1]
             total += parse_number(valor)
 
     report = _build_generic_aux_report(
@@ -1312,6 +4545,7 @@ def _build_eh_card_mismatch_report(
         return None
 
     def _tipo_curto(titulo: str) -> str:
+        titulo = corrigir_texto(titulo)
         titulo_norm = _normalize_caixa_client(titulo)
         if "CREDITO" in titulo_norm:
             return "Crédito"
@@ -1565,6 +4799,273 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
         "nfces_faltantes_sequencia": _find_missing_fiscal_numbers([item["numero"] for item in itens_nfce]),
         "fiscal_status_map": {},
     }
+
+
+def _is_mva_clipp_fechamento_text(texto: str) -> bool:
+    texto_normalizado = _normalize_caixa_client(texto)
+    return (
+        "FECHAMENTO DE CAIXA" in texto_normalizado
+        and "DOCUMENTOS GERADOS" in texto_normalizado
+        and "PAGAMENTO INSTANTANEO" in texto_normalizado
+        and "MVA COMERCIO" in texto_normalizado
+    )
+
+
+def analisar_pdf_fechamento_caixa_mva_clipp(
+    caminho_pdf: str,
+    *,
+    company: str = "MVA",
+    avisos_usuario: list[str] | None = None,
+    auto_download_missing: bool = False,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+    token_callback=None,
+) -> dict:
+    texto = _read_pdf_text(caminho_pdf)
+    if not _is_mva_clipp_fechamento_text(texto):
+        return {
+            "arquivo": os.path.basename(caminho_pdf),
+            "arquivo_tipo": "mva_desconhecido",
+            "resumo_modelo": "MVA",
+            "periodo": None,
+            "quantidade_nfce": 0,
+            "total_nfce": 0.0,
+            "relatorios_pagamento": {},
+            "nfces": [],
+            "nfces_faltantes_sequencia": [],
+            "fiscal_status_map": {},
+        }
+
+    linhas_brutas = [corrigir_texto(linha.strip()) for linha in texto.splitlines()]
+    linhas: list[str] = []
+    for linha in linhas_brutas:
+        if not linha:
+            continue
+        linha_normalizada = _normalize_caixa_client(linha)
+        if linha.lower().startswith("file:///"):
+            continue
+        if linha_normalizada == "(PIX)":
+            continue
+        if re.fullmatch(r"\d{2}/\d{2}/\d{2},\s+\d{2}:\d{2}\s+clipp_exportado\.htm", linha, re.IGNORECASE):
+            continue
+        linhas.append(linha)
+
+    periodo = None
+    match_periodo = re.search(
+        r"PER[IÍ]ODO ANALISADO,\s*DE\s*(\d{2}/\d{2}/\d{4})\s*AT[ÉE]\s*(\d{2}/\d{2}/\d{4})",
+        _normalize_caixa_client(texto),
+    )
+    if match_periodo:
+        periodo = f"{match_periodo.group(1)} - {match_periodo.group(2)}"
+    data_base = _extract_period_range(periodo or "")[0] or ""
+
+    payment_aliases = [
+        ("Pagamento Instantâneo (PIX)", ("PAGAMENTO INSTANTANEO (PIX)", "PAGAMENTO INSTANTANEO")),
+        ("Cartão de Crédito", ("CARTAO DE CREDITO",)),
+        ("Cartão de Débito", ("CARTAO DE DEBITO",)),
+        ("Dinheiro", ("DINHEIRO",)),
+    ]
+
+    totais_pagamento: dict[str, float] = {}
+    nfces_map: dict[str, dict] = {}
+    payment_buckets: dict[str, dict] = {}
+
+    for linha in linhas:
+        linha_normalizada = _normalize_caixa_client(linha)
+        total_match = re.match(
+            r"^(DINHEIRO|CARTAO DE CREDITO|CARTAO DE DEBITO|PAGAMENTO INSTANTANEO(?: \(PIX\))?)\s*:?\s*([-\d\.,]+)$",
+            linha_normalizada,
+        )
+        if total_match:
+            label_ascii = total_match.group(1)
+            valor = round(parse_number(total_match.group(2)), 2)
+            canonical_label = next(
+                (
+                    display
+                    for display, aliases in payment_aliases
+                    if any(alias == label_ascii for alias in aliases)
+                ),
+                None,
+            )
+            if canonical_label:
+                totais_pagamento[canonical_label] = valor
+            continue
+
+        doc_match = re.match(r"^(?P<numero>\d{6,})\s+NFCE\s+(?P<hora>\d{2}:\d{2}:\d{2})\s+(?P<resto>.+)$", linha_normalizada)
+        if not doc_match:
+            continue
+
+        numero = _normalize_fiscal_number(doc_match.group("numero"))
+        hora = doc_match.group("hora")
+        resto_original = linha[doc_match.end("hora"):].strip()
+        valor_match = re.search(r"([-\d\.,]+)\s*$", resto_original)
+        if not valor_match:
+            continue
+        valor = round(parse_number(valor_match.group(1)), 2)
+        corpo_original = resto_original[: valor_match.start()].strip()
+        corpo_normalizado = _normalize_caixa_client(corpo_original)
+
+        forma_pagamento = ""
+        idx_forma = -1
+        for display_label, aliases in payment_aliases:
+            for alias in aliases:
+                current_idx = corpo_normalizado.rfind(alias)
+                if current_idx > idx_forma:
+                    idx_forma = current_idx
+                    forma_pagamento = display_label
+
+        cliente = corpo_original
+        if idx_forma >= 0 and forma_pagamento:
+            forma_ascii = _normalize_caixa_client(forma_pagamento)
+            idx_original = _normalize_caixa_client(corpo_original).rfind(forma_ascii)
+            if idx_original >= 0:
+                cliente = corpo_original[:idx_original].strip()
+            else:
+                cliente = corpo_original
+
+        data_venda = f"{data_base} {hora}".strip() if data_base else hora
+        existente = nfces_map.get(numero)
+        if existente is None:
+            nfces_map[numero] = {
+                "numero": numero,
+                "numero_exibicao": _display_fiscal_number(numero),
+                "descricao": forma_pagamento or "NFC-e",
+                "data_venda": data_venda,
+                "cliente": cliente,
+                "valor": valor,
+            }
+        else:
+            existente["valor"] = round(float(existente.get("valor", 0.0)) + valor, 2)
+            if forma_pagamento and forma_pagamento not in str(existente.get("descricao") or ""):
+                existente["descricao"] = f"{existente['descricao']} + {forma_pagamento}"
+
+        if not forma_pagamento:
+            continue
+        meta_pagamento = _build_zweb_payment_report_meta(forma_pagamento)
+        if not meta_pagamento:
+            continue
+        bucket = payment_buckets.setdefault(
+            meta_pagamento["key"],
+            {
+                **meta_pagamento,
+                "itens": [],
+            },
+        )
+        bucket["itens"].append(
+            {
+                "numero": numero,
+                "numero_exibicao": _display_fiscal_number(numero),
+                "data_venda": data_venda,
+                "valor_bruto": valor,
+            }
+        )
+
+    itens_nfce = sorted(nfces_map.values(), key=lambda item: item["numero"])
+    total_nfce = round(sum(float(item.get("valor", 0.0)) for item in itens_nfce), 2)
+
+    relatorios_pagamento = {}
+    for key, bucket in payment_buckets.items():
+        itens = sorted(
+            bucket.get("itens", []),
+            key=lambda item: (str(item.get("data_venda") or ""), str(item.get("numero") or "")),
+        )
+        total_itens = round(sum(float(item.get("valor_bruto", 0.0)) for item in itens), 2)
+        total_reportado = round(float(totais_pagamento.get(bucket["forma_pagamento"], total_itens)), 2)
+        relatorios_pagamento[key] = {
+            "arquivo": os.path.basename(caminho_pdf),
+            "caminho": caminho_pdf,
+            "periodo": periodo,
+            "quantidade_autorizados": len(itens),
+            "total_autorizado": total_reportado,
+            "itens_autorizados": itens,
+            "quantidade_relatorio": len(itens),
+            "total_relatorio": total_reportado,
+            "consistente": abs(total_itens - total_reportado) < 0.01,
+            "origem": "clipp_fechamento_caixa_mva",
+            "mensagem": None if itens else bucket.get("empty_message"),
+            "categoria": key,
+            "tab_title": bucket.get("tab_title"),
+            "menu_text": bucket.get("menu_text"),
+            "summary_label": bucket.get("summary_label"),
+            "total_label": bucket.get("total_label"),
+            "section_label": bucket.get("section_label"),
+            "empty_message": bucket.get("empty_message"),
+            "table_headers": ("NFC-e", "Data", "Valor"),
+            "table_mode": "numero_data_valor",
+        }
+
+    report = {
+        "arquivo": os.path.basename(caminho_pdf),
+        "arquivo_tipo": "fechamento_caixa_clipp_mva",
+        "arquivo_resumo_titulo": "Arquivo Fechamento",
+        "total_resumo_titulo": "Total Fechamento de caixa",
+        "subtitle": "Compara os DAVs finalizados com o fechamento do Clipp e cruza as formas de pagamento com os relatórios da Caixa.",
+        "resumo_modelo": "MVA",
+        "periodo": periodo,
+        "quantidade_nfce": len(itens_nfce),
+        "total_nfce": total_nfce,
+        "total_geral": total_nfce,
+        "totalizadores": totais_pagamento,
+        "relatorios_pagamento": relatorios_pagamento,
+        "nfces": itens_nfce,
+        "nfces_faltantes_sequencia": _find_missing_fiscal_numbers([item["numero"] for item in itens_nfce]),
+        "fiscal_status_map": {},
+    }
+    data_br = _extract_period_range(periodo or "")[0]
+    avisos = list(avisos_usuario or [])
+    if data_br and auto_download_missing:
+        local_payment_reports = _find_eh_local_payment_reports(data_br, company=company)
+        need_pix = not bool(local_payment_reports.get("pix"))
+        need_cartoes = not bool(local_payment_reports.get("cartoes"))
+        if need_pix or need_cartoes:
+            try:
+                baixados = baixar_relatorios_caixa_eh_azulzinha(
+                    data_br,
+                    on_status=on_status,
+                    cancel_event=cancel_event,
+                    token_callback=token_callback,
+                    need_pix=need_pix,
+                    need_cartoes=need_cartoes,
+                    company=company,
+                )
+                avisos.extend(list(baixados.get("avisos") or []))
+            except Exception as exc:
+                if str(exc).strip() == "__cancelled__":
+                    raise
+                avisos.append(f"Nao foi possivel baixar automaticamente os relatorios da Caixa da {company}: {exc}")
+    if data_br:
+        report, _relatorio_pix, _avisos = _integrate_local_payment_reports(
+            report,
+            data_br,
+            avisos_usuario=avisos,
+            company=company,
+        )
+    return report
+
+
+def gerar_relatorios_caixa_eh_manuais(
+    data_br: str,
+    caminho_pedidos_html: str,
+    caminho_fechamento_html: str,
+) -> tuple[dict, dict, dict | None]:
+    texto_pedidos = _read_text_file(caminho_pedidos_html)
+    texto_fechamento = _read_text_file(caminho_fechamento_html)
+
+    relatorio = _analisar_html_pedidos_importados_eh(
+        texto_pedidos,
+        arquivo=os.path.basename(caminho_pedidos_html),
+    )
+    relatorio_fechamento = _analisar_html_fechamento_caixa_eh(
+        texto_fechamento,
+        arquivo=os.path.basename(caminho_fechamento_html),
+    )
+    relatorio_fechamento["fiscal_status_map"] = {}
+    relatorio = _aplicar_filtro_canceladas_pedidos_eh(relatorio, {})
+    relatorio_fechamento, relatorio_pix, _avisos = _integrate_local_payment_reports(
+        relatorio_fechamento,
+        data_br,
+    )
+    return relatorio, relatorio_fechamento, relatorio_pix
 
 
 
@@ -1840,11 +5341,7 @@ def _period_from_br_dates(datas: list[str]) -> str | None:
 
 
 def _runtime_user_dir() -> str:
-    import sys
-
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return _project_base_dir()
 
 
 def _zweb_browser_profile_dir() -> str:
@@ -1859,22 +5356,7 @@ def _zweb_browser_profile_dir() -> str:
 
 
 def _load_zweb_credentials() -> dict | None:
-    username = str(ZWEB_USERNAME or "").strip()
-    password = str(ZWEB_PASSWORD or "").strip()
-    base_url = str(ZWEB_BASE_URL or "").strip().rstrip("/")
-    if username and password and base_url.startswith("http"):
-        return {
-            "username": username,
-            "password": password,
-            "base_url": base_url,
-            "sign_in_url": f"{base_url}/#/sign-in",
-            "dashboard_url": f"{base_url}/#/dashboard",
-            "finance_movimentations_url": f"{base_url}/#/finance/movimentations",
-            "finance_reports_url": f"{base_url}/#/finance/reports",
-            "document_reports_url": f"{base_url}/#/document/reports",
-        }
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = _runtime_user_dir()
     for filename in ("credenciais.txt", "credencias.txt"):
         caminho = os.path.join(base_dir, filename)
         if not os.path.isfile(caminho):
@@ -1911,6 +5393,21 @@ def _load_zweb_credentials() -> dict | None:
                 "finance_reports_url": f"{base_url}/#/finance/reports",
                 "document_reports_url": f"{base_url}/#/document/reports",
             }
+
+    username = str(ZWEB_USERNAME or "").strip()
+    password = str(ZWEB_PASSWORD or "").strip()
+    base_url = str(ZWEB_BASE_URL or "").strip().rstrip("/")
+    if username and password and base_url.startswith("http"):
+        return {
+            "username": username,
+            "password": password,
+            "base_url": base_url,
+            "sign_in_url": f"{base_url}/#/sign-in",
+            "dashboard_url": f"{base_url}/#/dashboard",
+            "finance_movimentations_url": f"{base_url}/#/finance/movimentations",
+            "finance_reports_url": f"{base_url}/#/finance/reports",
+            "document_reports_url": f"{base_url}/#/document/reports",
+        }
     return None
 
 
@@ -1942,7 +5439,7 @@ def _pick_free_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_devtools_ready(port: int, timeout: float = 30.0) -> dict:
+def _wait_for_devtools_ready(port: int, timeout: float = 60.0) -> dict:
     import urllib.request
     import urllib.error
     deadline = time.time() + timeout
@@ -1950,12 +5447,12 @@ def _wait_for_devtools_ready(port: int, timeout: float = 30.0) -> dict:
 
     while time.time() < deadline:
         try:
-            resposta = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+            resposta = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=3)
             resposta.raise_for_status()
             return resposta.json() or {}
         except Exception as exc:
             last_exc = exc
-            time.sleep(0.4)
+            time.sleep(1.0)
 
     raise RuntimeError(f"Não foi possível iniciar o Chromium para gerar o relatório PIX: {last_exc}")
 
@@ -1971,6 +5468,26 @@ def _emit_pix_status(on_status, message: str) -> None:
 def _prepare_chromium_profile(profile_dir: str, download_dir: str) -> None:
     default_dir = os.path.join(profile_dir, "Default")
     os.makedirs(default_dir, exist_ok=True)
+
+    for lock_name in (
+        "SingletonCookie",
+        "SingletonLock",
+        "SingletonSocket",
+        "DevToolsActivePort",
+        "lockfile",
+    ):
+        lock_path = os.path.join(profile_dir, lock_name)
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
+        default_lock_path = os.path.join(default_dir, lock_name)
+        try:
+            if os.path.exists(default_lock_path):
+                os.remove(default_lock_path)
+        except OSError:
+            pass
 
     prefs_path = os.path.join(default_dir, "Preferences")
     prefs = {
@@ -2006,13 +5523,58 @@ def _launch_browser_process(chrome_args: list[str]) -> subprocess.Popen:
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        popen_kwargs["startupinfo"] = startupinfo
     return subprocess.Popen(chrome_args, **popen_kwargs)
+
+
+async def _hide_chromium_window(cdp, target_id: str) -> None:
+    """Move/minimize the Chromium window so login automation stays less visible."""
+    if not target_id:
+        return
+    try:
+        window_info = await cdp("Browser.getWindowForTarget", {"targetId": target_id}, timeout=5.0)
+    except Exception:
+        return
+
+    window_id = window_info.get("windowId")
+    if not window_id:
+        return
+
+    try:
+        await cdp(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {
+                    "left": -32000,
+                    "top": 0,
+                    "width": 1400,
+                    "height": 900,
+                },
+            },
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+
+    try:
+        await cdp(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"state": "minimized"}},
+            timeout=5.0,
+        )
+    except Exception:
+        pass
 
 
 def gerar_relatorios_caixa_eh_zweb(
     data_br: str,
     on_status=None,
     cancel_event: threading.Event | None = None,
+    token_callback=None,
 ) -> tuple[dict, dict, dict]:
     cancel_event = cancel_event or threading.Event()
 
@@ -2032,7 +5594,27 @@ def gerar_relatorios_caixa_eh_zweb(
     local_payment_reports = _find_eh_local_payment_reports(data_br)
     local_pix_pdf = local_payment_reports.get("pix")
     local_card_pdf = local_payment_reports.get("cartoes")
-    avisos_usuario: list[str] = []
+    avisos_usuario: list[str] = list(local_payment_reports.get("avisos") or [])
+
+    if not local_pix_pdf or not local_card_pdf:
+        try:
+            baixados = baixar_relatorios_caixa_eh_azulzinha(
+                data_br,
+                on_status=on_status,
+                cancel_event=cancel_event,
+                token_callback=token_callback,
+                need_pix=not bool(local_pix_pdf),
+                need_cartoes=not bool(local_card_pdf),
+            )
+            if not local_pix_pdf and baixados.get("pix"):
+                local_pix_pdf = baixados.get("pix")
+            if not local_card_pdf and baixados.get("cartoes"):
+                local_card_pdf = baixados.get("cartoes")
+            avisos_usuario.extend(baixados.get("avisos") or [])
+        except Exception as exc:
+            if str(exc).strip() == "__cancelled__":
+                raise
+            avisos_usuario.append(f"Nao foi possivel baixar automaticamente os relatorios da Caixa: {exc}")
 
     navegador = _find_chromium_browser_path()
     if not navegador:
@@ -2654,7 +6236,7 @@ def gerar_relatorios_caixa_eh_zweb(
     if local_card_pdf:
         _emit_pix_status(on_status, "Lendo relatorio local de cartoes...")
         try:
-            relatorios_cartao = _build_card_reports_from_caixa_pdf(local_card_pdf, data_br)
+            relatorios_cartao = _build_card_reports_from_caixa(local_card_pdf, data_br)
             relatorios_validos = {
                 key: report for key, report in relatorios_cartao.items() if report.get("itens_autorizados")
             }
@@ -2674,6 +6256,8 @@ def gerar_relatorios_caixa_eh_zweb(
         try:
             if str(local_pix_pdf).lower().endswith(".csv"):
                 relatorio_pix = _build_pix_report_from_caixa_csv(local_pix_pdf, data_br)
+            elif str(local_pix_pdf).lower().endswith(".xlsx"):
+                relatorio_pix = _build_pix_report_from_caixa_xlsx(local_pix_pdf, data_br)
             else:
                 relatorio_pix = _build_pix_report_from_caixa_pdf(local_pix_pdf, data_br)
             if relatorio_pix.get("quantidade_autorizados", 0) <= 0:
@@ -2698,6 +6282,7 @@ def gerar_relatorios_caixa_eh_zweb(
         relatorio_fechamento.setdefault("relatorios_pagamento", {})
         relatorio_fechamento["relatorios_pagamento"][str(relatorio_pix.get("categoria") or "pagamentos_digitais_nfce")] = relatorio_pix
 
+    _cleanup_eh_auto_payment_reports(local_pix_pdf, local_card_pdf)
     return relatorio, relatorio_fechamento, relatorio_pix
 
 
@@ -2773,6 +6358,8 @@ def _build_pix_report_from_zweb_movimentations(data_iso: str, lancamentos: list[
         mensagem = f"Não foi possível consultar Financeiro > Movimentações no Zweb:\n{erro}"
     elif not itens_autorizados:
         mensagem = "Nenhum pagamento digital de NFC-e foi encontrado em Financeiro > Movimentações para este dia."
+    else:
+        mensagem = "Relatório da Caixa/Azulzinha não utilizado. Valores confirmados via Financeiro > Movimentações do Zweb."
 
     return {
         "arquivo": "Zweb Financeiro > Movimentações",
@@ -2786,6 +6373,7 @@ def _build_pix_report_from_zweb_movimentations(data_iso: str, lancamentos: list[
         "consistente": True,
         "origem": "zweb_movimentacoes",
         "mensagem": mensagem,
+        "origem_label": "Financeiro > Movimentações do Zweb",
         "tab_title": "Pagamentos Digitais",
         "menu_text": "Abrir pagamentos digitais",
         "summary_label": "Pagamentos digitais",
@@ -2804,7 +6392,7 @@ def _load_minhas_notas_credentials() -> tuple[str, str] | None:
     if login and password:
         return login, password
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = _runtime_user_dir()
     for filename in ("credenciais.txt", "credencias.txt"):
         caminho = os.path.join(base_dir, filename)
         if not os.path.isfile(caminho):
@@ -3183,50 +6771,71 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             _money_text(valor),
         )
 
+    correlacao_rows = []
+
+    dinheiro_total = round(float(dinheiro_report.get("total_autorizado", 0.0) or 0.0), 2)
+    correlacao_rows.append(
+        (
+            "Dinheiro",
+            f"R$ {format_number_br(dinheiro_total)}",
+            "-",
+            "Interno",
+        )
+    )
+
     comparacoes = [
         (
-            "PIX CAIXA",
+            "PIX",
             relatorios_pagamento.get("pix_caixa") or relatorios_pagamento.get("pagamentos_digitais_nfce"),
             relatorios_pagamento.get("pix_fechamento"),
             "valor_bruto",
         ),
         (
-            "Cartão de Crédito CAIXA",
+            "Cart\u00e3o Cr\u00e9dito",
             relatorios_pagamento.get("cartao_credito_caixa"),
             relatorios_pagamento.get("cartao_credito"),
             "valor_bruto",
         ),
         (
-            "Cartão de Débito CAIXA",
+            "Cart\u00e3o D\u00e9bito",
             relatorios_pagamento.get("cartao_debito_caixa"),
             relatorios_pagamento.get("cartao_debito"),
             "valor_bruto",
         ),
     ]
-    comparacoes_cartao = {"Cartão de Crédito CAIXA", "Cartão de Débito CAIXA"}
+    comparacoes_cartao = {"Cart\u00e3o Cr\u00e9dito", "Cart\u00e3o D\u00e9bito"}
 
 
     for titulo_pagamento, report_externo, report_fechamento, campo_valor in comparacoes:
         if not report_fechamento:
             continue
         itens_fechamento = list(report_fechamento.get("itens_autorizados") or [])
+        total_caixa_pagamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
+        total_pagamentos = round(float((report_externo or {}).get("total_autorizado", 0.0) or 0.0), 2)
+        origem_externa = str((report_externo or {}).get("origem") or "").strip()
+        usa_fallback_zweb = origem_externa == "zweb_movimentacoes"
+        status_correlacao = "Finalizado" if report_externo and abs(total_caixa_pagamento - total_pagamentos) < 0.01 else "Divergente"
+        if usa_fallback_zweb:
+            status_correlacao = f"{status_correlacao} (Financeiro Zweb)"
+        correlacao_rows.append(
+            (
+                titulo_pagamento,
+                f"R$ {format_number_br(total_caixa_pagamento)}",
+                f"R$ {format_number_br(total_pagamentos)}",
+                status_correlacao,
+            )
+        )
 
         if not report_externo:
-            _add_alert("Relatório ausente", f"{titulo_pagamento}: relatório local não encontrado na pasta raiz.", "-")
+            _add_alert("Relat?rio ausente", f"{titulo_pagamento}: relat?rio local n?o encontrado na pasta raiz.", "-")
             continue
-            alert_rows.append(("Relatório ausente", f"{titulo_pagamento}: relatório local não encontrado na pasta raiz.", "-"))
-            for item in itens_fechamento:
-                numero = _normalize_fiscal_number(item.get("numero", ""))
-                if numero and numero not in numeros_pedidos_pendentes:
-                    _add_registro(
-                        numero,
-                        item.get("numero_exibicao") or _display_fiscal_number(numero),
-                        item.get("valor_bruto"),
-                        "Fechamento",
-                        f"{titulo_pagamento} sem relatório local correspondente",
-                    )
-                    fechamento_only_total += round(float(item.get("valor_bruto", 0.0)), 2)
-            continue
+
+        if usa_fallback_zweb:
+            _add_alert(
+                "Origem alternativa",
+                f"{titulo_pagamento}: valor confirmado via Financeiro > Movimentações do Zweb, sem relatório da Caixa/Azulzinha.",
+                f"R$ {format_number_br(total_pagamentos)}",
+            )
 
         itens_externos = list(report_externo.get("itens_autorizados") or [])
         _matched, externos_sem_fechamento, fechamento_sem_externo = _multiset_match_by_value(
@@ -3244,7 +6853,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         for item in externos_restantes:
             valor = round(float(item.get(campo_valor, 0.0)), 2)
             detail = item.get("data_venda") or item.get("numero_exibicao") or item.get("numero") or "-"
-            if titulo_pagamento == "PIX CAIXA":
+            if titulo_pagamento == "PIX":
                 pix_machine_only.append(
                     {
                         "titulo": titulo_pagamento,
@@ -3262,7 +6871,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 )
             alert_rows.append(
                 (
-                    "Transação Bancária sem CF/NF",
+                    "Transa??o Banc?ria sem CF/NF",
                     f"{titulo_pagamento}: {detail}",
                     _money_text(valor),
                 )
@@ -3280,9 +6889,9 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 item.get("numero_exibicao") or _display_fiscal_number(numero),
                 valor,
                 "Fechamento",
-                f"{titulo_pagamento} sem pagamento correspondente na máquina",
+                f"{titulo_pagamento} sem pagamento correspondente na m?quina",
             )
-            if titulo_pagamento == "PIX CAIXA":
+            if titulo_pagamento == "PIX":
                 pix_fechamento_only.append(
                     {
                         "titulo": titulo_pagamento,
@@ -3300,7 +6909,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 )
             alert_rows.append(
                 (
-                    "CF sem Transação Bancária",
+                    "CF sem Transa??o Banc?ria",
                     f"{titulo_pagamento}: CF {item.get('numero_exibicao') or _display_fiscal_number(numero)}",
                     _money_text(valor),
                 )
@@ -3371,6 +6980,16 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         ],
     )
     if alertas_report:
+        alertas_report["hidden_in_menu"] = True
+        alertas_report["summary_items"] = [
+            ("Per?odo", str(relatorio_caixa.get("periodo") or "N?o identificado")),
+            ("Pend?ncias", str(len(alert_rows))),
+            ("Total Pend?ncias", f"R$ {format_number_br(valor_faltantes)}"),
+        ]
+        alertas_report["correlacao_rows"] = correlacao_rows
+        alertas_report["valor_total_vendas"] = total_caixa
+        alertas_report["valor_pendente"] = valor_faltantes
+        alertas_report["texto_informativo"] = ""
         relatorios_pagamento[alertas_report["categoria"]] = alertas_report
         for key in (
             "pix_caixa",
@@ -3386,6 +7005,8 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
     status = "Confere"
     if registros or any(row for row in alert_rows if row[0] not in {"Cupom cancelado"}):
         status = "Faltante"
+    if alertas_report:
+        alertas_report["status"] = status
 
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
 
@@ -3497,7 +7118,290 @@ def _infer_mva_davs_sem_cupom(itens_caixa: list[dict], itens_nfce: list[dict]) -
     return sorted(faltantes, key=lambda item: item.get("pedido", ""))
 
 
+def _build_mva_conferencia_observation_rows(registros: list[dict]) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for item in registros or []:
+        origem = _normalize_caixa_client(item.get("origem", ""))
+        numero_exibicao = str(item.get("numero_exibicao") or "-").strip()
+        observacao = str(item.get("observacao") or "").strip()
+        valor = item.get("valor")
+        valor_texto = "-" if valor in (None, "") else f"R$ {format_number_br(valor)}"
+        if origem == "DAV":
+            tipo = "DAV pendente"
+        elif origem == "CF":
+            tipo = "CF pendente"
+        else:
+            tipo = "Pendência"
+        detalhe = f"{numero_exibicao}: {observacao}" if observacao else numero_exibicao
+        rows.append((tipo, detalhe, valor_texto))
+    return rows
+
+
+def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relatorio_fechamento: dict) -> dict:
+    itens_caixa = relatorio_caixa.get("itens_caixa", [])
+    itens_nfce = relatorio_fechamento.get("nfces", [])
+    relatorios_pagamento = dict(relatorio_fechamento.get("relatorios_pagamento") or {})
+
+    davs_sem_cupom = _infer_mva_davs_sem_cupom(itens_caixa, itens_nfce)
+    cfs_faltantes = sorted(
+        {
+            _normalize_fiscal_number(numero)
+            for numero in relatorio_fechamento.get("nfces_faltantes_sequencia", [])
+            if _normalize_fiscal_number(numero)
+        },
+        key=int,
+    )
+
+    registros = []
+    for item in davs_sem_cupom:
+        pedido = re.sub(r"\D", "", str(item.get("pedido", "")))
+        registros.append(
+            {
+                "numero": pedido,
+                "numero_exibicao": f"DAV {_display_fiscal_number(pedido) if pedido else item.get('pedido', '-')}",
+                "origem": "DAV",
+                "observacao": "DAV sem cupom no fechamento",
+                "valor": round(float(item.get("valor", 0.0)), 2),
+            }
+        )
+    for numero in cfs_faltantes:
+        registros.append(
+            {
+                "numero": numero,
+                "numero_exibicao": f"CF {_display_fiscal_number(numero)}",
+                "origem": "CF",
+                "observacao": "Cupom faltante na sequência",
+                "valor": None,
+            }
+        )
+
+    correlacao_rows = []
+    pix_fechamento_only: list[dict] = []
+    pix_machine_only: list[dict] = []
+    card_fechamento_only: list[dict] = []
+    card_machine_only: list[dict] = []
+    alert_rows: list[tuple[str, str, str]] = _build_mva_conferencia_observation_rows(registros)
+
+    dinheiro_report = relatorios_pagamento.get("dinheiro") or {}
+    dinheiro_total = round(float(dinheiro_report.get("total_autorizado", 0.0) or 0.0), 2)
+    correlacao_rows.append(
+        (
+            "Dinheiro",
+            f"R$ {format_number_br(dinheiro_total)}",
+            "-",
+            "Interno",
+        )
+    )
+
+
+    comparacoes = [
+        (
+            "PIX",
+            relatorios_pagamento.get("pix_caixa"),
+            relatorios_pagamento.get("pix_fechamento"),
+        ),
+        (
+            "Cartão Crédito",
+            relatorios_pagamento.get("cartao_credito_caixa"),
+            relatorios_pagamento.get("cartao_credito"),
+        ),
+        (
+            "Cartão Débito",
+            relatorios_pagamento.get("cartao_debito_caixa"),
+            relatorios_pagamento.get("cartao_debito"),
+        ),
+    ]
+
+    for titulo_pagamento, report_externo, report_fechamento in comparacoes:
+        if not report_fechamento:
+            continue
+        itens_fechamento = list(report_fechamento.get("itens_autorizados") or [])
+        itens_externos = list((report_externo or {}).get("itens_autorizados") or [])
+        total_fechamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
+        total_externo = round(float((report_externo or {}).get("total_autorizado", 0.0) or 0.0), 2)
+        status_correlacao = "Finalizado" if report_externo and abs(total_fechamento - total_externo) < 0.01 else "Divergente"
+        correlacao_rows.append(
+            (
+                titulo_pagamento,
+                f"R$ {format_number_br(total_fechamento)}",
+                f"R$ {format_number_br(total_externo)}",
+                status_correlacao,
+            )
+        )
+
+        if not report_externo:
+            alert_rows.append(
+                (
+                    "Relatório ausente",
+                    f"{titulo_pagamento}: relatório local não encontrado na pasta raiz.",
+                    "-",
+                )
+            )
+            continue
+
+        _matched, externos_sem_fechamento, fechamento_sem_externo = _multiset_match_by_value(
+            itens_externos,
+            itens_fechamento,
+            campo_esquerda="valor_bruto",
+            campo_direita="valor_bruto",
+        )
+
+        for item in externos_sem_fechamento:
+            valor = round(float(item.get("valor_bruto", 0.0)), 2)
+            detalhe = item.get("data_venda") or item.get("numero_exibicao") or item.get("numero") or "-"
+            payload = {
+                "titulo": titulo_pagamento,
+                "data_venda": detalhe,
+                "valor": valor,
+            }
+            if titulo_pagamento == "PIX":
+                pix_machine_only.append(payload)
+            else:
+                card_machine_only.append(payload)
+
+        for item in fechamento_sem_externo:
+            valor = round(float(item.get("valor_bruto", 0.0)), 2)
+            payload = {
+                "titulo": titulo_pagamento,
+                "numero_exibicao": item.get("numero_exibicao") or _display_fiscal_number(item.get("numero", "")),
+                "valor": valor,
+            }
+            if titulo_pagamento == "PIX":
+                pix_fechamento_only.append(payload)
+            else:
+                card_fechamento_only.append(payload)
+
+    for item in pix_fechamento_only:
+        alert_rows.append(
+            (
+                "CF sem Transação Bancária",
+                f"PIX: CF {item.get('numero_exibicao') or '-'}",
+                f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+        )
+    for item in card_fechamento_only:
+        alert_rows.append(
+            (
+                "CF sem Transação Bancária",
+                f"{item.get('titulo')}: CF {item.get('numero_exibicao') or '-'}",
+                f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+        )
+    for item in pix_machine_only:
+        alert_rows.append(
+            (
+                "Transação Bancária sem CF/NF",
+                f"PIX: {item.get('data_venda') or '-'}",
+                f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+        )
+    for item in card_machine_only:
+        alert_rows.append(
+            (
+                "Transação Bancária sem CF/NF",
+                f"{item.get('titulo')}: {item.get('data_venda') or '-'}",
+                f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+        )
+
+    alertas_report = _build_eh_alerts_report(
+        relatorio_caixa.get("periodo"),
+        alert_rows,
+        pix_fechamento_rows=[
+            (f"CF {item.get('numero_exibicao') or '-'}", f"R$ {format_number_br(item.get('valor', 0.0))}")
+            for item in pix_fechamento_only
+        ],
+        pix_maquina_rows=[
+            ("PIX", str(item.get("data_venda") or "-"), f"R$ {format_number_br(item.get('valor', 0.0))}")
+            for item in pix_machine_only
+        ],
+        cartao_fechamento_rows=[
+            (f"{item.get('titulo')}: CF {item.get('numero_exibicao') or '-'}", f"R$ {format_number_br(item.get('valor', 0.0))}")
+            for item in card_fechamento_only
+        ],
+        cartao_maquina_rows=[
+            (str(item.get("titulo") or "Cartão"), str(item.get("data_venda") or "-"), f"R$ {format_number_br(item.get('valor', 0.0))}")
+            for item in card_machine_only
+        ],
+        allow_empty=True,
+    )
+
+    total_caixa = round(float(relatorio_caixa.get("total_caixa", 0.0)), 2)
+    total_resumo = round(float(relatorio_fechamento.get("total_nfce", 0.0)), 2)
+    valor_davs_pendentes = round(
+        sum(float(item.get("valor", 0.0)) for item in registros if item.get("valor") not in (None, "")),
+        2,
+    )
+    valor_banco_pendente = round(
+        sum(float(item.get("valor", 0.0)) for item in pix_fechamento_only + card_fechamento_only + pix_machine_only + card_machine_only),
+        2,
+    )
+    valor_faltantes = round(valor_davs_pendentes + valor_banco_pendente, 2)
+
+    if alertas_report:
+        alertas_report["hidden_in_menu"] = True
+        alertas_report["caixa_modelo"] = "MVA"
+        alertas_report["summary_items"] = [
+            ("Período", str(relatorio_caixa.get("periodo") or "Não identificado")),
+            ("Pendências", str(len(alert_rows))),
+            ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
+        ]
+        alertas_report["correlacao_rows"] = correlacao_rows
+        alertas_report["valor_total_vendas"] = total_caixa
+        alertas_report["valor_pendente"] = valor_faltantes
+        alertas_report["texto_informativo"] = ""
+        relatorios_pagamento[alertas_report["categoria"]] = alertas_report
+        for key in (
+            "pix_caixa",
+            "pix_fechamento",
+            "cartao_credito",
+            "cartao_debito",
+            "cartao_credito_caixa",
+            "cartao_debito_caixa",
+        ):
+            if relatorios_pagamento.get(key):
+                relatorios_pagamento[key]["hidden_in_menu"] = True
+
+    status = "Confere" if not registros and not alert_rows else "Faltante"
+    if alertas_report:
+        alertas_report["status"] = status
+
+    periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
+    return {
+        "fechamento_modelo": "MVA",
+        "caixa_modelo": "MVA",
+        "subtitle": relatorio_fechamento.get("subtitle"),
+        "arquivo_caixa": relatorio_caixa.get("arquivo"),
+        "arquivo_resumo": relatorio_fechamento.get("arquivo"),
+        "arquivo_resumo_titulo": relatorio_fechamento.get("arquivo_resumo_titulo") or "Arquivo Fechamento",
+        "periodo": periodo_unico or relatorio_caixa.get("periodo"),
+        "total_caixa": total_caixa,
+        "total_caixa_titulo": "Total DAVs finalizados",
+        "total_resumo_nfce": total_resumo,
+        "total_resumo_titulo": relatorio_fechamento.get("total_resumo_titulo") or "Total Fechamento de caixa",
+        "nfces_faltantes_count": len(registros),
+        "faltantes_titulo": "DAVs/CF faltantes",
+        "valor_faltantes": valor_faltantes,
+        "status": status,
+        "secao_titulo": "DAVs/CF para conferência",
+        "empty_message": "Nenhum DAV/CF faltante encontrado.",
+        "registros_conferencia": sorted(
+            registros,
+            key=lambda item: (
+                0 if item.get("origem") == "DAV" else 1,
+                int(item["numero"]) if item.get("numero") else 0,
+            ),
+        ),
+        "relatorios_pagamento": relatorios_pagamento,
+        "alertas_count": len(alert_rows),
+        "avisos_usuario": list(relatorio_fechamento.get("avisos_usuario") or []),
+    }
+
+
 def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict) -> dict:
+    if relatorio_nfce.get("arquivo_tipo") == "fechamento_caixa_clipp_mva":
+        return _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa, relatorio_nfce)
+
     itens_caixa = relatorio_caixa.get("itens_caixa", [])
     itens_nfce = relatorio_nfce.get("nfces", [])
     itens_cupom_base = [
@@ -3564,6 +7468,31 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
     elif erro_minhas_notas:
         subtitle += " Consulta ao Minhas Notas indisponivel nesta analise."
 
+    alert_rows = _build_mva_conferencia_observation_rows(registros)
+    if erro_minhas_notas:
+        alert_rows.append(("Minhas Notas", "Consulta indisponível nesta análise.", "-"))
+
+    relatorios_pagamento: dict[str, dict] = {}
+    alertas_report = _build_eh_alerts_report(
+        relatorio_caixa.get("periodo"),
+        alert_rows,
+        allow_empty=False,
+    )
+    if alertas_report:
+        alertas_report["hidden_in_menu"] = True
+        alertas_report["caixa_modelo"] = "MVA"
+        alertas_report["summary_items"] = [
+            ("Período", str(relatorio_caixa.get("periodo") or "Não identificado")),
+            ("Pendências", str(len(alert_rows))),
+            ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
+        ]
+        alertas_report["correlacao_rows"] = []
+        alertas_report["valor_total_vendas"] = total_caixa
+        alertas_report["valor_pendente"] = valor_faltantes
+        alertas_report["texto_informativo"] = ""
+        alertas_report["status"] = status
+        relatorios_pagamento[alertas_report["categoria"]] = alertas_report
+
     return {
         "fechamento_modelo": "MVA",
         "caixa_modelo": "MVA",
@@ -3594,6 +7523,7 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
                 int(item["numero"]) if item.get("numero") else 0,
             ),
         ),
+        "relatorios_pagamento": relatorios_pagamento,
         "nfes_identificadas": nfes_identificadas,
         "erro_minhas_notas": erro_minhas_notas,
     }
@@ -4707,11 +8637,11 @@ def analisar_SALES_PERIOD(caminho_pdf):
         return SALES_PERIOD
 
     except Exception as e:
-        print(f"Erro ao analisar perÃ­odo de vendas: {e}")
+        print(f"Erro ao analisar período de vendas: {e}")
         SALES_PERIOD = None
         return None
 
-# ----------------- ConexÃ£o com Supabase -----------------
+# ----------------- Conexão com Supabase -----------------
 
 from api_client import (
     get_supabase,
@@ -4724,5 +8654,5 @@ from api_client import (
 )
 
 
-# ImportaÃ§Ãµes delegadas ao pdf_parser
+# Importações delegadas ao pdf_parser
 from pdf_parser import (_get_pd, _get_pdfplumber, _inspect_pdf_text_layer, _pdf_sem_texto_message, _analisar_pdf_caixa_eh, _analisar_pdf_caixa_mva, analisar_pdf_caixa, _analisar_pdf_resumo_nfce_eh, _analisar_pdf_resumo_nfce_mva, analisar_pdf_resumo_nfce, source_pdf_async, adicionar_pdf, processar_pdf_sem_ui)

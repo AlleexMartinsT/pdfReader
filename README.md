@@ -4,44 +4,37 @@
 
 Desktop application for reconciling sales reports from two business flows:
 
-- `EH`: automatic Zweb-based cashier workflow
-- `MVA`: PDF-based workflow with `Minhas Notas` reconciliation
+- `EH`: automated cashier workflow with Zweb plus Caixa/Azulzinha payment reports.
+- `MVA`: PDF-based workflow with `Minhas Notas` reconciliation.
 
-### Current scope
+### Current Scope
 
-- Import commission PDFs and organize seller results.
-- Run `Caixa > EH` without manual PDF import for the core EH flow.
-- Fetch EH data from:
+- Imports commission PDFs and organizes seller results.
+- Runs `Caixa > EH` without manual import for the core Zweb reports.
+- Fetches EH data from:
   - `Zweb > Documentos > Relatórios > Pedidos importados`
   - `Zweb > Financeiro > Relatórios > Fechamento de caixa`
   - `Zweb > Fiscal > NFC-e`
-- Reconcile temporary local bank files placed beside the app:
-  - PIX report: CSV preferred, PDF supported
-  - Card report: PDF
-- Run `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
-- Export summary and reconciliation views to PDF.
-- Auto-update from GitHub releases using the ZIP asset.
-
-### EH workflow
-
-For `EH`, the app now:
-
-1. Loads imported orders from Zweb.
-2. Loads cashier closing from Zweb.
-3. Loads NFC-e fiscal status from Zweb.
-4. Matches imported orders with closing entries.
-5. Ignores cancelled fiscal documents when applicable.
-6. Reads local PIX and card reports from the app root only when they match the requested day.
-7. Builds a single `Conciliação Bancária` view for unresolved PIX/card differences.
-
-### MVA workflow
-
-For `MVA`, the app still uses:
-
-1. Imported DAV/order PDFs
-2. Imported coupon summary PDF
-3. Optional imported budget PDF
-4. `Minhas Notas` reconciliation for missing NF-e values
+- Uses Caixa/Azulzinha payment reports for EH reconciliation:
+  - The EH loading window now shows a real-time debug log for Gmail token capture and portal automation.
+  - Existing local PIX CSV/XLSX/PDF and card PDF/XLSX files are detected by content.
+  - If the Caixa PIX export arrives as XLSX, the app converts it to CSV automatically and continues the flow.
+  - If PIX or card files are missing, the app attempts to download them from the Caixa/Azulzinha portal.
+  - The Caixa/Azulzinha browser now starts minimized and off-screen so the login screen stays less visible during automation.
+  - Auto-downloaded EH PIX/card reports named with `_auto` are deleted after they are parsed, so temporary reports do not stay in the workspace.
+  - If the portal asks for a token, the app reads the latest code sent by `no-reply@fiserv.com` to the configured Gmail account.
+  - If Caixa/Azulzinha is unavailable and PIX is confirmed through `Financeiro > Movimentações` in Zweb, the report marks that fallback explicitly.
+  - If Caixa rejects the token as invalid, the app discards the code it just used and waits longer for a newer email before retrying.
+  - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.
+- Runs `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
+- MVA closing screens now mirror the EH sectioned `Fechamento de Caixa` structure in the app and in A4 printing, including the same reconciliation sections and observations block.
+- When MVA uses the newer Clipp closing file, the app now also attempts to auto-download missing Caixa/Azulzinha PIX and card reports with the local MVA credentials before reconciling payments.
+- Shows the EH `Fechamento de Caixa` with total-sales/pending text plus organized tables for PIX/card missing bank transactions and bank-only transactions without CF/NF.
+- Prints sectioned cashier reports through a printer selection dialog.
+- Keeps the `Dinheiro` row in value-correlation tables under the `Caixa` column, since it comes from the cashier closing instead of bank-payment exports.
+- Uses a more compact A4 print layout so long report titles fit on one line more reliably.
+- Normalizes mojibake and broken PT-BR accents in dialogs, reports, and printed output using `ftfy` plus internal fallbacks.
+- Auto-updates from GitHub releases using the ZIP asset.
 
 ### Development
 
@@ -58,100 +51,59 @@ python main.py
 .\.venv64\Scripts\python.exe .\build.py
 ```
 
-Output:
-
-- `dist/Relatorio de Clientes/`
-- `dist/RelatorioClientes-<version>.zip`
-
-### Local temporary files
-
-These files are intentionally local-only and should stay beside the executable only while reconciling a day:
-
-- `relatório pix.pdf`
-- `relatório cartoes.pdf`
-- `Relatorio_de_Vendas_Pix_*.csv`
-
-### Notes
-
-- This project is for internal use.
-- Credentials used by the automation can be embedded in the app for production flows.
-- The updater expects a GitHub release ZIP asset.
-
----
-
 ## Português
 
 Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 
-- `EH`: fluxo automático de caixa via Zweb
-- `MVA`: fluxo por PDFs com conferência no `Minhas Notas`
+- `EH`: fluxo automático de caixa com Zweb e relatórios de pagamento Caixa/Azulzinha.
+- `MVA`: fluxo por PDFs com conferência no `Minhas Notas`.
 
-### Escopo atual
+### Escopo Atual
 
 - Importa PDFs de comissão e organiza os resultados por vendedor.
-- Executa `Caixa > EH` sem importação manual dos PDFs principais.
+- Executa `Caixa > EH` sem importação manual dos relatórios principais do Zweb.
 - Busca os dados da `EH` em:
   - `Zweb > Documentos > Relatórios > Pedidos importados`
   - `Zweb > Financeiro > Relatórios > Fechamento de caixa`
   - `Zweb > Fiscal > NFC-e`
-- Concilia arquivos bancários temporários colocados ao lado do app:
-  - relatório de PIX: preferência por CSV, com suporte a PDF
-  - relatório de cartões: PDF
+- Usa relatórios de pagamento Caixa/Azulzinha na conciliação da EH:
+  - Arquivos locais de PIX em CSV/XLSX/PDF e cartões em PDF/XLSX são identificados pelo conteúdo.
+  - Se o PIX da Caixa vier em XLSX, o app converte automaticamente para CSV e continua o fluxo.
+  - Se os arquivos de PIX ou cartões estiverem ausentes, o app tenta baixá-los no portal Caixa/Azulzinha.
+  - Se o portal solicitar token, o app lê automaticamente o código mais recente enviado por `no-reply@fiserv.com` no Gmail configurado.
+  - Se a Caixa/Azulzinha não estiver disponível e o PIX for confirmado por `Financeiro > Movimentações` no Zweb, o relatório sinaliza esse fallback de forma explícita.
 - Executa `Caixa > MVA` com PDFs importados e conferência no `Minhas Notas`.
-- Exporta resumos e telas de conciliação em PDF.
+- O fechamento da MVA agora espelha a estrutura seccionada do `Fechamento de Caixa` da EH no aplicativo e na impressão A4, incluindo as mesmas seções de conciliação e observações.
+- Quando a MVA usa o fechamento novo do Clipp, o app agora também tenta baixar automaticamente os relatórios PIX e cartões da Caixa/Azulzinha com as credenciais locais da MVA antes de conciliar os pagamentos.
+- Exibe o `Fechamento de Caixa` da EH com texto de total de vendas/pendências e tabelas organizadas para divergências de PIX e cartão.
+- Imprime relatórios seccionados de caixa pela tela de seleção de impressora.
+- Normaliza mojibake e acentuação quebrada em diálogos, relatórios e impressão com `ftfy` e fallback interno.
+- Mantem a linha `Dinheiro` da correlacao de valores na coluna `Caixa`, porque ela vem do fechamento do caixa e nao do pagamento bancario.
+- Usa uma diagramacao A4 mais compacta para que titulos longos caibam melhor em uma unica linha.
 - Atualiza automaticamente pelo ZIP publicado nas releases do GitHub.
+  - Se a Caixa rejeitar o token como invalido, o app descarta o codigo usado e aguarda mais tempo por um novo e-mail antes de tentar de novo.
+  - Os arquivos temporarios de debug da exportacao da Azulzinha sao limpos automaticamente ao final do fluxo.
+  - Relatorios automaticos da EH com nome `_auto` sao excluidos depois do parse, para nao poluir o workspace.
+  - O navegador da Caixa/Azulzinha agora inicia minimizado e fora da area visivel para deixar o login menos evidente durante a automacao.
+### EH Debug
 
-### Fluxo EH
+- EH loading now includes a real-time debug panel for Gmail token lookup and portal automation steps.
+- A tela de carregamento da EH agora inclui um painel de debug em tempo real para a busca do token no Gmail e para as etapas da automação do portal.
 
-Na `EH`, o aplicativo agora:
+## Manual Cashier Notes / Notas do Caixa Manual
 
-1. carrega `Pedidos importados` pelo Zweb;
-2. carrega `Fechamento de caixa` pelo Zweb;
-3. carrega o status fiscal de `NFC-e` pelo Zweb;
-4. relaciona pedidos importados com os cupons do fechamento;
-5. desconsidera documentos fiscais cancelados quando aplicável;
-6. lê os relatórios locais de PIX/cartão somente se forem do dia solicitado;
-7. monta uma visão única de `Conciliação Bancária` para divergências restantes.
+- `Caixa > EH` keeps the Zweb reports automatic.
+- For EH, the only manual part is the local machine files placed in the app root:
+  - PIX: `CSV`, `XLSX` or `PDF`
+  - Cards: `PDF` or `XLSX`
+- `Caixa > MVA` accepts the legacy coupon report or the newer `clipp_exportado.htm.pdf` closing file.
+- When the Clipp closing file is used, MVA also loads local Caixa PIX/card reports from the root folder and builds bank reconciliation tables closer to the EH flow.
+- A4 cashier prints keep centered tables with line wrapping for long cells.
 
-### Fluxo MVA
-
-Na `MVA`, o aplicativo continua usando:
-
-1. PDFs importados de DAVs/pedidos;
-2. PDF importado do resumo de cupons;
-3. PDF opcional de orçamentos;
-4. conferência com `Minhas Notas` para valores de NF-e faltantes.
-
-### Desenvolvimento
-
-```powershell
-python -m venv .venv64
-.\.venv64\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main.py
-```
-
-### Build
-
-```powershell
-.\.venv64\Scripts\python.exe .\build.py
-```
-
-Saída:
-
-- `dist/Relatorio de Clientes/`
-- `dist/RelatorioClientes-<version>.zip`
-
-### Arquivos temporários locais
-
-Esses arquivos devem ficar apenas localmente, ao lado do executável, quando forem usados na conciliação do dia:
-
-- `relatório pix.pdf`
-- `relatório cartoes.pdf`
-- `Relatorio_de_Vendas_Pix_*.csv`
-
-### Observações
-
-- Projeto para uso interno.
-- As credenciais usadas pela automação podem ficar embutidas no app nos fluxos de produção.
-- O atualizador espera um asset ZIP na release do GitHub.
+- `Caixa > EH` mantém os relatórios do Zweb automáticos.
+- Na EH, a única parte manual são os arquivos locais da maquininha na pasta raiz:
+  - PIX: `CSV`, `XLSX` ou `PDF`
+  - Cartões: `PDF` ou `XLSX`
+- `Caixa > MVA` aceita o relatÃ³rio antigo de Cupons ou o novo fechamento `clipp_exportado.htm.pdf`.
+- Quando o fechamento do Clipp Ã© usado, a MVA tambÃ©m carrega os relatÃ³rios locais de PIX/cartÃµes da Caixa na pasta raiz e monta a conciliaÃ§Ã£o bancÃ¡ria no mesmo padrÃ£o da EH.
+- A impressÃ£o A4 do caixa mantÃ©m tabelas centralizadas e quebra de linha para cÃ©lulas longas.

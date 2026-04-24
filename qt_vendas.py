@@ -4,10 +4,12 @@ import sys
 import os
 import re
 import time
+import tempfile
 import queue
 import threading
 import difflib
 from typing import List, Optional
+from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -16,6 +18,7 @@ from utils import (
     adicionar_pdf,
     analisar_pdf_caixa,
     analisar_pdf_resumo_nfce,
+    analisar_pdf_fechamento_caixa_mva_clipp,
     combinar_relatorios_caixa_mva,
     comparar_caixa_resumo_nfce,
     gerar_relatorios_caixa_eh_zweb,
@@ -34,6 +37,8 @@ from utils import (
     _excel_export,
     parse_number,
     format_number_br,
+    corrigir_texto,
+    corrigir_estrutura_texto,
     criar_etiquetas,
     salvar_feedback_db,
     carregar_feedbacks_db,
@@ -41,6 +46,7 @@ from utils import (
     atualizar_ultimo_feedback,
     listar_vendedores_db,
     set_ui_refs,
+    _runtime_user_dir,
 )
 from ui_dialogs import messagebox, filedialog, set_parent
 from qt_adapters import (
@@ -83,14 +89,14 @@ class SourceDialog(QtWidgets.QDialog):
 class InstructionDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, title: str, message: str) -> None:
         super().__init__(parent)
-        self.setWindowTitle(title)
+        self.setWindowTitle(corrigir_texto(title))
         self.setModal(True)
         self.resize(430, 170)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(12)
 
-        label = QtWidgets.QLabel(message)
+        label = QtWidgets.QLabel(corrigir_texto(message))
         label.setWordWrap(True)
         label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(label, 1)
@@ -117,15 +123,17 @@ class LoadingStatusDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._cancelled = False
         self._closing_programmatically = False
-        self.setWindowTitle(title)
+        self._last_log_message = ""
+        self.setWindowTitle(corrigir_texto(title))
         self.setModal(True)
         self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, True)
-        self.setFixedSize(390, 145)
+        self.resize(620, 340)
+        self.setMinimumSize(620, 340)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(12)
 
-        self._label = QtWidgets.QLabel(message)
+        self._label = QtWidgets.QLabel(corrigir_texto(message))
         self._label.setWordWrap(True)
         self._label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(self._label, 1)
@@ -136,8 +144,34 @@ class LoadingStatusDialog(QtWidgets.QDialog):
         self._bar.setMinimumHeight(16)
         layout.addWidget(self._bar)
 
+        debug_title = QtWidgets.QLabel("Debug em tempo real")
+        debug_title.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        layout.addWidget(debug_title)
+
+        self._debug_log = QtWidgets.QPlainTextEdit()
+        self._debug_log.setReadOnly(True)
+        self._debug_log.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self._debug_log.setMinimumHeight(180)
+        layout.addWidget(self._debug_log, 2)
+
+        self.append_log(message)
+
     def set_status(self, message: str) -> None:
-        self._label.setText(message)
+        normalized = corrigir_texto(message)
+        self._label.setText(normalized)
+        self.append_log(normalized)
+
+    def append_log(self, message: str) -> None:
+        normalized = corrigir_texto(message)
+        if not normalized:
+            return
+        if normalized == self._last_log_message:
+            return
+        self._last_log_message = normalized
+        timestamp = time.strftime("%H:%M:%S")
+        self._debug_log.appendPlainText(f"[{timestamp}] {normalized}")
+        scrollbar = self._debug_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def was_cancelled(self) -> bool:
         return self._cancelled
@@ -472,7 +506,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         title = QtWidgets.QLabel("Relatório de Caixa")
         title_font = title.font()
         title_font.setBold(True)
-        title_font.setPointSize(13)
+        title_font.setPointSize(15)
         title.setFont(title_font)
         title.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(title)
@@ -496,6 +530,12 @@ class CaixaReportDialog(QtWidgets.QDialog):
         if relatorio.get("caixa_modelo") == "EH":
             return "Pedidos Caixa"
         return "DAVs Importados"
+
+    def _build_caixa_dialog_title(self, relatorio: dict) -> str:
+        if relatorio.get("caixa_modelo") == "EH":
+            return "Fechamento de Caixa - Eletrônica Horizonte"
+        return "Fechamento de Caixa - MVA"
+
 
     def _display_periodo(self, periodo: str | None) -> str:
         periodo_texto = str(periodo or "").strip()
@@ -620,6 +660,189 @@ class CaixaReportDialog(QtWidgets.QDialog):
     def _build_fechamento_empty_message(self, fechamento: dict) -> str:
         return fechamento.get("empty_message", "Nenhuma NFC-e faltante encontrada.")
 
+    def _get_fechamento_bank_report(self, fechamento: dict) -> dict | None:
+        relatorios_pagamento = fechamento.get("relatorios_pagamento") or {}
+        report = relatorios_pagamento.get("alertas_eh")
+        if report:
+            return report
+        return self._payment_reports.get("alertas_eh")
+
+    def _enrich_eh_bank_report(self, fechamento: dict, relatorio_pagamento: dict) -> dict:
+        report = corrigir_estrutura_texto(dict(relatorio_pagamento or {}))
+        periodo = fechamento.get("periodo") or report.get("periodo")
+        valor_total_vendas = round(float(report.get("valor_total_vendas", fechamento.get("total_caixa", 0.0)) or 0.0), 2)
+        valor_pendente = round(float(report.get("valor_pendente", fechamento.get("valor_faltantes", 0.0)) or 0.0), 2)
+        status = str(fechamento.get("status") or report.get("status") or "-")
+        report["periodo"] = periodo
+        report["valor_total_vendas"] = valor_total_vendas
+        report["valor_pendente"] = valor_pendente
+        report["status"] = status
+        report["caixa_modelo"] = fechamento.get("caixa_modelo") or report.get("caixa_modelo") or "EH"
+        report["texto_informativo"] = ""
+        pendencias_count = int(report.get("alertas_count", 0) or 0)
+        if pendencias_count <= 0:
+            pendencias_count = sum(
+                len(report.get(key) or [])
+                for key in (
+                    "pix_fechamento_rows",
+                    "cartao_fechamento_rows",
+                    "pix_maquina_rows",
+                    "cartao_maquina_rows",
+                    "observacao_rows",
+                )
+            )
+        report["pendencias_count"] = pendencias_count
+        report["summary_items"] = (
+            ("Período", self._display_periodo(periodo)),
+            ("Pendências", str(int(report.get("pendencias_count", 0) or 0))),
+            ("Total Pendências", f"R$ {format_number_br(valor_pendente)}"),
+        )
+        return report
+
+    def _build_eh_bank_sections(
+        self,
+        relatorio_pagamento: dict,
+    ) -> list[tuple[str, tuple[str, ...], list[tuple[str, ...]], list[int], str]]:
+        relatorio_pagamento = corrigir_estrutura_texto(relatorio_pagamento or {})
+        correlation_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("correlacao_rows") or [])
+            if row
+        ]
+        pix_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("pix_fechamento_rows") or [])
+            if row
+        ]
+        cartao_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("cartao_fechamento_rows") or [])
+            if row
+        ]
+
+        bank_rows: list[tuple[str, str, str]] = []
+        for row in (relatorio_pagamento.get("pix_maquina_rows") or []):
+            if not row:
+                continue
+            origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
+            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+                bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
+            elif len(row) >= 2:
+                bank_rows.append(("PIX", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
+        for row in (relatorio_pagamento.get("cartao_maquina_rows") or []):
+            if not row:
+                continue
+            origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
+            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+                bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
+            elif len(row) >= 2:
+                bank_rows.append(("Cartão", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
+
+        sections = [
+            (
+                "Correlação de Valores",
+                ("Pagamento", "Caixa", "Pagamentos", "Status"),
+                correlation_rows,
+                [220, 110, 110, 110],
+                "Nenhuma correlação de valores disponível.",
+            ),
+            (
+                "CF sem Transação Bancária - PIX",
+                ("CF", "Valor"),
+                pix_rows,
+                [340, 140],
+                "Nenhum CF PIX sem transação bancária encontrado.",
+            ),
+            (
+                "CF sem Transação Bancária - Cartão",
+                ("CF", "Valor"),
+                cartao_rows,
+                [340, 140],
+                "Nenhum CF de cartão sem transação bancária encontrado.",
+            ),
+            (
+                "Transações Bancárias sem CF/NF",
+                ("Origem", "Detalhe", "Valor"),
+                bank_rows,
+                [110, 400, 120],
+                "Nenhuma transação bancária sem CF/NF encontrada.",
+            ),
+        ]
+        return sections
+
+    def _build_bank_sections(
+        self,
+        relatorio_pagamento: dict,
+    ) -> list[tuple[str, tuple[str, ...], list[tuple[str, ...]], list[int], str]]:
+        relatorio_pagamento = corrigir_estrutura_texto(relatorio_pagamento or {})
+        caixa_modelo = str(relatorio_pagamento.get("caixa_modelo") or "EH").upper()
+        fechamento_label = "Fechamento EH" if caixa_modelo == "EH" else "Fechamento MVA"
+
+        correlation_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("correlacao_rows") or [])
+            if row
+        ]
+        pix_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("pix_fechamento_rows") or [])
+            if row
+        ]
+        cartao_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("cartao_fechamento_rows") or [])
+            if row
+        ]
+
+        bank_rows: list[tuple[str, str, str]] = []
+        for row in (relatorio_pagamento.get("pix_maquina_rows") or []):
+            if not row:
+                continue
+            origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
+            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+                bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
+            elif len(row) >= 2:
+                bank_rows.append(("PIX", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
+        for row in (relatorio_pagamento.get("cartao_maquina_rows") or []):
+            if not row:
+                continue
+            origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
+            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+                bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
+            elif len(row) >= 2:
+                bank_rows.append(("Cartão", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
+
+        return [
+            (
+                "Correlação de Valores",
+                ("Pagamento", "Caixa", "Pagamentos", "Status"),
+                correlation_rows,
+                [220, 110, 110, 110],
+                "Nenhuma correlação de valores disponível.",
+            ),
+            (
+                "CF sem Transação Bancária - PIX",
+                (fechamento_label, "Valor"),
+                pix_rows,
+                [340, 140],
+                "Nenhum CF PIX sem transação bancária encontrado.",
+            ),
+            (
+                "CF sem Transação Bancária - Cartão",
+                (fechamento_label, "Valor"),
+                cartao_rows,
+                [340, 140],
+                "Nenhum CF de cartão sem transação bancária encontrado.",
+            ),
+            (
+                "Transações Bancárias sem CF/NF",
+                ("Origem", "Detalhe", "Valor"),
+                bank_rows,
+                [110, 400, 120],
+                "Nenhuma transação bancária sem CF/NF encontrada.",
+            ),
+        ]
+
     def _build_pix_summary_items(self, relatorio_pix: dict):
         summary_label = relatorio_pix.get("summary_label") or "Pagamentos digitais"
         total_label = relatorio_pix.get("total_label") or f"Total {str(summary_label).casefold()}"
@@ -664,7 +887,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         actions.addStretch()
         actions.addWidget(
             self._create_export_button(
-                "Imprimir PDF",
+                "Imprimir",
                 lambda: self._export_davs_pdf(relatorio),
             )
         )
@@ -723,6 +946,10 @@ class CaixaReportDialog(QtWidgets.QDialog):
         return widget
 
     def _build_fechamento_tab(self, fechamento: dict) -> QtWidgets.QWidget:
+        bank_report = self._get_fechamento_bank_report(fechamento)
+        if bank_report:
+            return self._build_bank_reconciliation_tab(self._enrich_eh_bank_report(fechamento, bank_report))
+
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -745,7 +972,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             self._wrap_centered(
                 self._build_summary_frame(
                     summary_items,
-                    {"Valor das faltantes", "Status"},
+                    {"Total Pend?ncias"},
                     fechamento=fechamento,
                     action_widgets=action_widgets,
                 ),
@@ -757,7 +984,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         actions.addStretch()
         actions.addWidget(
             self._create_export_button(
-                "Imprimir PDF",
+                "Imprimir",
                 lambda: self._export_fechamento_pdf(fechamento),
             )
         )
@@ -770,7 +997,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
 
         table = QtWidgets.QTableWidget()
         table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(("Número", "Valor"))
+        table.setHorizontalHeaderLabels(("N?mero", "Valor"))
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
@@ -959,6 +1186,9 @@ class CaixaReportDialog(QtWidgets.QDialog):
         widths: list[int],
         empty_message: str,
     ) -> QtWidgets.QWidget:
+        headers = tuple(corrigir_texto(str(value)) for value in headers)
+        rows = [tuple(corrigir_texto(str(value)) for value in row) for row in rows]
+        empty_message = corrigir_texto(empty_message)
         table = QtWidgets.QTableWidget()
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
@@ -975,7 +1205,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         table.setRowCount(len(rows) if rows else 1)
         for row_index, values in enumerate(rows):
             for col_index, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(str(value))
+                item = QtWidgets.QTableWidgetItem(corrigir_texto(str(value)))
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 table.setItem(row_index, col_index, item)
 
@@ -995,76 +1225,92 @@ class CaixaReportDialog(QtWidgets.QDialog):
         return wrap
 
     def _build_bank_reconciliation_tab(self, relatorio_pagamento: dict) -> QtWidgets.QWidget:
+        relatorio_pagamento = corrigir_estrutura_texto(relatorio_pagamento or {})
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        summary_items = self._build_pix_summary_items(relatorio_pagamento)
-        layout.addWidget(
-            self._wrap_centered(
-                self._build_summary_frame(
-                    summary_items,
-                    {relatorio_pagamento.get("total_label") or "Total pendências"},
-                ),
-                560,
+        if relatorio_pagamento.get("categoria") == "alertas_eh":
+            summary_items = relatorio_pagamento.get("summary_items") or ()
+            layout.addWidget(
+                self._wrap_centered(
+                    self._build_summary_frame(summary_items, {"Total Pend?ncias"}),
+                    560,
+                )
             )
-        )
+            sections = self._build_bank_sections(relatorio_pagamento)
+            keep_empty_sections = True
+
+        else:
+            summary_items = self._build_pix_summary_items(relatorio_pagamento)
+            layout.addWidget(
+                self._wrap_centered(
+                    self._build_summary_frame(
+                        summary_items,
+                        {corrigir_texto(relatorio_pagamento.get("total_label") or "Total pend?ncias")},
+                    ),
+                    560,
+                )
+            )
+            sections = [
+                (
+                    "PIX - CF sem Transa??o Banc?ria",
+                    ("Fechamento EH", "Valor EH"),
+                    list(relatorio_pagamento.get("pix_fechamento_rows") or []),
+                    [250, 110],
+                    "Nenhum CF PIX sem transa??o banc?ria encontrado.",
+                ),
+                (
+                    "PIX - Transa??o Banc?ria sem CF/NF",
+                    ("M?quina", "Valor Banco"),
+                    list(relatorio_pagamento.get("pix_maquina_rows") or []),
+                    [250, 110],
+                    "Nenhuma transa??o PIX sem CF/NF encontrada.",
+                ),
+                (
+                    "Cart?es - CF sem Transa??o Banc?ria",
+                    ("Fechamento EH", "Valor EH"),
+                    list(relatorio_pagamento.get("cartao_fechamento_rows") or []),
+                    [250, 110],
+                    "Nenhum CF de cart?o sem transa??o banc?ria encontrado.",
+                ),
+                (
+                    "Cart?es - Transa??o Banc?ria sem CF/NF",
+                    ("M?quina", "Valor Banco"),
+                    list(relatorio_pagamento.get("cartao_maquina_rows") or []),
+                    [250, 110],
+                    "Nenhuma transa??o de cart?o sem CF/NF encontrada.",
+                ),
+                (
+                    "Observa??es",
+                    ("Tipo", "Detalhe", "Valor"),
+                    list(relatorio_pagamento.get("observacao_rows") or []),
+                    [170, 360, 110],
+                    "Nenhuma observa??o adicional encontrada.",
+                ),
+            ]
+            keep_empty_sections = False
 
         actions = QtWidgets.QHBoxLayout()
         actions.addStretch()
         actions.addWidget(
             self._create_export_button(
-                "Imprimir PDF",
+                "Imprimir",
                 lambda: self._export_pix_pdf(relatorio_pagamento),
             )
         )
         actions.addStretch()
         layout.addLayout(actions)
 
-        sections = [
-            (
-                "PIX - CF sem Transação Bancária",
-                ("Fechamento EH", "Valor EH"),
-                list(relatorio_pagamento.get("pix_fechamento_rows") or []),
-                [250, 110],
-                "Nenhum CF PIX sem transação bancária encontrado.",
-            ),
-            (
-                "PIX - Transação Bancária sem CF/NF",
-                ("Máquina", "Valor Banco"),
-                list(relatorio_pagamento.get("pix_maquina_rows") or []),
-                [250, 110],
-                "Nenhuma transação PIX sem CF/NF encontrada.",
-            ),
-            (
-                "Cartões - CF sem Transação Bancária",
-                ("Fechamento EH", "Valor EH"),
-                list(relatorio_pagamento.get("cartao_fechamento_rows") or []),
-                [250, 110],
-                "Nenhum CF de cartão sem transação bancária encontrado.",
-            ),
-            (
-                "Cartões - Transação Bancária sem CF/NF",
-                ("Máquina", "Valor Banco"),
-                list(relatorio_pagamento.get("cartao_maquina_rows") or []),
-                [250, 110],
-                "Nenhuma transação de cartão sem CF/NF encontrada.",
-            ),
-            (
-                "Observações",
-                ("Tipo", "Detalhe", "Valor"),
-                list(relatorio_pagamento.get("observacao_rows") or []),
-                [170, 360, 110],
-                "Nenhuma observação adicional encontrada.",
-            ),
-        ]
-
         for title, headers, rows, widths, empty_message in sections:
-            if not rows and title != "Observações":
+            if not rows and not keep_empty_sections and title != "Observa??es":
                 continue
-            label = QtWidgets.QLabel(title)
+            label = QtWidgets.QLabel(corrigir_texto(title))
             label.setAlignment(QtCore.Qt.AlignCenter)
+            label_font = label.font()
+            label_font.setPointSize(max(8, label_font.pointSize() - 1))
+            label.setFont(label_font)
             layout.addWidget(label)
             layout.addWidget(
                 self._build_simple_centered_table(
@@ -1079,6 +1325,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         return widget
 
     def _build_pix_tab(self, relatorio_pix: dict) -> QtWidgets.QWidget:
+        relatorio_pix = corrigir_estrutura_texto(relatorio_pix or {})
         if relatorio_pix.get("categoria") == "alertas_eh":
             return self._build_bank_reconciliation_tab(relatorio_pix)
 
@@ -1092,7 +1339,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             self._wrap_centered(
                 self._build_summary_frame(
                     summary_items,
-                    {relatorio_pix.get("total_label") or "Total pagamentos digitais"},
+                    {corrigir_texto(relatorio_pix.get("total_label") or "Total pagamentos digitais")},
                 ),
                 560,
             )
@@ -1103,7 +1350,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             actions.addStretch()
             actions.addWidget(
                 self._create_export_button(
-                    "Imprimir PDF",
+                    "Imprimir",
                     lambda: self._export_pix_pdf(relatorio_pix),
                 )
             )
@@ -1114,7 +1361,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         section_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(section_label)
 
-        headers = tuple(relatorio_pix.get("table_headers") or ("Data da venda", "Valor bruto"))
+        headers = tuple(corrigir_texto(str(value)) for value in (relatorio_pix.get("table_headers") or ("Data da venda", "Valor bruto")))
         rows = self._build_payment_table_rows(relatorio_pix)
         table = QtWidgets.QTableWidget()
         table.setColumnCount(len(headers))
@@ -1132,13 +1379,13 @@ class CaixaReportDialog(QtWidgets.QDialog):
         table.setRowCount(len(rows))
         for row_index, values in enumerate(rows):
             for col_index, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(str(value))
+                item = QtWidgets.QTableWidgetItem(corrigir_texto(str(value)))
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 table.setItem(row_index, col_index, item)
 
         if not rows:
             table.setRowCount(1)
-            empty_item = QtWidgets.QTableWidgetItem(self._build_pix_empty_message(relatorio_pix))
+            empty_item = QtWidgets.QTableWidgetItem(corrigir_texto(self._build_pix_empty_message(relatorio_pix)))
             empty_item.setTextAlignment(QtCore.Qt.AlignCenter)
             table.setSpan(0, 0, 1, len(headers))
             table.setItem(0, 0, empty_item)
@@ -1159,7 +1406,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         fechamento: dict | None = None,
         action_widgets: dict[str, QtWidgets.QWidget] | None = None,
     ) -> QtWidgets.QFrame:
-        highlighted_labels = highlighted_labels or set()
+        highlighted_labels = {corrigir_texto(str(label)) for label in (highlighted_labels or set())}
         action_widgets = action_widgets or {}
         frame = QtWidgets.QFrame()
         frame.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
@@ -1170,20 +1417,28 @@ class CaixaReportDialog(QtWidgets.QDialog):
         layout.setAlignment(QtCore.Qt.AlignCenter)
 
         for row, (label_text, value_text) in enumerate(items):
+            label_text = corrigir_texto(str(label_text))
+            value_text = corrigir_texto(str(value_text))
             label = QtWidgets.QLabel(f"{label_text}:")
             value = QtWidgets.QLabel(value_text)
             label.setAlignment(QtCore.Qt.AlignCenter)
             value.setAlignment(QtCore.Qt.AlignCenter)
+            label_font = label.font()
+            label_font.setPointSize(max(10, label_font.pointSize() + 1))
+            label.setFont(label_font)
+            value_font_base = value.font()
+            value_font_base.setPointSize(max(10, value_font_base.pointSize() + 1))
+            value.setFont(value_font_base)
 
             if label_text in highlighted_labels:
                 value_font = value.font()
                 value_font.setBold(True)
-                value_font.setPointSize(value_font.pointSize() + 1)
+                value_font.setPointSize(value_font.pointSize())
                 value.setFont(value_font)
 
-            if label_text in highlighted_labels and label_text not in {"Valor das faltantes", "Status"}:
+            if label_text in highlighted_labels and label_text not in {"Total Pend?ncias"}:
                 value.setStyleSheet("color:#59C734;")
-            if label_text in {"Valor das faltantes", "Status"}:
+            if label_text in {"Total Pend?ncias"}:
                 cor = "#59C734"
                 if fechamento and fechamento.get("status") != "Confere":
                     cor = "#FF4D4F"
@@ -1250,6 +1505,17 @@ class CaixaReportDialog(QtWidgets.QDialog):
         )
 
     def _export_fechamento_pdf(self, fechamento: dict) -> None:
+        bank_report = self._get_fechamento_bank_report(fechamento)
+        if bank_report:
+            report = self._enrich_eh_bank_report(fechamento, bank_report)
+            self._export_sectioned_report_pdf(
+                title="Fechamento de Caixa - Eletrônica Horizonte" if str(fechamento.get("caixa_modelo") or "").upper() == "EH" else "Fechamento de Caixa - MVA",
+                default_name="relatorio_caixa_fechamento_eh.pdf" if str(fechamento.get("caixa_modelo") or "").upper() == "EH" else "relatorio_caixa_fechamento_mva.pdf",
+                summary_items=report.get("summary_items") or (),
+                sections=self._build_bank_sections(report),
+            )
+            return
+
         summary_items = self._build_fechamento_summary_items(fechamento)
         rows = [
             (
@@ -1266,7 +1532,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 )
             )
         self._export_report_pdf(
-            title="Relatório de Caixa - Fechamento",
+            title=f"Fechamento de Caixa - {'MVA' if fechamento.get('caixa_modelo') == 'MVA' else 'Eletrônica Horizonte'}",
             default_name="relatorio_caixa_fechamento.pdf",
             summary_items=summary_items,
             headers=("Número", "Valor"),
@@ -1275,12 +1541,21 @@ class CaixaReportDialog(QtWidgets.QDialog):
         )
 
     def _export_pix_pdf(self, relatorio_pix: dict) -> None:
+        if relatorio_pix.get("categoria") == "alertas_eh":
+            self._export_sectioned_report_pdf(
+                title="Fechamento de Caixa - Eletrônica Horizonte" if str(relatorio_pix.get("caixa_modelo") or "EH").upper() == "EH" else "Fechamento de Caixa - MVA",
+                default_name="relatorio_caixa_fechamento_eh.pdf" if str(relatorio_pix.get("caixa_modelo") or "EH").upper() == "EH" else "relatorio_caixa_fechamento_mva.pdf",
+                summary_items=relatorio_pix.get("summary_items") or (),
+                sections=self._build_bank_sections(relatorio_pix),
+            )
+            return
+
         summary_items = self._build_pix_summary_items(relatorio_pix)
-        headers = tuple(relatorio_pix.get("table_headers") or ("Data da venda", "Valor bruto"))
+        headers = tuple(corrigir_texto(str(value)) for value in (relatorio_pix.get("table_headers") or ("Data da venda", "Valor bruto")))
         rows = self._build_payment_table_rows(relatorio_pix)
         categoria = re.sub(r"[^a-z0-9]+", "_", str(relatorio_pix.get("categoria") or "pagamento").casefold()).strip("_")
         self._export_report_pdf(
-            title=relatorio_pix.get("export_title") or f"Relatório de Caixa - {relatorio_pix.get('tab_title') or 'Pagamentos'}",
+            title=relatorio_pix.get("export_title") or f"Fechamento de Caixa - {relatorio_pix.get('tab_title') or 'Pagamentos'}",
             default_name=relatorio_pix.get("export_name") or f"relatorio_caixa_{categoria or 'pagamento'}.pdf",
             summary_items=summary_items,
             headers=headers,
@@ -1299,6 +1574,12 @@ class CaixaReportDialog(QtWidgets.QDialog):
     ) -> None:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas
+
+        title = corrigir_texto(title)
+        summary_items = [(corrigir_texto(str(label)), corrigir_texto(str(value))) for label, value in summary_items]
+        headers = tuple(corrigir_texto(str(header)) for header in headers)
+        rows = [tuple(corrigir_texto(str(value)) for value in row) for row in rows]
+        empty_message = corrigir_texto(str(empty_message))
 
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
@@ -1355,6 +1636,75 @@ class CaixaReportDialog(QtWidgets.QDialog):
 
         pdf.save()
         messagebox.showinfo("Exportado", f"PDF salvo em:\n{path}")
+
+    def _export_sectioned_report_pdf(
+        self,
+        title: str,
+        default_name: str,
+        summary_items,
+        sections,
+    ) -> None:
+        from html import escape
+        from PySide6 import QtPrintSupport
+
+        printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.HighResolution)
+        printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.A4))
+        printer.setPageMargins(QtCore.QMarginsF(6, 6, 6, 6), QtGui.QPageLayout.Millimeter)
+        print_dialog = QtPrintSupport.QPrintDialog(printer, self)
+        print_dialog.setWindowTitle(corrigir_texto("Selecionar impressora"))
+        if print_dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        def _cell(value: object) -> str:
+            return escape(corrigir_texto(str(value or "")))
+
+        html_parts = [
+            "<html><head><meta charset='utf-8'>",
+            "<style>",
+            "body{font-family:Arial,Helvetica,sans-serif;font-size:8pt;color:#000;margin:0;padding:0;}",
+            ".page{width:100%;max-width:none;margin:0 auto;padding:0;text-align:center;}",
+            "h1{font-size:10.5pt;text-align:center;margin:0 0 5px 0;white-space:nowrap;overflow-wrap:normal;word-break:normal;}",
+            "h2{font-size:8pt;text-align:center;margin:4px 0 2px 0;}",
+            "table{width:100%;border-collapse:collapse;table-layout:fixed;margin:0 0 6px 0;}",
+            "th{background:#000;color:#fff;font-weight:bold;}",
+            "th,td{border:1px solid #777;padding:2px;text-align:center;vertical-align:middle;word-wrap:break-word;overflow-wrap:anywhere;font-size:7pt;}",
+            "td{background:#fff;color:#000;}",
+            "</style></head><body><div class='page'>",
+            f"<h1>{_cell(title)}</h1>",
+            "<table><thead><tr><th>Campo</th><th>Valor</th></tr></thead><tbody>",
+        ]
+
+        for label, value in summary_items:
+            html_parts.append(f"<tr><td>{_cell(label)}</td><td>{_cell(value)}</td></tr>")
+        html_parts.append("</tbody></table>")
+
+        for section_title, headers, rows, _widths, empty_message in sections:
+            headers = tuple(headers or ())
+            rows = list(rows or [])
+            html_parts.append(f"<h2>{_cell(section_title)}</h2>")
+            html_parts.append("<table><thead><tr>")
+            for header in headers:
+                html_parts.append(f"<th>{_cell(header)}</th>")
+            html_parts.append("</tr></thead><tbody>")
+            if rows:
+                for row in rows:
+                    html_parts.append("<tr>")
+                    for value in row:
+                        html_parts.append(f"<td>{_cell(value)}</td>")
+                    html_parts.append("</tr>")
+            else:
+                col_span = max(1, len(headers))
+                html_parts.append(f"<tr><td colspan='{col_span}'>{_cell(empty_message)}</td></tr>")
+            html_parts.append("</tbody></table>")
+
+        html_parts.append("</div></body></html>")
+
+        document = QtGui.QTextDocument()
+        page_rect = printer.pageRect(QtPrintSupport.QPrinter.Point)
+        document.setPageSize(page_rect.size())
+        document.setHtml("".join(html_parts))
+        document.print_(printer)
+        messagebox.showinfo(corrigir_texto("Impress\u00e3o"), corrigir_texto("Relat\u00f3rio enviado para impress\u00e3o."))
 
     def _split_pdf_text(self, text: str, max_chars: int) -> list[str]:
         text = str(text or "")
@@ -1992,80 +2342,175 @@ class MainWindow(QtWidgets.QMainWindow):
             return None, None, None, str(result.get("error")).strip() or "Falha ao gerar os relatorios da EH no Zweb."
         return result.get("relatorio"), result.get("relatorio_fechamento"), result.get("relatorio_pix"), None
 
+    def _load_mva_reports_with_loading(
+        self,
+        path_davs: str,
+        path_orcamentos: str,
+        path_cupons: str,
+    ) -> tuple[dict | None, dict | None, dict | None, str | None]:
+        status_queue: queue.Queue[str] = queue.Queue()
+        result: dict = {}
+
+        def push_status(message: str) -> None:
+            texto = str(message or "").strip()
+            if texto:
+                status_queue.put(texto)
+
+        def worker() -> None:
+            try:
+                push_status("Lendo DAV MVA...")
+                result["relatorio_davs"] = analisar_pdf_caixa(path_davs)
+                push_status("Lendo Orcamento...")
+                result["relatorio_orcamentos"] = analisar_pdf_caixa(path_orcamentos)
+                result["relatorio_cupons"] = None
+                if path_cupons:
+                    push_status("Lendo Fechamento de Caixa...")
+                    relatorio_cupons = analisar_pdf_fechamento_caixa_mva_clipp(
+                        path_cupons,
+                        auto_download_missing=True,
+                        on_status=push_status,
+                    )
+                    if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
+                        relatorio_cupons = analisar_pdf_resumo_nfce(path_cupons)
+                    result["relatorio_cupons"] = relatorio_cupons
+            except Exception as exc:
+                result["error"] = str(exc)
+
+        dialog = LoadingStatusDialog(self, "Caixa MVA", "Processando arquivos da MVA...")
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        while thread.is_alive():
+            while True:
+                try:
+                    dialog.set_status(status_queue.get_nowait())
+                except queue.Empty:
+                    break
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 100)
+            thread.join(0.05)
+            time.sleep(0.01)
+
+        while True:
+            try:
+                dialog.set_status(status_queue.get_nowait())
+            except queue.Empty:
+                break
+        dialog.close_gracefully()
+
+        if result.get("error"):
+            return None, None, None, str(result.get("error")).strip() or "Falha ao processar os arquivos da MVA."
+        return result.get("relatorio_davs"), result.get("relatorio_orcamentos"), result.get("relatorio_cupons"), None
+
+    def _auto_find_mva_caixa_files(self) -> dict[str, str]:
+        terms_by_key = {
+            "davs": ["dav mva", "dav"],
+            "orcamentos": ["orcamento", "orçamento"],
+            "cupons": ["fechamento de caixa"],
+        }
+        base_dirs: list[str] = []
+        for raw in [os.getcwd(), _runtime_user_dir()]:
+            if raw and os.path.isdir(raw) and raw not in base_dirs:
+                base_dirs.append(raw)
+
+        found: dict[str, str] = {}
+        for base_dir in base_dirs:
+            try:
+                pdfs = [
+                    os.path.join(base_dir, name)
+                    for name in os.listdir(base_dir)
+                    if name.lower().endswith(".pdf")
+                ]
+            except OSError:
+                continue
+            pdfs.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+            for key, terms in terms_by_key.items():
+                if key in found:
+                    continue
+                for path in pdfs:
+                    nome = corrigir_texto(os.path.basename(path)).casefold()
+                    if any(term in nome for term in terms):
+                        found[key] = path
+                        break
+        return found
+
     def _handle_caixa_report(self) -> None:
         cnpj = CaixaCnpjDialog(self).choice()
         if not cnpj:
             return
 
         if cnpj == "MVA":
-            if not InstructionDialog(
-                self,
-                "Caixa MVA - Passo 1 de 3",
-                "Selecione agora o PDF Exportacao de dados.\n\n"
-                "No passo seguinte o sistema vai pedir o relatório de Orçamentos e depois o relatório de Cupons.",
-            ).confirmed():
-                return
+            auto_files = self._auto_find_mva_caixa_files()
 
-            path_davs = filedialog.askopenfilename(
-                filetypes=[("Arquivos PDF", "*.pdf")],
-                title="Caixa MVA - Passo 1 de 3: selecionar exportacao de dados",
-            )
+            path_davs = auto_files.get("davs", "")
+            if not path_davs:
+                if not InstructionDialog(
+                    self,
+                    "Caixa MVA - Passo 1 de 3",
+                    "Selecione agora o PDF DAV MVA.\n\n"
+                    "O app tentou localizar automaticamente um arquivo com nome DAV e não encontrou.",
+                ).confirmed():
+                    return
+                path_davs = filedialog.askopenfilename(
+                    filetypes=[("Arquivos PDF", "*.pdf")],
+                    title="Caixa MVA - Passo 1 de 3: selecionar DAV MVA",
+                )
             if not path_davs:
                 return
 
-            if not InstructionDialog(
-                self,
-                "Caixa MVA - Passo 2 de 3",
-                "Agora selecione o PDF de Orçamentos.\n\n"
-                "Ele sera somado aos DAVs finalizados para montar a base de comparacao do caixa.",
-            ).confirmed():
-                return
-
-            path_orcamentos = filedialog.askopenfilename(
-                filetypes=[("Arquivos PDF", "*.pdf")],
-                title="Caixa MVA - Passo 2 de 3: selecionar orcamentos",
-            )
+            path_orcamentos = auto_files.get("orcamentos", "")
+            if not path_orcamentos:
+                if not InstructionDialog(
+                    self,
+                    "Caixa MVA - Passo 2 de 3",
+                    "Selecione agora o PDF Orcamento.\n\n"
+                    "O app tentou localizar automaticamente um arquivo com nome Orcamento e não encontrou.",
+                ).confirmed():
+                    return
+                path_orcamentos = filedialog.askopenfilename(
+                    filetypes=[("Arquivos PDF", "*.pdf")],
+                    title="Caixa MVA - Passo 2 de 3: selecionar Orcamento",
+                )
             if not path_orcamentos:
                 messagebox.showwarning(
-                    "Arquivo obrigatorio",
-                    "O relatório de Orçamentos da MVA precisa ser selecionado para continuar.",
+                    "Arquivo obrigatório",
+                    "O relatório de Orcamento da MVA precisa ser selecionado para continuar.",
                 )
                 return
 
-            if not InstructionDialog(
-                self,
-                "Caixa MVA - Passo 3 de 3",
-                "Agora selecione o relatório de Cupons.\n\n"
-                "Ele sera usado para comparar com os DAVs aptos para cupom e apontar DAVs/CF faltantes.",
-            ).confirmed():
-                return
-
-            path_cupons = filedialog.askopenfilename(
-                filetypes=[("Arquivos PDF", "*.pdf")],
-                title="Caixa MVA - Passo 3 de 3: selecionar relatório de cupons",
-            )
+            path_cupons = auto_files.get("cupons", "")
+            if not path_cupons:
+                if not InstructionDialog(
+                    self,
+                    "Caixa MVA - Passo 3 de 3",
+                    "Selecione agora o PDF Fechamento de Caixa.\n\n"
+                    "O app tentou localizar automaticamente um arquivo com nome Fechamento de Caixa e não encontrou.",
+                ).confirmed():
+                    return
+                path_cupons = filedialog.askopenfilename(
+                    filetypes=[("Arquivos PDF", "*.pdf")],
+                    title="Caixa MVA - Passo 3 de 3: selecionar Fechamento de Caixa",
+                )
             if not path_cupons:
                 continuar_sem_cupons = messagebox.askyesno(
-                    "Relatório de Cupons não selecionado",
-                    "O relatório de Cupons não foi selecionado.\n\n"
+                    "Fechamento de Caixa não selecionado",
+                    "O Fechamento de Caixa não foi selecionado.\n\n"
                     "Deseja continuar somente com a análise dos DAVs da MVA?",
                 )
                 if not continuar_sem_cupons:
                     return
 
-            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-            try:
-                relatorio_davs = analisar_pdf_caixa(path_davs)
-                relatorio_orcamentos = analisar_pdf_caixa(path_orcamentos)
-                fechamento = None
-                relatorio_cupons = None
-                if path_cupons:
-                    relatorio_cupons = analisar_pdf_resumo_nfce(path_cupons)
-            except Exception as exc:
-                messagebox.showerror("Erro", f"Erro ao analisar PDF de Caixa:\n{exc}")
+            relatorio_davs, relatorio_orcamentos, relatorio_cupons, mva_msg = self._load_mva_reports_with_loading(
+                path_davs,
+                path_orcamentos,
+                path_cupons,
+            )
+            if mva_msg:
+                messagebox.showerror("Erro", f"Erro ao analisar PDF de Caixa:\n{mva_msg}")
                 return
-            finally:
-                QtWidgets.QApplication.restoreOverrideCursor()
+            fechamento = None
 
             davs_ok, davs_msg = validar_arquivo_caixa_mva(
                 relatorio_davs,
@@ -2134,7 +2579,7 @@ class MainWindow(QtWidgets.QMainWindow):
         data_caixa = CaixaDateDialog(
             self,
             "Caixa EH - Data",
-            "Selecione o dia para gerar automaticamente os relatorios da EH no Zweb.",
+            "Selecione o dia do relatório da EH.",
         ).selected_date()
         if not data_caixa:
             return
@@ -2142,6 +2587,7 @@ class MainWindow(QtWidgets.QMainWindow):
         relatorio, relatorio_nfce, relatorio_pix, eh_msg = self._load_eh_caixa_reports_with_loading(data_caixa)
         if eh_msg == "__cancelled__":
             return
+
         if eh_msg:
             messagebox.showerror("Caixa EH", eh_msg)
             return

@@ -1,5 +1,10 @@
 # Sensitive local files
+AGENTS.md
 credenciais.txt
+gmail_oauth_client.json
+gmail_oauth_token.json
+body_email.txt
+azulzinha_browser/
 data/credenciaisAPI.json
 data/credenciaisDB.json
 data/caixa_pix_cache.json
@@ -24,6 +29,7 @@ __pycache__/
 
 # Local runtime artifacts
 *.log
+*.crdownload
 debug_*.txt
 debug_*.html
 debug_*.json
@@ -35,6 +41,7 @@ found_html.txt
 # Temporary local bank reports
 Relatorio_de_Vendas_Pix_*.csv
 Relatorio_de_Vendas_Pix_*.xlsx
+Relatorio_Simplificado_de_Vendas_Historico_de_Vendas_*.xlsx
 relatório pix.pdf
 relatório cartoes.pdf
 

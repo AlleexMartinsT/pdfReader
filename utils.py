@@ -913,7 +913,7 @@ def _display_eh_order_number(numero: str) -> str:
 def _candidate_local_report_dirs() -> list[Path]:
     dirs = []
     seen = set()
-    for raw in [os.getcwd(), _runtime_user_dir(), os.path.join(os.path.expanduser("~"), "Downloads")]:
+    for raw in [_active_report_dir()]:
         path = Path(str(raw or "")).expanduser()
         key = str(path).casefold()
         if not path.exists() or key in seen:
@@ -921,6 +921,61 @@ def _candidate_local_report_dirs() -> list[Path]:
         seen.add(key)
         dirs.append(path)
     return dirs
+
+
+def _active_report_dir() -> str:
+    import sys
+
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_dir = os.getcwd()
+    if base_dir and os.path.isdir(base_dir):
+        return base_dir
+    return _runtime_user_dir()
+
+
+def _save_zweb_html_report(data_br: str, report_key: str, html_text: str) -> str:
+    report_dir = Path(_active_report_dir())
+    report_dir.mkdir(parents=True, exist_ok=True)
+    safe_date = str(data_br or "").replace("/", "-").strip() or "sem-data"
+    filename_map = {
+        "pedidos_importados": f"Pedidos_importados_{safe_date}_eh_zweb_auto.html",
+        "fechamento_caixa": f"Fechamento_de_caixa_{safe_date}_eh_zweb_auto.html",
+    }
+    filename = filename_map.get(report_key) or f"Relatorio_Zweb_{safe_date}_{report_key}_auto.html"
+    target = report_dir / filename
+    target.write_text(str(html_text or ""), encoding="utf-8")
+    return str(target)
+
+
+_LOCAL_REPORT_SUFFIXES = (".csv", ".xlsx", ".pdf")
+
+
+def _effective_local_report_suffix(path_like: str | Path) -> str:
+    path = Path(path_like)
+    suffix = path.suffix.lower()
+    if suffix == ".crdownload":
+        nested_suffix = Path(path.stem).suffix.lower()
+        if nested_suffix in _LOCAL_REPORT_SUFFIXES:
+            return nested_suffix
+    return suffix
+
+
+def _finalize_local_report_path(path_like: str | Path) -> str:
+    path = Path(path_like)
+    if path.suffix.lower() != ".crdownload":
+        return str(path)
+    if _effective_local_report_suffix(path) not in _LOCAL_REPORT_SUFFIXES:
+        return str(path)
+    target = path.with_suffix("")
+    try:
+        path.replace(target)
+        return str(target)
+    except Exception:
+        if target.exists():
+            return str(target)
+        return str(path)
 
 
 def _read_pdf_text(path: str | Path) -> str:
@@ -1066,42 +1121,38 @@ def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict
     pix_pdf_matches: list[Path] = []
     card_matches: list[Path] = []
     avisos: list[str] = []
-    patterns = ("*.pdf", "*.csv", "*.xlsx")
+    patterns = ("*.pdf", "*.csv", "*.xlsx", "*.crdownload")
     company_norm = _normalize_ascii_text(company) or "eh"
 
-    preferred_dirs: list[Path] = []
-    seen = set()
-    for raw in [os.getcwd(), _runtime_user_dir()]:
-        path = Path(str(raw or "")).expanduser()
-        key = str(path).casefold()
-        if not path.exists() or key in seen:
-            continue
-        seen.add(key)
-        preferred_dirs.append(path)
+    preferred_dirs = _candidate_local_report_dirs()
 
     for directory in preferred_dirs:
         for pattern in patterns:
             for path in directory.glob(pattern):
                 try:
-                    if path.suffix.lower() == ".csv":
+                    effective_suffix = _effective_local_report_suffix(path)
+                    if effective_suffix == ".csv":
                         text = _read_text_file(path)
-                    elif path.suffix.lower() == ".xlsx":
+                    elif effective_suffix == ".xlsx":
                         text = _read_excel_text(path)
-                    else:
+                    elif effective_suffix == ".pdf":
                         text = _read_pdf_text(path)
+                    else:
+                        continue
                 except Exception:
                     continue
 
                 text_norm = _normalize_ascii_text(text)
                 detected_date = _extract_local_report_date_br(text)
                 report_kind = None
-                if path.suffix.lower() == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm:
+                normalized_path = Path(_finalize_local_report_path(path))
+                if effective_suffix == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm:
                     report_kind = "pix_csv"
-                elif path.suffix.lower() == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm:
+                elif effective_suffix == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm:
                     report_kind = "pix_xlsx"
                 elif "extrato pix" in text_norm:
                     report_kind = "pix_pdf"
-                elif path.suffix.lower() == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm:
+                elif effective_suffix == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm:
                     report_kind = "cartoes"
                 elif "relatorio de historico de vendas" in text_norm and "periodo de venda" in text_norm:
                     report_kind = "cartoes"
@@ -1117,23 +1168,29 @@ def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict
                     continue
 
                 if report_kind == "pix_csv":
-                    pix_csv_matches.append(path)
+                    pix_csv_matches.append(normalized_path)
                 elif report_kind == "pix_xlsx":
-                    pix_xlsx_matches.append(path)
+                    pix_xlsx_matches.append(normalized_path)
                 elif report_kind == "pix_pdf":
-                    pix_pdf_matches.append(path)
+                    pix_pdf_matches.append(normalized_path)
                 else:
-                    card_matches.append(path)
+                    card_matches.append(normalized_path)
 
     def _pick_latest(paths: list[Path]) -> str | None:
+        if not paths:
+            return None
+        explicit_other_company_paths = [
+            item
+            for item in paths
+            if any(f"_{other}_auto" in item.stem.casefold() for other in ("eh", "mva") if other != company_norm)
+        ]
+        paths = [item for item in paths if item not in explicit_other_company_paths]
         if not paths:
             return None
         def _score(item: Path) -> tuple[int, float]:
             name = item.stem.casefold()
             if f"_{company_norm}_auto" in name:
                 company_score = 3
-            elif "_auto" in name and any(f"_{other}_auto" in name for other in ("eh", "mva") if other != company_norm):
-                company_score = -1
             elif "_auto" in name:
                 company_score = 1
             else:
@@ -1188,9 +1245,10 @@ def _integrate_local_payment_reports(
 
     if local_pix_pdf:
         try:
-            if str(local_pix_pdf).lower().endswith(".csv"):
+            pix_suffix = _effective_local_report_suffix(local_pix_pdf)
+            if pix_suffix == ".csv":
                 relatorio_pix = _build_pix_report_from_caixa_csv(local_pix_pdf, data_br)
-            elif str(local_pix_pdf).lower().endswith(".xlsx"):
+            elif pix_suffix == ".xlsx":
                 relatorio_pix = _build_pix_report_from_caixa_xlsx(local_pix_pdf, data_br)
             else:
                 relatorio_pix = _build_pix_report_from_caixa_pdf(local_pix_pdf, data_br)
@@ -1481,20 +1539,25 @@ def _write_gmail_body_debug(
     title: str | None = None,
     summary_lines: list[str] | None = None,
     note: str | None = None,
+    extra_lines: list[str] | None = None,
 ) -> None:
     try:
         linhas = []
         if title:
             linhas.extend([title, "=" * 100, ""])
+        if extra_lines:
+            linhas.extend([str(item) for item in extra_lines if str(item or "").strip()])
+            if linhas and linhas[-1] != "":
+                linhas.append("")
         if summary_lines:
             linhas.append("Últimos e-mails identificados:")
-            for line in summary_lines[:5]:
+            for line in summary_lines[:8]:
                 linhas.append(f"- {line}")
             linhas.append("")
         if note:
             linhas.append(note)
             linhas.append("")
-        for idx, entry in enumerate(entries[:5], start=1):
+        for idx, entry in enumerate(entries[:8], start=1):
             msg_ts = float(entry.get("timestamp") or 0.0)
             horario = "--:--:--"
             if msg_ts:
@@ -1502,16 +1565,26 @@ def _write_gmail_body_debug(
                     horario = datetime.fromtimestamp(msg_ts).strftime("%d/%m/%Y %H:%M:%S")
                 except Exception:
                     pass
-            remetente = str(entry.get("sender") or "Remetente desconhecido")
-            assunto = str(entry.get("subject") or "Sem assunto")
+            remetente = corrigir_texto(str(entry.get("sender") or "Remetente desconhecido"))
+            assunto = corrigir_texto(str(entry.get("subject") or "Sem assunto"))
+            msg_id = str(entry.get("message_id") or "").strip()
+            token = str(entry.get("token") or "").strip() or "(nenhum)"
+            decisao = corrigir_texto(str(entry.get("decision") or "sem decisao"))
+            snippet = corrigir_texto(str(entry.get("snippet") or "")).strip()
             corpo = corrigir_texto(str(entry.get("body") or "")).strip()
             linhas.extend(
                 [
                     "=" * 100,
                     f"Email #{idx}",
                     f"Horário: {horario}",
+                    f"Message ID: {msg_id or '(desconhecido)'}",
                     f"Remetente: {remetente}",
                     f"Assunto: {assunto}",
+                    f"Token extraído: {token}",
+                    f"Decisão do app: {decisao}",
+                    "",
+                    "Snippet retornado pela API:",
+                    snippet or "(vazio)",
                     "",
                     "Corpo visível analisado pelo parser:",
                     corpo or "(vazio)",
@@ -1540,8 +1613,6 @@ def _fetch_fiserv_token_from_gmail(
         for token in (ignored_tokens or set())
         if str(token or "").strip()
     }
-    fresh_cutoff = max(0.0, float(sent_after or 0.0))
-    fresh_cutoff_grace = 5.0
 
     _write_gmail_body_debug(
         [],
@@ -1553,6 +1624,8 @@ def _fetch_fiserv_token_from_gmail(
     last_error = None
     fallback_recent_token: tuple[float, str] | None = None
     checked_full_ids: set[str] = set()
+    gmail_query = "from:no-reply@fiserv.com newer_than:7d"
+    gmail_debug_limit = 8
 
     def _format_candidate_summary(msg_ts: float, sender: str, subject: str) -> str:
         horario = "--:--:--"
@@ -1578,11 +1651,6 @@ def _fetch_fiserv_token_from_gmail(
             return 5.0
         return 10.0
 
-    def _is_recent_enough(msg_ts: float) -> bool:
-        if not fresh_cutoff:
-            return True
-        return msg_ts >= max(0.0, fresh_cutoff - fresh_cutoff_grace)
-
     try:
         creds = _get_gmail_api_credentials(on_status=on_status)
         if not creds:
@@ -1594,8 +1662,8 @@ def _fetch_fiserv_token_from_gmail(
             response = session.get(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
                 params={
-                    "q": "",
-                    "maxResults": 20,
+                    "q": gmail_query,
+                    "maxResults": gmail_debug_limit,
                     "includeSpamTrash": "false",
                     "fields": "messages/id,resultSizeEstimate",
                 },
@@ -1613,14 +1681,21 @@ def _fetch_fiserv_token_from_gmail(
                     pass
             response.raise_for_status()
             messages = (response.json() or {}).get("messages") or []
-            _emit_pix_status(
-                on_status,
-                f"Gmail API retornou {len(messages)} e-mail(s) recente(s). Exibindo os 5 mais recentes.",
-            )
             newest_match: tuple[float, str] | None = None
             ignored_marker_seen = False
+            ignored_rejected_logged = False
+            older_than_rejected_logged = False
             candidates: list[tuple[float, str, str, str]] = []
             api_debug_entries: list[dict[str, object]] = []
+            debug_context_lines = [
+                f"Consulta Gmail usada: {gmail_query}",
+                f"Fallback recente permitido nesta tentativa: {'sim' if allow_recent_fallback else 'não'}",
+                (
+                    "Tokens já descartados nesta rodada: "
+                    + (", ".join(sorted(ignored_tokens_normalized)) if ignored_tokens_normalized else "(nenhum)")
+                ),
+                "",
+            ]
             for item in messages:
                 msg_id = str(item.get("id") or "").strip()
                 if not msg_id:
@@ -1645,84 +1720,72 @@ def _fetch_fiserv_token_from_gmail(
             candidates.sort(key=lambda item: item[0], reverse=True)
             candidate_summaries = [
                 _format_candidate_summary(msg_ts, sender, subject)
-                for msg_ts, _msg_id, subject, sender in candidates[:5]
+                for msg_ts, _msg_id, subject, sender in candidates[:gmail_debug_limit]
             ]
-            _emit_pix_status(
-                on_status,
-                f"Validando os {min(len(candidates), 5)} e-mail(s) mais recente(s).",
-            )
-            if candidates:
-                for idx, (msg_ts, _msg_id, subject, sender) in enumerate(candidates[:5], start=1):
-                    _emit_pix_status(
-                        on_status,
-                        f"Email recente #{idx}: {_format_candidate_summary(msg_ts, sender, subject)}",
-                    )
-            for msg_ts, msg_id, subject, sender in candidates[:5]:
+            for msg_ts, msg_id, subject, sender in candidates[:gmail_debug_limit]:
                 if msg_id in checked_full_ids:
                     continue
-                assunto_resumido = (subject or "Sem assunto").strip()
-                if len(assunto_resumido) > 70:
-                    assunto_resumido = assunto_resumido[:67] + "..."
-                remetente_resumido = (sender or "Remetente desconhecido").strip()
-                if len(remetente_resumido) > 60:
-                    remetente_resumido = remetente_resumido[:57] + "..."
-                _emit_pix_status(
-                    on_status,
-                    f"Lendo e-mail {msg_id[-6:]} de {remetente_resumido} ({assunto_resumido}).",
-                )
                 msg_resp = session.get(
                     f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
-                    params={"format": "full", "fields": "id,internalDate,payload"},
+                    params={"format": "full", "fields": "id,internalDate,payload,snippet"},
                     timeout=15.0,
                 )
                 msg_resp.raise_for_status()
                 payload = msg_resp.json() or {}
                 checked_full_ids.add(msg_id)
                 body = _extract_gmail_api_body(payload.get("payload") or {})
+                snippet = str(payload.get("snippet") or "").strip()
+                searchable_text = body
+                if snippet:
+                    searchable_text = f"{searchable_text}\n{snippet}".strip() if searchable_text else snippet
+                token = _extract_fiserv_email_token(f"{subject}\n{searchable_text}")
                 api_debug_entries.append(
                     {
                         "timestamp": msg_ts,
+                        "message_id": msg_id,
                         "sender": sender,
                         "subject": subject,
-                        "body": body,
+                        "snippet": snippet,
+                        "body": searchable_text,
+                        "token": token or "",
+                        "decision": "sem_token",
                     }
                 )
-                token = _extract_fiserv_email_token(f"{subject}\n{body}")
-                if token and _is_likely_login_token_email(sender, subject, body):
+                if token and _is_likely_login_token_email(sender, subject, searchable_text):
                     if token in ignored_tokens_normalized:
                         ignored_marker_seen = True
-                        _emit_pix_status(
-                            on_status,
-                            f"Token do e-mail {msg_id[-6:]} ja foi descartado; aguardando um codigo novo.",
-                        )
+                        api_debug_entries[-1]["decision"] = "token_ja_rejeitado"
+                        if not ignored_rejected_logged:
+                            _emit_pix_status(
+                                on_status,
+                                "Codigo de login ja rejeitado anteriormente; aguardando um novo e-mail.",
+                            )
+                            ignored_rejected_logged = True
                         continue
                     if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
                         fallback_recent_token = (msg_ts, token)
                     if ignored_marker_seen and ignored_tokens_normalized and not allow_recent_fallback:
-                        _emit_pix_status(
-                            on_status,
-                            f"O token do e-mail {msg_id[-6:]} e mais antigo que o codigo rejeitado; aguardando um e-mail mais novo.",
-                        )
+                        api_debug_entries[-1]["decision"] = "token_mais_antigo_que_rejeitado"
+                        if not older_than_rejected_logged:
+                            _emit_pix_status(
+                                on_status,
+                                "O codigo disponivel e mais antigo que o rejeitado; aguardando um e-mail mais novo.",
+                            )
+                            older_than_rejected_logged = True
                         continue
                     if not newest_match or msg_ts > newest_match[0]:
                         newest_match = (msg_ts, token)
-                    _emit_pix_status(
-                        on_status,
-                        f"Token compativel com login encontrado no e-mail {msg_id[-6:]}.",
-                    )
+                    api_debug_entries[-1]["decision"] = "token_pronto_para_validacao"
                     continue
-                    if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
-                        fallback_recent_token = (msg_ts, token)
-                    if not newest_match or msg_ts > newest_match[0]:
-                        newest_match = (msg_ts, token)
-                    _emit_pix_status(
-                        on_status,
-                        f"Token compatível com login encontrado no e-mail {msg_id[-6:]}.",
-                    )
+                if token:
+                    api_debug_entries[-1]["decision"] = "token_extraido_sem_confirmacao_de_contexto"
+                else:
+                    api_debug_entries[-1]["decision"] = "nenhum_token_extraido"
             _write_gmail_body_debug(
                 api_debug_entries,
                 title="Debug do Gmail via API",
                 summary_lines=candidate_summaries,
+                extra_lines=debug_context_lines,
                 note=(
                     None
                     if api_debug_entries
@@ -1730,7 +1793,7 @@ def _fetch_fiserv_token_from_gmail(
                 ),
             )
             if newest_match:
-                _emit_pix_status(on_status, f"Token encontrado no Gmail: {newest_match[1]}.")
+                _emit_pix_status(on_status, f"Codigo de login pronto para validacao na Caixa: {newest_match[1]}.")
                 return newest_match[1]
             wait_seconds = _compute_poll_interval()
             _emit_pix_status(
@@ -1791,12 +1854,10 @@ def _fetch_fiserv_token_from_gmail(
                 if status != "OK":
                     status, data = mail.uid("search", None, "ALL")
                 ids = (data[0] or b"").split()[-20:]
-                _emit_pix_status(
-                    on_status,
-                    f"IMAP retornou {len(ids)} e-mail(s) recente(s). Exibindo os 5 mais recentes.",
-                )
                 newest_match: tuple[float, str] | None = None
                 ignored_marker_seen = False
+                ignored_rejected_logged = False
+                older_than_rejected_logged = False
                 imap_candidates: list[tuple[float, str, str]] = []
                 imap_debug_entries: list[dict[str, object]] = []
                 for uid in reversed(ids):
@@ -1816,16 +1877,6 @@ def _fetch_fiserv_token_from_gmail(
                     assunto = _decode_mime(msg.get("Subject") or "")
                     corpo = _message_text(msg)
                     imap_candidates.append((msg_ts, msg.get("From") or "", assunto))
-                    remetente_resumido = (msg.get("From") or "Remetente desconhecido").strip()
-                    if len(remetente_resumido) > 60:
-                        remetente_resumido = remetente_resumido[:57] + "..."
-                    assunto_resumido = (assunto or "Sem assunto").strip()
-                    if len(assunto_resumido) > 70:
-                        assunto_resumido = assunto_resumido[:67] + "..."
-                    _emit_pix_status(
-                        on_status,
-                        f"Validando e-mail IMAP de {remetente_resumido} ({assunto_resumido}).",
-                    )
                     imap_debug_entries.append(
                         {
                             "timestamp": msg_ts,
@@ -1838,25 +1889,25 @@ def _fetch_fiserv_token_from_gmail(
                     if token and _is_likely_login_token_email(remetente, assunto, corpo):
                         if token in ignored_tokens_normalized:
                             ignored_marker_seen = True
-                            _emit_pix_status(
-                                on_status,
-                                "O token retornado via IMAP ja foi descartado; aguardando um novo codigo.",
-                            )
+                            if not ignored_rejected_logged:
+                                _emit_pix_status(
+                                    on_status,
+                                    "O token retornado via IMAP ja foi descartado; aguardando um novo codigo.",
+                                )
+                                ignored_rejected_logged = True
                             continue
                         if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
                             fallback_recent_token = (msg_ts, token)
                         if ignored_marker_seen and ignored_tokens_normalized and not allow_recent_fallback:
-                            _emit_pix_status(
-                                on_status,
-                                "O token encontrado via IMAP e mais antigo que o codigo rejeitado; aguardando um e-mail mais novo.",
-                            )
+                            if not older_than_rejected_logged:
+                                _emit_pix_status(
+                                    on_status,
+                                    "O codigo encontrado via IMAP e mais antigo que o rejeitado; aguardando um e-mail mais novo.",
+                                )
+                                older_than_rejected_logged = True
                             continue
                         if not newest_match or msg_ts > newest_match[0]:
                             newest_match = (msg_ts, token)
-                        _emit_pix_status(
-                            on_status,
-                            f"Token compativel com login encontrado via IMAP ({assunto_resumido}).",
-                        )
                         continue
                         if not fallback_recent_token or msg_ts > fallback_recent_token[0]:
                             fallback_recent_token = (msg_ts, token)
@@ -1865,13 +1916,6 @@ def _fetch_fiserv_token_from_gmail(
                         _emit_pix_status(
                             on_status,
                             f"Token compatível com login encontrado via IMAP ({assunto_resumido}).",
-                        )
-                if imap_candidates:
-                    imap_candidates.sort(key=lambda item: item[0], reverse=True)
-                    for idx, (msg_ts, sender, subject) in enumerate(imap_candidates[:5], start=1):
-                        _emit_pix_status(
-                            on_status,
-                            f"Email IMAP #{idx}: {_format_candidate_summary(msg_ts, sender, subject)}",
                         )
                 _write_gmail_body_debug(
                     imap_debug_entries,
@@ -1887,7 +1931,7 @@ def _fetch_fiserv_token_from_gmail(
                     ),
                 )
                 if newest_match:
-                    _emit_pix_status(on_status, f"Token encontrado via IMAP: {newest_match[1]}.")
+                    _emit_pix_status(on_status, f"Codigo de login via IMAP pronto para validacao na Caixa: {newest_match[1]}.")
                     return newest_match[1]
         except Exception as exc:
             last_error = exc
@@ -1922,7 +1966,7 @@ def _wait_for_downloaded_report(
     timeout: float = 90.0,
 ) -> str | None:
     deadline = time.time() + timeout
-    suffixes = ("*.csv", "*.xlsx") if kind == "pix" else ("*.pdf", "*.xlsx")
+    suffixes = ("*.csv", "*.xlsx", "*.crdownload") if kind == "pix" else ("*.pdf", "*.xlsx", "*.crdownload")
     while time.time() < deadline:
         for pattern in suffixes:
             candidates = sorted(
@@ -1932,13 +1976,14 @@ def _wait_for_downloaded_report(
             )
             for path in candidates:
                 try:
+                    effective_suffix = _effective_local_report_suffix(path)
                     if path.stat().st_mtime < started_at - 1:
                         continue
-                    if path.name.endswith(".crdownload") or path.name.endswith(".tmp"):
+                    if effective_suffix not in _LOCAL_REPORT_SUFFIXES or path.name.endswith(".tmp"):
                         continue
-                    if path.suffix.lower() == ".csv":
+                    if effective_suffix == ".csv":
                         text = _read_text_file(path)
-                    elif path.suffix.lower() == ".xlsx":
+                    elif effective_suffix == ".xlsx":
                         text = _read_excel_text(path)
                     else:
                         text = _read_pdf_text(path)
@@ -1947,18 +1992,19 @@ def _wait_for_downloaded_report(
                     if detected_date and detected_date != data_br:
                         continue
                     if kind == "pix" and (
-                        (path.suffix.lower() == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm)
-                        or (path.suffix.lower() == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm)
+                        (effective_suffix == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm)
+                        or (effective_suffix == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm)
                     ):
-                        if path.suffix.lower() == ".xlsx":
-                            converted = _convert_pix_xlsx_to_csv(str(path))
-                            return converted or str(path)
-                        return str(path)
+                        normalized_path = _finalize_local_report_path(path)
+                        if effective_suffix == ".xlsx":
+                            converted = _convert_pix_xlsx_to_csv(normalized_path)
+                            return converted or normalized_path
+                        return normalized_path
                     if kind == "cartoes" and (
                         "relatorio de historico de vendas" in text_norm and "periodo de venda" in text_norm
-                        or (path.suffix.lower() == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm)
+                        or (effective_suffix == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm)
                     ):
-                        return str(path)
+                        return _finalize_local_report_path(path)
                 except Exception:
                     continue
         time.sleep(0.6)
@@ -1978,7 +2024,7 @@ _AZULZINHA_DEBUG_ARTIFACT_PATTERNS = (
 
 
 def _cleanup_azulzinha_debug_artifacts() -> None:
-    base_dir = Path(_runtime_user_dir())
+    base_dir = Path(_active_report_dir())
     visited: set[Path] = set()
     for pattern in _AZULZINHA_DEBUG_ARTIFACT_PATTERNS:
         try:
@@ -1999,7 +2045,13 @@ _EH_AUTO_PAYMENT_REPORT_PREFIXES = (
     "relatorio_de_vendas_pix_",
     "historico_simplificado_de_vendas_",
 )
-_EH_AUTO_PAYMENT_REPORT_SUFFIXES = (".csv", ".xlsx", ".pdf")
+_EH_AUTO_PAYMENT_REPORT_SUFFIXES = (".csv", ".xlsx", ".pdf", ".crdownload")
+_AUTO_ZWEB_REPORT_PREFIXES = (
+    "pedidos_importados_",
+    "fechamento_de_caixa_",
+    "relatorio_zweb_",
+)
+_AUTO_ZWEB_REPORT_SUFFIXES = (".html",)
 
 
 def _is_eh_auto_payment_report_path(path_like: str | os.PathLike | None) -> bool:
@@ -2017,19 +2069,77 @@ def _is_eh_auto_payment_report_path(path_like: str | os.PathLike | None) -> bool
     return "_auto" in path.stem.casefold()
 
 
+def _is_generated_auto_report_path(path_like: str | os.PathLike | None) -> bool:
+    if _is_eh_auto_payment_report_path(path_like):
+        return True
+    if not path_like:
+        return False
+    try:
+        path = Path(path_like)
+    except TypeError:
+        return False
+    name = path.name.casefold()
+    if not any(name.startswith(prefix) for prefix in _AUTO_ZWEB_REPORT_PREFIXES):
+        return False
+    if path.suffix.lower() not in _AUTO_ZWEB_REPORT_SUFFIXES:
+        return False
+    return "_auto" in path.stem.casefold()
+
+
 def _cleanup_eh_auto_payment_reports(*paths_like: str | os.PathLike | None) -> None:
     targets: dict[str, Path] = {}
+    scan_dirs: dict[str, Path] = {str(Path(_active_report_dir())).casefold(): Path(_active_report_dir())}
     for raw_path in paths_like:
         if not _is_eh_auto_payment_report_path(raw_path):
             continue
         path = Path(str(raw_path))
-        for suffix in _EH_AUTO_PAYMENT_REPORT_SUFFIXES:
-            candidate = path.with_suffix(suffix)
-            if not candidate.is_file() or not _is_eh_auto_payment_report_path(candidate):
+        scan_dirs[str(path.parent).casefold()] = path.parent
+        base_name = path.name[:-11] if path.name.casefold().endswith(".crdownload") else path.name
+        for candidate in (path.parent / f"{base_name}.crdownload",):
+            if not candidate.is_file():
+                continue
+            if not _is_eh_auto_payment_report_path(candidate):
                 continue
             targets[str(candidate).casefold()] = candidate
 
+    for directory in scan_dirs.values():
+        try:
+            partials = list(directory.glob("*.crdownload"))
+        except Exception:
+            continue
+        for candidate in partials:
+            name = candidate.name.casefold()
+            if (
+                "relatorio_de_vendas_pix" in name
+                or ("historico" in name and "vendas" in name)
+            ):
+                targets[str(candidate).casefold()] = candidate
+
     for candidate in targets.values():
+        try:
+            candidate.unlink()
+        except Exception:
+            pass
+
+
+def cleanup_generated_auto_reports(report_dir: str | os.PathLike | None = None) -> None:
+    try:
+        base_dir = Path(report_dir or _active_report_dir())
+    except TypeError:
+        return
+    if not base_dir.exists() or not base_dir.is_dir():
+        return
+
+    try:
+        candidates = list(base_dir.iterdir())
+    except Exception:
+        return
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if not _is_generated_auto_report_path(candidate):
+            continue
         try:
             candidate.unlink()
         except Exception:
@@ -2072,9 +2182,12 @@ def baixar_relatorios_caixa_eh_azulzinha(
             "avisos": ["Nenhum navegador Chromium compativel foi encontrado para baixar os relatorios da Azulzinha/Caixa."],
         }
 
-    download_dir = _runtime_user_dir()
-    profile_dir = _azulzinha_browser_profile_dir(company_label)
-    _prepare_chromium_profile(profile_dir, download_dir)
+    download_dir = _active_report_dir()
+    artifacts_dir = Path(download_dir)
+    profile_root = _azulzinha_browser_profile_dir(company_label)
+    profile_dir = tempfile.mkdtemp(prefix=f"run_{company_norm}_", dir=profile_root)
+    browser_download_dir = tempfile.mkdtemp(prefix=f"downloads_{company_norm}_", dir=profile_root)
+    _prepare_chromium_profile(profile_dir, browser_download_dir)
     _cleanup_azulzinha_debug_artifacts()
     port = _pick_free_local_port()
     chrome_args = [
@@ -2091,8 +2204,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
         "--disable-save-password-bubble",
         "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication",
         "--window-size=1400,900",
-        "--window-position=-32000,-32000",
-        "--start-minimized",
         "--disable-gpu",
         "about:blank",
     ]
@@ -2214,7 +2325,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     if kind == "pix"
                     else f"Historico_Simplificado_de_vendas_{data_br.replace('/', '-')}_{company_norm}_auto{safe_suffix}"
                 )
-                target = Path(download_dir) / filename
+                target = artifacts_dir / filename
                 try:
                     target.write_bytes(payload)
                 except Exception:
@@ -2249,6 +2360,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             return str(target)
                 except Exception:
                     pass
+                try:
+                    if target.exists():
+                        target.unlink()
+                except Exception:
+                    pass
                 return None
 
             def _persist_downloaded_report(path_like: str | None, kind: str) -> str | None:
@@ -2262,15 +2378,20 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     payload = source_path.read_bytes()
                 except Exception:
                     return str(source_path)
-                saved = _save_captured_report_bytes(payload, kind, source_path.suffix or ".pdf", str(source_path))
+                normalized_source = _finalize_local_report_path(source_path)
+                effective_suffix = _effective_local_report_suffix(normalized_source) or ".pdf"
+                saved = _save_captured_report_bytes(payload, kind, effective_suffix, str(source_path))
                 if saved:
                     try:
+                        normalized_path = Path(normalized_source)
+                        if normalized_path.exists() and normalized_path.resolve() != Path(saved).resolve():
+                            normalized_path.unlink()
                         if source_path.exists() and source_path.resolve() != Path(saved).resolve():
                             source_path.unlink()
                     except Exception:
                         pass
                     return saved
-                return str(source_path)
+                return normalized_source
 
             def _find_export_url_in_payload(payload):
                 if isinstance(payload, dict):
@@ -2449,7 +2570,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     if method == "Browser.downloadWillBegin":
                         browser_download_seen = True
                         await asyncio.sleep(2.0)
-                        found = _wait_for_downloaded_report(download_dir, data_br, kind, time.time() - 5.0, timeout=10.0)
+                        found = _wait_for_downloaded_report(browser_download_dir, data_br, kind, time.time() - 5.0, timeout=10.0)
                         if found:
                             return _persist_downloaded_report(found, kind)
                         event_start_index = len(event_log)
@@ -2508,7 +2629,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 json_text = payload.decode("utf-8", errors="ignore")
                                 json_payload = json.loads(json_text)
                                 try:
-                                    debug_path = Path(_runtime_user_dir()) / f"azulzinha_export_payload_{kind}.json"
+                                    debug_path = artifacts_dir / f"azulzinha_export_payload_{kind}.json"
                                     debug_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                                 except Exception:
                                     pass
@@ -2585,14 +2706,14 @@ def baixar_relatorios_caixa_eh_azulzinha(
 
                 if browser_download_seen:
                     return _persist_downloaded_report(
-                        _wait_for_downloaded_report(download_dir, data_br, kind, time.time() - 10.0, timeout=10.0),
+                            _wait_for_downloaded_report(browser_download_dir, data_br, kind, time.time() - 10.0, timeout=10.0),
                         kind,
                     )
                 direct_saved = await try_browser_export_urls()
                 if direct_saved:
                     return direct_saved
                 try:
-                    debug_path = Path(_runtime_user_dir()) / f"azulzinha_network_candidates_{kind}.json"
+                    debug_path = artifacts_dir / f"azulzinha_network_candidates_{kind}.json"
                     debug_path.write_text(json.dumps(seen_candidates, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
@@ -2612,7 +2733,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         """,
                         timeout=5.0,
                     )
-                    debug_signals_path = Path(_runtime_user_dir()) / f"azulzinha_export_signals_{kind}.json"
+                    debug_signals_path = artifacts_dir / f"azulzinha_export_signals_{kind}.json"
                     debug_signals_path.write_text(json.dumps(export_signals, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
@@ -2754,7 +2875,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         timeout=15.0,
                     )
                     if html_debug:
-                        debug_path = Path(_runtime_user_dir()) / f"azulzinha_tabs_debug_{tab_id}.html"
+                        debug_path = artifacts_dir / f"azulzinha_tabs_debug_{tab_id}.html"
                         debug_path.write_text(str(html_debug), encoding="utf-8")
                 except Exception:
                     pass
@@ -2764,21 +2885,146 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     raise RuntimeError(f"Nao foi possivel localizar o botao da aba {tab_id} no portal Azulzinha/Caixa.")
                 raise RuntimeError(f"Nao foi possivel abrir a aba {tab_id} no portal Azulzinha/Caixa.")
 
+            async def wait_for_portal_settle(
+                session_id: str,
+                tab_id: str | None = None,
+                timeout: float = 20.0,
+                context_label: str = "a tela atual",
+            ) -> None:
+                content_selector = (
+                    f"#{tab_id}Content [role='tabpanel']"
+                    if tab_id
+                    else "header[role='tablist'], #HistoricoVendas button[role='tab'], #Pix button[role='tab']"
+                )
+                settle_expression = f"""
+                    (() => {{
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const href = String(location.href || '').toUpperCase();
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const loginInput = document.querySelector('#b2-b1-b4-InputMask');
+                        const passwordInput = document.querySelector('#b2-b1-Input_Password');
+                        const loginTextVisible = (
+                            text.includes('ACESSE SUA CONTA') ||
+                            (text.includes('CNPJ, CPF OU USUARIO') && text.includes('SENHA'))
+                        );
+                        const deviceVisible = text.includes('SELECIONE O DISPOSITIVO');
+                        const tokenDeliveryVisible = (
+                            text.includes('ESCOLHA POR ONDE DESEJA RECEBER') ||
+                            text.includes('RECEBER POR E-MAIL') ||
+                            text.includes('@GMAIL.COM')
+                        );
+                        const tokenVisible = Boolean(
+                            [...document.querySelectorAll('input')]
+                                .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled && visible(el))
+                                .length
+                        ) && (
+                            text.includes('TOKEN') ||
+                            text.includes('CODIGO') ||
+                            text.includes('E-MAIL') ||
+                            text.includes('EMAIL')
+                        );
+                        const invalidVisible = (
+                            text.includes('CODIGO INVALIDO') ||
+                            text.includes('TOKEN INVALIDO') ||
+                            text.includes('TOKEN EXPIRADO') ||
+                            text.includes('TENTATIVAS')
+                        );
+                        if (href.includes('/_ERROR.HTML') || text.includes('ERROR PROCESSING YOUR REQUEST')) return 'portal_error';
+                        if (
+                            href.includes('ISTIMEOUT=TRUE') ||
+                            (visible(loginInput) && visible(passwordInput)) ||
+                            (
+                                loginTextVisible &&
+                                !deviceVisible &&
+                                !tokenDeliveryVisible &&
+                                !tokenVisible &&
+                                !invalidVisible
+                            )
+                        ) return 'login';
+                        const content = document.querySelector({content_selector!r});
+                        if (!content || (content.getAttribute && content.getAttribute('aria-hidden') === 'true')) return '';
+                        const busyNodes = [
+                            ...document.querySelectorAll('[aria-busy="true"], .ph-item, .ph-picture, .ph-picture-small, .spinner-border, .spinner-grow, .loading, .skeleton, .ant-skeleton')
+                        ].filter(visible);
+                        if (busyNodes.length) return '';
+                        const body = (content.innerText || content.textContent || document.body?.innerText || '').trim();
+                        return body.length > 20 ? 'ready' : '';
+                    }})()
+                    """
+                try:
+                    state = await wait_for_condition(
+                        session_id,
+                        settle_expression,
+                        timeout=timeout,
+                        step=0.4,
+                    )
+                except Exception:
+                    await capture_portal_html_debug_v2(session_id, "azulzinha_portal_settle_debug.html")
+                    raise
+                if state == "portal_error":
+                    raise RuntimeError(f"A Caixa abriu a pagina de erro durante {context_label}.")
+                if state == "login":
+                    raise RuntimeError(f"A Caixa voltou para o login durante {context_label}.")
+
             async def wait_for_tab_content(session_id: str, tab_id: str, timeout: float = 45.0) -> None:
                 content_id = f"{tab_id}Content"
-                await wait_for_condition(
+                state = await wait_for_condition(
                     session_id,
                     f"""
                     (() => {{
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const href = String(location.href || '').toUpperCase();
+                        if (href.includes('/_ERROR.HTML') || text.includes('ERROR PROCESSING YOUR REQUEST')) return 'portal_error';
                         const content = document.querySelector("#{content_id} [role='tabpanel']");
-                        if (!content || content.getAttribute('aria-hidden') !== 'false') return false;
+                        if (!content || content.getAttribute('aria-hidden') !== 'false') return '';
                         const body = content.innerText || content.textContent || '';
                         const html = content.innerHTML || '';
-                        return body.trim().length > 40 || html.includes('data-testid') || html.includes('Exportar') || html.includes('Filtro');
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const busyNodes = [...content.querySelectorAll('[aria-busy="true"], .ph-item, .ph-picture, .ph-picture-small, .spinner-border, .spinner-grow, .loading, .skeleton, .ant-skeleton')]
+                            .filter(visible);
+                        if (busyNodes.length) return '';
+                        if (body.trim().length > 40 || html.includes('data-testid') || html.includes('Exportar') || html.includes('Filtro')) return 'ready';
+                        return '';
                     }})()
                     """,
                     timeout=timeout,
                     step=0.5,
+                )
+                if state == "portal_error":
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = artifacts_dir / f"azulzinha_tab_error_{tab_id}.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"A Caixa abriu a pagina de erro ao carregar a aba {tab_id}.")
+                await asyncio.sleep(0.6)
+                await wait_for_portal_settle(
+                    session_id,
+                    tab_id=tab_id,
+                    timeout=20.0,
+                    context_label=f"carregar a aba {tab_id}",
                 )
 
             async def focus_selector(session_id: str, selector: str) -> bool:
@@ -2948,7 +3194,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             timeout=15.0,
                         )
                         if html_debug:
-                            debug_path = Path(_runtime_user_dir()) / "azulzinha_pix_date_debug.html"
+                            debug_path = artifacts_dir / "azulzinha_pix_date_debug.html"
                             debug_path.write_text(str(html_debug), encoding="utf-8")
                     except Exception:
                         pass
@@ -2984,26 +3230,44 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     )
                 except Exception:
                     pass
+                await asyncio.sleep(0.8)
 
             async def wait_for_export_ready(session_id: str, kind: str, timeout: float = 60.0) -> None:
                 export_selector = '[data-testid="exportar-pix-van"]' if kind == "pix" else '[data-testid^="exportar-"]'
                 content_id = "PixContent" if kind == "pix" else "HistoricoVendasContent"
                 expression = f"""
                 (() => {{
+                    const text = (document.body?.innerText || '')
+                        .normalize('NFD')
+                        .replace(/[\\u0300-\\u036f]/g, '')
+                        .toUpperCase();
+                    const href = String(location.href || '').toUpperCase();
+                    if (href.includes('/_ERROR.HTML') || text.includes('ERROR PROCESSING YOUR REQUEST')) return 'portal_error';
                     const content = document.querySelector("#{content_id} [role='tabpanel']");
-                    if (!content || content.getAttribute('aria-hidden') === 'true') return false;
+                    if (!content || content.getAttribute('aria-hidden') === 'true') return '';
+                    const visible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const busyNodes = [...content.querySelectorAll('[aria-busy="true"], .ph-item, .ph-picture, .ph-picture-small, .spinner-border, .spinner-grow, .loading, .skeleton, .ant-skeleton')]
+                        .filter(visible);
+                    if (busyNodes.length) return '';
                     const exportBtn = document.querySelector({export_selector!r});
-                    if (!exportBtn) return false;
-                    return !exportBtn.disabled;
+                    if (!exportBtn) return '';
+                    return !exportBtn.disabled ? 'ready' : '';
                 }})()
                 """
                 try:
-                    await wait_for_condition(
+                    state = await wait_for_condition(
                         session_id,
                         expression,
                         timeout=timeout,
                         step=0.5,
                     )
+                    if state == "ready":
+                        return
                 except Exception:
                     try:
                         html_debug = await eval_js(
@@ -3012,7 +3276,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             timeout=15.0,
                         )
                         if html_debug:
-                            debug_path = Path(_runtime_user_dir()) / f"azulzinha_export_ready_debug_{kind}.html"
+                            debug_path = artifacts_dir / f"azulzinha_export_ready_debug_{kind}.html"
                             debug_path.write_text(str(html_debug), encoding="utf-8")
                     except Exception:
                         pass
@@ -3047,11 +3311,25 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             timeout=15.0,
                         )
                         if state_debug is not None:
-                            debug_state_path = Path(_runtime_user_dir()) / f"azulzinha_export_ready_state_{kind}.json"
+                            debug_state_path = artifacts_dir / f"azulzinha_export_ready_state_{kind}.json"
                             debug_state_path.write_text(json.dumps(state_debug, ensure_ascii=False, indent=2), encoding="utf-8")
                     except Exception:
                         pass
                     raise
+                try:
+                    html_debug = await eval_js(
+                        session_id,
+                        "document.documentElement ? document.documentElement.outerHTML : ''",
+                        timeout=15.0,
+                    )
+                    if html_debug:
+                        debug_path = artifacts_dir / f"azulzinha_export_error_{kind}.html"
+                        debug_path.write_text(str(html_debug), encoding="utf-8")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"A Caixa abriu a pagina de erro ao preparar a exportacao do relatorio de {'PIX' if kind == 'pix' else 'cartoes'}."
+                )
 
             async def click_export(session_id: str, kind: str) -> None:
                 await eval_js(
@@ -3288,7 +3566,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                         timeout=15.0,
                                     )
                                     if html_debug:
-                                        debug_path = Path(_runtime_user_dir()) / "azulzinha_export_popup_cartoes.html"
+                                        debug_path = artifacts_dir / "azulzinha_export_popup_cartoes.html"
                                         debug_path.write_text(str(html_debug), encoding="utf-8")
                                 except Exception:
                                     pass
@@ -3364,7 +3642,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             timeout=15.0,
                         )
                         if state_debug is not None:
-                            debug_state_path = Path(_runtime_user_dir()) / f"azulzinha_export_state_{kind}.json"
+                            debug_state_path = artifacts_dir / f"azulzinha_export_state_{kind}.json"
                             debug_state_path.write_text(json.dumps(state_debug, ensure_ascii=False, indent=2), encoding="utf-8")
                     except Exception:
                         pass
@@ -3375,37 +3653,199 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             timeout=15.0,
                         )
                         if html_debug:
-                            debug_path = Path(_runtime_user_dir()) / f"azulzinha_export_debug_{kind}.html"
+                            debug_path = artifacts_dir / f"azulzinha_export_debug_{kind}.html"
                             debug_path.write_text(str(html_debug), encoding="utf-8")
                     except Exception:
                         pass
                     raise RuntimeError("Nao foi possivel acionar o botao de exportacao no portal Azulzinha/Caixa.")
 
-            async def ensure_login(session_id: str) -> None:
+            async def ensure_login(session_id: str, auth_restart_count: int = 0) -> None:
                 _emit_pix_status(on_status, "Acessando Azulzinha/Caixa...")
                 await navigate(session_id, credenciais["login_url"])
                 if await eval_js(
                     session_id,
                     """
                     (() => {
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
                         const hasSalesTabs = Boolean(
                             document.querySelector('header[role="tablist"]') ||
                             document.querySelector('#HistoricoVendas button[role="tab"]') ||
                             document.querySelector('#Pix button[role="tab"]')
                         );
-                        return location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs;
+                        const onLoginPage = (
+                            visible(document.querySelector('#b2-b1-b4-InputMask')) &&
+                            visible(document.querySelector('#b2-b1-Input_Password'))
+                        ) || text.includes('ACESSE SUA CONTA');
+                        return !onLoginPage && (
+                            hasSalesTabs ||
+                            text.includes('HISTORICO DE VENDAS') ||
+                            text.includes('PAGAMENTO INSTANTANEO') ||
+                            text.includes('PIX')
+                        );
                     })()
                     """,
                 ):
                     return
                 _emit_pix_status(on_status, "Autenticando na Azulzinha/Caixa...")
-                await wait_for_condition(
+                login_selectors = await wait_for_condition(
                     session_id,
-                    "Boolean(document.querySelector('#b2-b1-b4-InputMask') && document.querySelector('#b2-b1-Input_Password'))",
+                    """
+                    (() => {
+                        const visible = (el) => {
+                            if (!el || el.disabled) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const userCandidates = [
+                            document.querySelector('#b2-b1-b4-InputMask'),
+                            ...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])'),
+                        ].filter(visible);
+                        const passwordCandidates = [
+                            document.querySelector('#b2-b1-Input_Password'),
+                            ...document.querySelectorAll('input[type="password"]'),
+                        ].filter(visible);
+                        const user = userCandidates[0];
+                        const password = passwordCandidates[0];
+                        if (!user || !password) return null;
+                        user.setAttribute('data-codex-login-user', '1');
+                        password.setAttribute('data-codex-login-pass', '1');
+                        return {
+                            user: user.id ? `#${user.id}` : '[data-codex-login-user="1"]',
+                            password: password.id ? `#${password.id}` : '[data-codex-login-pass="1"]',
+                        };
+                    })()
+                    """,
                     timeout=60.0,
+                    description="A Caixa nao exibiu a tela de login para informar CNPJ e senha",
                 )
-                await insert_text(session_id, "#b2-b1-b4-InputMask", re.sub(r"\D", "", str(credenciais["cnpj"] or "")))
-                await insert_text(session_id, "#b2-b1-Input_Password", str(credenciais["password"] or ""))
+                login_user_selector = str((login_selectors or {}).get("user") or "#b2-b1-b4-InputMask")
+                login_password_selector = str((login_selectors or {}).get("password") or "#b2-b1-Input_Password")
+                cnpj_digits = re.sub(r"\D", "", str(credenciais["cnpj"] or ""))
+                password_text = str(credenciais["password"] or "")
+                try:
+                    await insert_text(session_id, login_user_selector, cnpj_digits)
+                except Exception:
+                    pass
+                try:
+                    await insert_text(session_id, login_password_selector, password_text)
+                except Exception:
+                    pass
+                await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const setNativeValue = (el, value) => {{
+                            const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                            if (setter) setter.call(el, value); else el.value = value;
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: '0' }}));
+                            el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                        }};
+                        const user = document.querySelector({login_user_selector!r}) || [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                        const password = document.querySelector({login_password_selector!r}) || [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                        if (!user || !password) return false;
+                        user.focus();
+                        setNativeValue(user, {cnpj_digits!r});
+                        password.focus();
+                        setNativeValue(password, {password_text!r});
+                        return true;
+                    }})()
+                    """,
+                    timeout=15.0,
+                )
+                credential_fill_state = await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const user = document.querySelector({login_user_selector!r}) || [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                        const password = document.querySelector({login_password_selector!r}) || [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                        const userValue = String(user?.value || user?.getAttribute('value') || '').replace(/\\D/g, '');
+                        const passwordValue = String(password?.value || password?.getAttribute('value') || '');
+                        return {{
+                            userLen: userValue.length,
+                            passwordLen: passwordValue.length,
+                        }};
+                    }})()
+                    """,
+                ) or {}
+                if int(credential_fill_state.get("userLen") or 0) < len(cnpj_digits) or int(credential_fill_state.get("passwordLen") or 0) < len(password_text):
+                    await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                            const visible = (el) => {{
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            }};
+                            const setNativeValue = (el, value) => {{
+                                const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                                if (setter) setter.call(el, value); else el.value = value;
+                                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                            }};
+                            const user = document.querySelector({login_user_selector!r}) || [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                            const password = document.querySelector({login_password_selector!r}) || [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                            if (!user || !password) return false;
+                            user.focus();
+                            setNativeValue(user, {cnpj_digits!r});
+                            password.focus();
+                            setNativeValue(password, {password_text!r});
+                            return true;
+                        }})()
+                        """,
+                    )
+                credential_fill_state = await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const user = document.querySelector({login_user_selector!r}) || [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                        const password = document.querySelector({login_password_selector!r}) || [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                        const userValue = String(user?.value || user?.getAttribute('value') || '').replace(/\\D/g, '');
+                        const passwordValue = String(password?.value || password?.getAttribute('value') || '');
+                        return {{
+                            userLen: userValue.length,
+                            passwordLen: passwordValue.length,
+                        }};
+                    }})()
+                    """,
+                ) or {}
+                if int(credential_fill_state.get("userLen") or 0) < len(cnpj_digits) or int(credential_fill_state.get("passwordLen") or 0) < len(password_text):
+                    await capture_portal_html_debug_v2(session_id, "azulzinha_login_fill_debug.html")
+                    raise RuntimeError("Nao foi possivel preencher o login e a senha da Azulzinha/Caixa.")
                 await press_tab(session_id)
                 await wait_for_condition(
                     session_id,
@@ -3439,14 +3879,29 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             .normalize('NFD')
                             .replace(/[\\u0300-\\u036f]/g, '')
                             .toUpperCase();
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
                         const hasSalesTabs = Boolean(
                             document.querySelector('header[role="tablist"]') ||
                             document.querySelector('#HistoricoVendas button[role="tab"]') ||
                             document.querySelector('#Pix button[role="tab"]')
                         );
-                        if (location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs) return 'logged';
-                        if (text.includes('SELECIONE O DISPOSITIVO')) return 'device';
-                        if (text.includes('TOKEN') || text.includes('CODIGO') || text.includes('E-MAIL') || text.includes('EMAIL')) return 'token';
+                        const onLoginPage = (
+                            visible(document.querySelector('#b2-b1-b4-InputMask')) &&
+                            visible(document.querySelector('#b2-b1-Input_Password'))
+                        ) || text.includes('ACESSE SUA CONTA');
+                        const tokenInputs = [...document.querySelectorAll('input')].filter((el) => {
+                            const type = (el.type || '').toLowerCase();
+                            return type !== 'hidden' && type !== 'password' && !el.disabled && visible(el);
+                        });
+                        if (!onLoginPage && (hasSalesTabs || text.includes('HISTORICO DE VENDAS') || text.includes('PAGAMENTO INSTANTANEO') || text.includes('PIX'))) return 'logged';
+                        if (!onLoginPage && text.includes('SELECIONE O DISPOSITIVO')) return 'device';
+                        if (!onLoginPage && (text.includes('ESCOLHA POR ONDE DESEJA RECEBER') || text.includes('RECEBER POR E-MAIL') || text.includes('@GMAIL.COM'))) return 'token';
+                        if (!onLoginPage && tokenInputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'))) return 'token';
                         return '';
                     })()
                     """,
@@ -3467,15 +3922,29 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 .normalize('NFD')
                                 .replace(/[\\u0300-\\u036f]/g, '')
                                 .toUpperCase();
+                            const visible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
                             const hasSalesTabs = Boolean(
                                 document.querySelector('header[role="tablist"]') ||
                                 document.querySelector('#HistoricoVendas button[role="tab"]') ||
                                 document.querySelector('#Pix button[role="tab"]')
                             );
-                            if (location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs) return 'logged';
-                            if (text.includes('INFORME O TOKEN DO APLICATIVO')) return 'token_app';
-                            if (text.includes('ESCOLHA POR ONDE DESEJA RECEBER')) return 'token_delivery';
-                            if (text.includes('TOKEN') || text.includes('CODIGO') || text.includes('E-MAIL') || text.includes('EMAIL')) return 'token';
+                            const onLoginPage = (
+                                visible(document.querySelector('#b2-b1-b4-InputMask')) &&
+                                visible(document.querySelector('#b2-b1-Input_Password'))
+                            ) || text.includes('ACESSE SUA CONTA');
+                            const tokenInputs = [...document.querySelectorAll('input')].filter((el) => {
+                                const type = (el.type || '').toLowerCase();
+                                return type !== 'hidden' && type !== 'password' && !el.disabled && visible(el);
+                            });
+                            if (!onLoginPage && (hasSalesTabs || text.includes('HISTORICO DE VENDAS') || text.includes('PAGAMENTO INSTANTANEO') || text.includes('PIX'))) return 'logged';
+                            if (!onLoginPage && text.includes('INFORME O TOKEN DO APLICATIVO')) return 'token_app';
+                            if (!onLoginPage && (text.includes('ESCOLHA POR ONDE DESEJA RECEBER') || text.includes('RECEBER POR E-MAIL') || text.includes('@GMAIL.COM'))) return 'token_delivery';
+                            if (!onLoginPage && tokenInputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'))) return 'token';
                             return '';
                         })()
                         """,
@@ -3485,9 +3954,154 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 if state == "logged":
                     return
 
+                async def request_token_via_email(session_id: str, current_state: str | None = None) -> str:
+                    state_local = str(current_state or "").strip()
+                    if state_local in {"token", "token_app"}:
+                        token_screen_ready = await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const text = (document.body?.innerText || '')
+                                    .normalize('NFD')
+                                    .replace(/[\u0300-\u036f]/g, '')
+                                    .toUpperCase();
+                                const visible = (el) => {
+                                    if (!el) return false;
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                };
+                                const onLoginPage = (
+                                    visible(document.querySelector('#b2-b1-b4-InputMask')) &&
+                                    visible(document.querySelector('#b2-b1-Input_Password'))
+                                ) || text.includes('ACESSE SUA CONTA');
+                                const tokenInputs = [...document.querySelectorAll('input')].filter((el) => {
+                                    const type = (el.type || '').toLowerCase();
+                                    return type !== 'hidden' && type !== 'password' && !el.disabled && visible(el);
+                                });
+                                return !onLoginPage && (
+                                    text.includes('ESCOLHA POR ONDE DESEJA RECEBER') ||
+                                    text.includes('RECEBER POR E-MAIL') ||
+                                    text.includes('@GMAIL.COM') ||
+                                    (tokenInputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO')))
+                                );
+                            })()
+                            """,
+                        )
+                        if not token_screen_ready:
+                            state_local = ""
+                    if state_local in {"token", "token_app"}:
+                        abriu = await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const link = document.querySelector('a.bold.font-universe.cor-preto');
+                                if (!link) return false;
+                                link.click();
+                                return true;
+                            })()
+                            """,
+                        )
+                        if not abriu and not await click_by_text(
+                            session_id,
+                            [
+                                "Receber codigo por e-mail ou SMS",
+                                "Receber c??digo por e-mail ou SMS",
+                                "Receber cÃ³digo por e-mail ou SMS",
+                                "Reenviar codigo",
+                                "Reenviar token",
+                            ],
+                            timeout=20.0,
+                        ):
+                            return state_local
+                        state_local = await wait_for_condition(
+                            session_id,
+                            """
+                            (() => {
+                                const text = (document.body?.innerText || '').toUpperCase();
+                                const inputs = [...document.querySelectorAll('input')]
+                                    .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                                if (text.includes('ESCOLHA POR ONDE DESEJA RECEBER')) return 'token_delivery';
+                                if (text.includes('RECEBER POR E-MAIL') || text.includes('@GMAIL.COM')) return 'token_delivery';
+                                if (inputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'))) return 'token';
+                                return '';
+                            })()
+                            """,
+                            timeout=30.0,
+                        )
+                        await asyncio.sleep(1.0)
+
+                    if state_local == "token_delivery":
+                        selecionou_email = await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                                const visible = (el) => {
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                };
+                                const candidates = [...document.querySelectorAll('[id$="-Content"], .card-content, .ph.card.card-content')]
+                                    .filter(visible)
+                                    .map((el) => {
+                                        const text = norm(el.innerText || el.textContent || '');
+                                        if (!text.includes('RECEBER POR E-MAIL') && !text.includes('@GMAIL.COM')) return null;
+                                        const className = (el.className || '').toString().toUpperCase();
+                                        const isCard = className.includes('CARD-CONTENT') || className.includes('PH CARD');
+                                        const textLength = text.length || 9999;
+                                        return { el, score: (isCard ? 1000 : 0) - textLength };
+                                    })
+                                    .filter(Boolean)
+                                    .sort((a, b) => b.score - a.score);
+                                const match = candidates.length ? candidates[0].el : null;
+                                if (!match) return false;
+                                const text = norm(match.innerText || match.textContent || '');
+                                if (!text.includes('RECEBER POR E-MAIL') && !text.includes('@GMAIL.COM')) return false;
+                                const clickable = match.closest('[id$="-Content"], .card-content, .ph.card.card-content') || match;
+                                clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                                clickable.click();
+                                return true;
+                            })()
+                            """,
+                        )
+                        if not selecionou_email and not await click_card_by_text(session_id, ["RECEBER POR E-MAIL", "@GMAIL.COM"], timeout=20.0):
+                            if not await click_by_text(session_id, ["Receber por e-mail", "@gmail.com"], timeout=20.0):
+                                raise RuntimeError("Nao foi possivel selecionar o envio do token por e-mail na Azulzinha/Caixa.")
+                        await asyncio.sleep(1.0)
+                        await wait_for_condition(
+                            session_id,
+                            """
+                            (() => {
+                                const text = (document.body?.innerText || '')
+                                    .normalize('NFD')
+                                    .replace(/[\\u0300-\\u036f]/g, '')
+                                    .toUpperCase();
+                                const inputs = [...document.querySelectorAll('input')].filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                                return inputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'));
+                            })()
+                            """,
+                            timeout=30.0,
+                        )
+                        return "token"
+
+                    return state_local
+
+                token_email_grace_seconds = 15.0
+
+                async def wait_for_token_email_delivery_grace() -> None:
+                    _emit_pix_status(
+                        on_status,
+                        f"Aguardando {int(token_email_grace_seconds)}s para o e-mail do token chegar...",
+                    )
+                    await asyncio.sleep(token_email_grace_seconds)
+
                 _emit_pix_status(on_status, "Solicitando token por e-mail...")
                 token_requested_at = time.time()
-                if state in {"token", "token_app"}:
+                state = await request_token_via_email(session_id, state)
+                if state == "token":
+                    await wait_for_token_email_delivery_grace()
+                if False and state in {"token", "token_app"}:
                     abriu = await eval_js(
                         session_id,
                         """
@@ -3522,7 +4136,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         timeout=30.0,
                     )
                     await asyncio.sleep(1.0)
-                if state == "token_delivery":
+                if False and state == "token_delivery":
                     selecionou_email = await eval_js(
                         session_id,
                         """
@@ -3558,6 +4172,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     )
                     if not selecionou_email and not await click_card_by_text(session_id, ["RECEBER POR E-MAIL", "@GMAIL.COM"], timeout=20.0):
                         if not await click_by_text(session_id, ["Receber por e-mail", "@gmail.com"], timeout=20.0):
+                            await capture_portal_html_debug_v2(session_id, f"azulzinha_token_delivery_select_{company_norm}.html")
                             raise RuntimeError("Nao foi possivel selecionar o envio do token por e-mail na Azulzinha/Caixa.")
                     await asyncio.sleep(1.0)
                     await wait_for_condition(
@@ -3582,24 +4197,76 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             .normalize('NFD')
                             .replace(/[\\u0300-\\u036f]/g, '')
                             .toUpperCase();
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const hasSalesTabs = Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                        const onLoginPage = (
+                            visible(document.querySelector('#b2-b1-b4-InputMask')) &&
+                            visible(document.querySelector('#b2-b1-Input_Password'))
+                        ) || text.includes('ACESSE SUA CONTA');
                         const inputs = [...document.querySelectorAll('input')].filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
-                        return location.href.includes('/Home') || location.href.includes('/MinhasVendas') || inputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO'));
+                        return (!onLoginPage && (hasSalesTabs || text.includes('HISTORICO DE VENDAS') || text.includes('PAGAMENTO INSTANTANEO') || text.includes('PIX'))) || (!onLoginPage && inputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO')));
                     })()
                     """,
                     timeout=60.0,
                 )
-                if await eval_js(session_id, "location.href.includes('/Home') || location.href.includes('/MinhasVendas')"):
+                if await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const onLoginPage = (
+                            visible(document.querySelector('#b2-b1-b4-InputMask')) &&
+                            visible(document.querySelector('#b2-b1-Input_Password'))
+                        ) || text.includes('ACESSE SUA CONTA');
+                        return Boolean(
+                            !onLoginPage && (
+                                document.querySelector('header[role="tablist"]') ||
+                                document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                                document.querySelector('#Pix button[role="tab"]') ||
+                                text.includes('HISTORICO DE VENDAS') ||
+                                text.includes('PAGAMENTO INSTANTANEO') ||
+                                text.includes('PIX')
+                            )
+                        );
+                    })()
+                    """,
+                ):
                     return
                 ultimo_token_usado = ""
                 tokens_descartados: set[str] = set()
                 for tentativa_token in range(3):
                     if tentativa_token > 0:
-                        espera_extra_apos_rejeicao = 20.0
+                        espera_extra_apos_rejeicao = 5.0
                         _emit_pix_status(
                             on_status,
                             f"Token rejeitado pela Caixa; descartando o codigo anterior e aguardando {int(espera_extra_apos_rejeicao)}s por um novo e-mail...",
                         )
                         await asyncio.sleep(espera_extra_apos_rejeicao)
+                        try:
+                            state = await request_token_via_email(session_id, "token")
+                            if state == "token":
+                                token_requested_at = time.time()
+                                await wait_for_token_email_delivery_grace()
+                        except Exception:
+                            pass
                     inicio_busca_token = token_requested_at
                     espera_token = 180.0 if tentativa_token == 0 else 150.0
                     token = str(
@@ -3625,7 +4292,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         continue
 
                     ultimo_token_usado = token
-                    _emit_pix_status(on_status, "Confirmando token da Caixa...")
+                    _emit_pix_status(on_status, f"Confirmando token da Caixa: {token}...")
                     confirmed = False
                     token_inputs = await eval_js(
                         session_id,
@@ -3704,7 +4371,420 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     )
 
                     _emit_pix_status(on_status, "Aguardando a Caixa validar o token...")
-                    resultado_token = await wait_for_condition(
+                    await asyncio.sleep(1.5)
+                    sales_ready_expression = """
+                    (() => {
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const hasSalesTabs = Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                        return hasSalesTabs || text.includes('HISTORICO DE VENDAS') || text.includes('PAGAMENTO INSTANTANEO') || text.includes('PIX');
+                    })()
+                    """
+                    post_token_state_expression = """
+                    (() => {
+                        const text = (document.body?.innerText || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .toUpperCase();
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const hasSalesTabs = Boolean(
+                            document.querySelector('header[role="tablist"]') ||
+                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
+                            document.querySelector('#Pix button[role="tab"]')
+                        );
+                        const loginInput = document.querySelector('#b2-b1-b4-InputMask');
+                        const passwordInput = document.querySelector('#b2-b1-Input_Password');
+                        const tokenInputs = [...document.querySelectorAll('input')]
+                            .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled && visible(el));
+                        if (
+                            text.includes('CODIGO INVALIDO') ||
+                            text.includes('TOKEN INVALIDO') ||
+                            text.includes('TOKEN EXPIRADO') ||
+                            text.includes('TENTATIVAS')
+                        ) return 'invalid';
+                        if ((visible(loginInput) && visible(passwordInput)) || (text.includes('ACESSE SUA CONTA') && visible(loginInput))) return 'login';
+                        if (hasSalesTabs || text.includes('HISTORICO DE VENDAS') || text.includes('PAGAMENTO INSTANTANEO') || text.includes('PIX')) return 'sales';
+                        if (tokenInputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO') || text.includes('E-MAIL') || text.includes('EMAIL'))) return 'token';
+                        return '';
+                    })()
+                    """
+                    try:
+                        resultado_token = await wait_for_condition(
+                            session_id,
+                            post_token_state_expression,
+                            timeout=150.0,
+                            description="A Caixa nao concluiu a validacao do token",
+                        )
+                    except Exception:
+                        resultado_token = ""
+                    if resultado_token == "login":
+                        if auth_restart_count >= 2:
+                            raise RuntimeError("A Caixa voltou para a tela de login apos validar o token repetidas vezes.")
+                        _emit_pix_status(
+                            on_status,
+                            "A Caixa voltou para a tela de login apos validar o token; refazendo a autenticacao...",
+                        )
+                        await asyncio.sleep(2.0)
+                        await ensure_login(session_id, auth_restart_count + 1)
+                        return
+                    if resultado_token != "sales" and resultado_token != "invalid":
+                        try:
+                            await navigate(session_id, credenciais["sales_url"])
+                            resultado_token = await wait_for_condition(
+                                session_id,
+                                post_token_state_expression,
+                                timeout=60.0,
+                                description="A Caixa nao abriu a area de vendas apos validar o token",
+                            )
+                        except Exception:
+                            pass
+                    if resultado_token == "sales":
+                        break
+                    if tentativa_token >= 2:
+                        raise RuntimeError("O token informado pela Caixa nao foi aceito apos multiplas tentativas.")
+                    tokens_descartados.add(token)
+                await wait_for_condition(
+                    session_id,
+                    sales_ready_expression,
+                    timeout=90.0,
+                    description="A Caixa nao abriu a area de vendas apos validar o token",
+                )
+
+            sales_area_state_expression = """
+            (() => {
+                const text = (document.body?.innerText || '')
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toUpperCase();
+                const href = String(location.href || '').toUpperCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const hasAuthenticatedNav = Boolean(
+                    [...document.querySelectorAll('a, button, span, div')]
+                        .filter(visible)
+                        .find((el) => {
+                            if (el.closest('.om-footer, footer')) return false;
+                            const label = String(el.innerText || el.textContent || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const linkHref = String(el.getAttribute?.('href') || '').toUpperCase();
+                            return (
+                                linkHref.includes('/MINHASVENDAS') ||
+                                linkHref.includes('ROUTER=0') ||
+                                label.includes('RELATORIOS DE VENDA') ||
+                                label.includes('MINHAS VENDAS') ||
+                                label.includes('HISTORICO DE VENDAS') ||
+                                label.includes('PAGAMENTO INSTANTANEO') ||
+                                label.includes('PIX') ||
+                                label.includes('SAIR')
+                            );
+                        })
+                );
+                const hasSalesTabs = Boolean(
+                    visible(document.querySelector('header[role="tablist"]')) ||
+                    [...document.querySelectorAll('header[role="tablist"] button[role="tab"], #HistoricoVendas button[role="tab"], #Pix button[role="tab"], #HistoricoVendas [role="tabpanel"], #Pix [role="tabpanel"]')]
+                        .some(visible)
+                );
+                const loginInput = document.querySelector('#b2-b1-b4-InputMask');
+                const passwordInput = document.querySelector('#b2-b1-Input_Password');
+                const tokenInputs = [...document.querySelectorAll('input')]
+                    .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled && visible(el));
+                const deviceVisible = text.includes('SELECIONE O DISPOSITIVO');
+                const tokenDeliveryVisible = (
+                    text.includes('ESCOLHA POR ONDE DESEJA RECEBER') ||
+                    text.includes('RECEBER POR E-MAIL') ||
+                    text.includes('@GMAIL.COM')
+                );
+                const invalidVisible = (
+                    text.includes('CODIGO INVALIDO') ||
+                    text.includes('TOKEN INVALIDO') ||
+                    text.includes('TOKEN EXPIRADO') ||
+                    text.includes('TENTATIVAS')
+                );
+                const tokenVisible = tokenInputs.length > 0 && (
+                    text.includes('TOKEN') ||
+                    text.includes('CODIGO') ||
+                    text.includes('E-MAIL') ||
+                    text.includes('EMAIL')
+                );
+                const loginTextVisible = (
+                    text.includes('ACESSE SUA CONTA') ||
+                    (text.includes('CNPJ, CPF OU USUARIO') && text.includes('SENHA'))
+                );
+                const loginVisible = (
+                    href.includes('ISTIMEOUT=TRUE') ||
+                    (visible(loginInput) && visible(passwordInput)) ||
+                    (
+                        loginTextVisible &&
+                        !deviceVisible &&
+                        !tokenDeliveryVisible &&
+                        !tokenVisible &&
+                        !invalidVisible
+                    )
+                );
+                if (href.includes('/_ERROR.HTML') || text.includes('ERROR PROCESSING YOUR REQUEST')) return 'portal_error';
+                if (hasSalesTabs) return 'sales';
+                if (loginVisible) return 'login';
+                if (deviceVisible) return 'device';
+                if (tokenDeliveryVisible) return 'token';
+                if (tokenVisible) return 'token';
+                return '';
+            })()
+            """
+
+            async def ensure_sales_area(session_id: str, kind: str, context_label: str, auth_retry_count: int = 0) -> None:
+                try:
+                    current_state = str(await eval_js(session_id, sales_area_state_expression, timeout=15.0) or "").strip()
+                except Exception:
+                    current_state = ""
+                if current_state == "sales":
+                    return
+                if current_state == "portal_error":
+                    if auth_retry_count >= 2:
+                        raise RuntimeError(f"A Caixa abriu a pagina de erro ao acessar {context_label} repetidas vezes.")
+                    _emit_pix_status(
+                        on_status,
+                        f"A Caixa abriu a pagina de erro ao acessar {context_label}; recarregando o portal...",
+                    )
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = artifacts_dir / f"azulzinha_portal_error_{kind}.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2.0)
+                    await navigate(session_id, credenciais["sales_url"])
+                    await ensure_sales_area(session_id, kind, context_label, auth_retry_count + 1)
+                    return
+                if current_state in {"login", "device", "token"}:
+                    if auth_retry_count >= 2:
+                        raise RuntimeError(f"A Caixa perdeu a sessao ao abrir {context_label} repetidas vezes.")
+                    _emit_pix_status(
+                        on_status,
+                        f"A sessao da Caixa expirou ao abrir {context_label}; refazendo a autenticacao...",
+                    )
+                    await ensure_login(session_id)
+                    try:
+                        current_state = str(await eval_js(session_id, sales_area_state_expression, timeout=15.0) or "").strip()
+                    except Exception:
+                        current_state = ""
+                    if current_state == "sales":
+                        return
+                await navigate(session_id, credenciais["sales_url"])
+                await wait_for_condition(session_id, "document.body && document.body.innerText.length > 20", timeout=60.0)
+                try:
+                    state_after_navigation = await wait_for_condition(
+                        session_id,
+                        sales_area_state_expression,
+                        timeout=60.0,
+                        step=0.5,
+                        description=f"A Caixa nao abriu a area de vendas para {context_label}",
+                    )
+                except Exception:
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = artifacts_dir / f"azulzinha_sales_area_debug_{kind}.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    raise
+                if state_after_navigation == "sales":
+                    return
+                if state_after_navigation == "portal_error":
+                    if auth_retry_count >= 2:
+                        raise RuntimeError(f"A Caixa abriu a pagina de erro ao acessar {context_label} repetidas vezes.")
+                    _emit_pix_status(
+                        on_status,
+                        f"A Caixa abriu a pagina de erro ao abrir {context_label}; tentando recarregar o portal...",
+                    )
+                    await asyncio.sleep(2.0)
+                    await navigate(session_id, credenciais["sales_url"])
+                    await ensure_sales_area(session_id, kind, context_label, auth_retry_count + 1)
+                    return
+                if state_after_navigation in {"login", "device", "token"}:
+                    if auth_retry_count >= 2:
+                        raise RuntimeError(f"A Caixa perdeu a sessao ao abrir {context_label} repetidas vezes.")
+                    _emit_pix_status(
+                        on_status,
+                        f"A Caixa redirecionou para o login ao abrir {context_label}; refazendo a autenticacao...",
+                    )
+                    await ensure_login(session_id)
+                    await ensure_sales_area(session_id, kind, context_label, auth_retry_count + 1)
+                    return
+                raise RuntimeError(f"A Caixa nao confirmou a area de vendas para {context_label}.")
+
+            token_email_grace_seconds_v2 = 15.0
+            tokens_descartados_globais_v2: set[str] = set()
+
+            portal_state_expression_v2 = """
+            (() => {
+                const text = (document.body?.innerText || '')
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .toUpperCase();
+                const href = String(location.href || '').toUpperCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const hasAuthenticatedNav = Boolean(
+                    [...document.querySelectorAll('a, button, span, div')]
+                        .filter(visible)
+                        .find((el) => {
+                            if (el.closest('.om-footer, footer')) return false;
+                            const label = String(el.innerText || el.textContent || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const linkHref = String(el.getAttribute?.('href') || '').toUpperCase();
+                            return (
+                                linkHref.includes('/MINHASVENDAS') ||
+                                linkHref.includes('ROUTER=0') ||
+                                label.includes('RELATORIOS DE VENDA') ||
+                                label.includes('MINHAS VENDAS') ||
+                                label.includes('HISTORICO DE VENDAS') ||
+                                label.includes('PAGAMENTO INSTANTANEO') ||
+                                label.includes('PIX') ||
+                                label.includes('SAIR')
+                            );
+                        })
+                );
+                const hasSalesTabs = Boolean(
+                    visible(document.querySelector('header[role="tablist"]')) ||
+                    [...document.querySelectorAll('header[role="tablist"] button[role="tab"], #HistoricoVendas button[role="tab"], #Pix button[role="tab"], #HistoricoVendas [role="tabpanel"], #Pix [role="tabpanel"]')]
+                        .some(visible)
+                );
+                const loginInput = document.querySelector('#b2-b1-b4-InputMask');
+                const passwordInput = document.querySelector('#b2-b1-Input_Password');
+                const tokenInputs = [...document.querySelectorAll('input')]
+                    .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled && visible(el));
+                const deviceVisible = text.includes('SELECIONE O DISPOSITIVO');
+                const tokenDeliveryVisible = (
+                    text.includes('ESCOLHA POR ONDE DESEJA RECEBER') ||
+                    text.includes('RECEBER POR E-MAIL') ||
+                    text.includes('@GMAIL.COM')
+                );
+                const invalidVisible = (
+                    text.includes('CODIGO INVALIDO') ||
+                    text.includes('TOKEN INVALIDO') ||
+                    text.includes('TOKEN EXPIRADO') ||
+                    text.includes('TENTATIVAS')
+                );
+                const tokenVisible = tokenInputs.length > 0 && (
+                    text.includes('TOKEN') ||
+                    text.includes('CODIGO') ||
+                    text.includes('E-MAIL') ||
+                    text.includes('EMAIL')
+                );
+                const genericErrorVisible = (
+                    text.includes('OPS, UM ERRO ACONTECEU') ||
+                    text.includes('OPS UM ERRO ACONTECEU') ||
+                    (text.includes('ERRO ACONTECEU') && text.includes('TENTE NOVAMENTE MAIS TARDE'))
+                );
+                const loginTextVisible = (
+                    text.includes('ACESSE SUA CONTA') ||
+                    (text.includes('CNPJ, CPF OU USUARIO') && text.includes('SENHA'))
+                );
+                const loginVisible = (
+                    href.includes('ISTIMEOUT=TRUE') ||
+                    (visible(loginInput) && visible(passwordInput)) ||
+                    (
+                        loginTextVisible &&
+                        !deviceVisible &&
+                        !tokenDeliveryVisible &&
+                        !tokenVisible &&
+                        !invalidVisible
+                    )
+                );
+                const homeVisible = (
+                    !loginVisible &&
+                    !deviceVisible &&
+                    !tokenVisible &&
+                    !tokenDeliveryVisible &&
+                    !invalidVisible &&
+                    (href.includes('/HOME') || text.includes('RELATORIOS DE VENDA') || hasAuthenticatedNav)
+                );
+                const bodyLength = (document.body?.innerText || '').trim().length;
+                if (href.includes('/_ERROR.HTML') || text.includes('ERROR PROCESSING YOUR REQUEST') || genericErrorVisible) return 'portal_error';
+                if (hasSalesTabs) return 'sales';
+                if (loginVisible) return 'login';
+                if (homeVisible) return 'home';
+                if (invalidVisible) return 'invalid';
+                if (deviceVisible) return 'device';
+                if (tokenVisible) return 'token';
+                if (tokenDeliveryVisible) return 'token_delivery';
+                if (document.readyState !== 'complete' || bodyLength < 20) return 'loading';
+                return 'unknown';
+            })()
+            """
+
+            async def capture_portal_html_debug_v2(session_id: str, filename: str) -> None:
+                try:
+                    html_debug = await eval_js(
+                        session_id,
+                        "document.documentElement ? document.documentElement.outerHTML : ''",
+                        timeout=15.0,
+                    )
+                    if html_debug:
+                        (artifacts_dir / filename).write_text(str(html_debug), encoding="utf-8")
+                except Exception:
+                    pass
+
+            async def get_portal_state_v2(session_id: str, timeout: float = 15.0) -> str:
+                try:
+                    return str(await eval_js(session_id, portal_state_expression_v2, timeout=timeout) or "").strip()
+                except Exception:
+                    return ""
+
+            async def wait_for_portal_state_v2(
+                session_id: str,
+                accepted_states: set[str],
+                timeout: float,
+                description: str,
+                step: float = 0.5,
+            ) -> str:
+                deadline = time.time() + timeout
+                last_state = ""
+                while time.time() < deadline:
+                    _check_cancelled()
+                    state = await get_portal_state_v2(session_id)
+                    last_state = state or ""
+                    if state in accepted_states:
+                        return state
+                    await asyncio.sleep(step)
+                raise TimeoutError(f"{description} :: ultimo estado={last_state or 'desconhecido'}")
+
+            async def is_app_token_screen_v2(session_id: str) -> bool:
+                return bool(
+                    await eval_js(
                         session_id,
                         """
                         (() => {
@@ -3712,118 +4792,1231 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 .normalize('NFD')
                                 .replace(/[\\u0300-\\u036f]/g, '')
                                 .toUpperCase();
-                            const hasSalesTabs = Boolean(
-                                document.querySelector('header[role="tablist"]') ||
-                                document.querySelector('#HistoricoVendas button[role="tab"]') ||
-                                document.querySelector('#Pix button[role="tab"]')
+                            return text.includes('INFORME O TOKEN DO APLICATIVO');
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+
+            async def inspect_token_challenge_v2(session_id: str) -> dict:
+                return (
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const text = (document.body?.innerText || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const href = String(location.href || '').toUpperCase();
+                            const visible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const loginInput = document.querySelector('#b2-b1-b4-InputMask');
+                            const passwordInput = document.querySelector('#b2-b1-Input_Password');
+                            const tokenInputs = [...document.querySelectorAll('input')].filter((el) => {
+                                const type = (el.type || '').toLowerCase();
+                                return type !== 'hidden' && type !== 'password' && !el.disabled && visible(el);
+                            });
+                            const deliveryVisible = (
+                                text.includes('ESCOLHA POR ONDE DESEJA RECEBER') ||
+                                text.includes('RECEBER POR E-MAIL') ||
+                                text.includes('@GMAIL.COM')
                             );
-                            if (location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs) return 'logged';
-                            if (
+                            const appTokenVisible = text.includes('INFORME O TOKEN DO APLICATIVO');
+                            const invalidVisible = (
                                 text.includes('CODIGO INVALIDO') ||
                                 text.includes('TOKEN INVALIDO') ||
                                 text.includes('TOKEN EXPIRADO') ||
                                 text.includes('TENTATIVAS')
-                            ) return 'invalid';
-                            return '';
+                            );
+                            const emailTokenReady = tokenInputs.length > 0 && (
+                                text.includes('TOKEN') ||
+                                text.includes('CODIGO') ||
+                                text.includes('E-MAIL') ||
+                                text.includes('EMAIL')
+                            );
+                            const loginTextVisible = (
+                                text.includes('ACESSE SUA CONTA') ||
+                                (text.includes('CNPJ, CPF OU USUARIO') && text.includes('SENHA'))
+                            );
+                            const onLoginPage = (
+                                (visible(loginInput) && visible(passwordInput)) ||
+                                (
+                                    loginTextVisible &&
+                                    !deliveryVisible &&
+                                    !appTokenVisible &&
+                                    !emailTokenReady &&
+                                    !invalidVisible &&
+                                    !text.includes('SELECIONE O DISPOSITIVO')
+                                )
+                            );
+                            return {
+                                onLoginPage,
+                                tokenInputsVisible: !onLoginPage && tokenInputs.length > 0,
+                                emailTokenReady: !onLoginPage && emailTokenReady,
+                                deliveryVisible: !onLoginPage && deliveryVisible,
+                                appTokenVisible: !onLoginPage && appTokenVisible,
+                                invalidVisible: !onLoginPage && invalidVisible,
+                            };
                         })()
                         """,
-                        timeout=45.0,
-                        description="A Caixa nao concluiu a validacao do token",
+                        timeout=10.0,
                     )
-                    if resultado_token == "logged":
+                    or {}
+                )
+
+            async def wait_for_token_email_delivery_grace_v2() -> None:
+                _emit_pix_status(
+                    on_status,
+                    f"Aguardando {int(token_email_grace_seconds_v2)}s para o e-mail do token chegar...",
+                )
+                await asyncio.sleep(token_email_grace_seconds_v2)
+
+            async def wait_for_post_token_resolution_v2(session_id: str, timeout: float = 150.0) -> str:
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    snapshot = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const text = (document.body?.innerText || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .toUpperCase();
+                            const href = String(location.href || '').toUpperCase();
+                            const visible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const bodyLength = (document.body?.innerText || '').trim().length;
+                            const tokenInputs = [...document.querySelectorAll('input')]
+                                .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled && visible(el));
+                            const hasAuthenticatedNav = Boolean(
+                                [...document.querySelectorAll('a, button, span, div')]
+                                    .filter(visible)
+                                    .find((el) => {
+                                        if (el.closest('.om-footer, footer')) return false;
+                                        const label = String(el.innerText || el.textContent || '')
+                                            .normalize('NFD')
+                                            .replace(/[\\u0300-\\u036f]/g, '')
+                                            .toUpperCase();
+                                        const linkHref = String(el.getAttribute?.('href') || '').toUpperCase();
+                                        return (
+                                            linkHref.includes('/MINHASVENDAS') ||
+                                            linkHref.includes('ROUTER=0') ||
+                                            label.includes('RELATORIOS DE VENDA') ||
+                                            label.includes('MINHAS VENDAS') ||
+                                            label.includes('HISTORICO DE VENDAS') ||
+                                            label.includes('PAGAMENTO INSTANTANEO') ||
+                                            label.includes('PIX') ||
+                                            label.includes('SAIR')
+                                        );
+                                    })
+                            );
+                            const hasSalesTabs = Boolean(
+                                visible(document.querySelector('header[role="tablist"]')) ||
+                                [...document.querySelectorAll('header[role="tablist"] button[role="tab"], #HistoricoVendas button[role="tab"], #Pix button[role="tab"], #HistoricoVendas [role="tabpanel"], #Pix [role="tabpanel"]')]
+                                    .some(visible)
+                            );
+                            const loginInput = document.querySelector('#b2-b1-b4-InputMask');
+                            const passwordInput = document.querySelector('#b2-b1-Input_Password');
+                            const deviceVisible = text.includes('SELECIONE O DISPOSITIVO');
+                            const tokenDeliveryVisible = text.includes('ESCOLHA POR ONDE DESEJA RECEBER') || text.includes('RECEBER POR E-MAIL') || text.includes('@GMAIL.COM');
+                            const invalidVisible = (
+                                text.includes('CODIGO INVALIDO') ||
+                                text.includes('TOKEN INVALIDO') ||
+                                text.includes('TOKEN EXPIRADO') ||
+                                text.includes('TENTATIVAS')
+                            );
+                            const tokenVisible = tokenInputs.length > 0 && (text.includes('TOKEN') || text.includes('CODIGO') || text.includes('E-MAIL') || text.includes('EMAIL'));
+                            const genericErrorVisible = (
+                                text.includes('OPS, UM ERRO ACONTECEU') ||
+                                text.includes('OPS UM ERRO ACONTECEU') ||
+                                (text.includes('ERRO ACONTECEU') && text.includes('TENTE NOVAMENTE MAIS TARDE'))
+                            );
+                            const loginTextVisible = text.includes('ACESSE SUA CONTA') || (text.includes('CNPJ, CPF OU USUARIO') && text.includes('SENHA'));
+                            const loginVisible = (
+                                href.includes('ISTIMEOUT=TRUE') ||
+                                (visible(loginInput) && visible(passwordInput)) ||
+                                (
+                                    loginTextVisible &&
+                                    !deviceVisible &&
+                                    !tokenDeliveryVisible &&
+                                    !tokenVisible &&
+                                    !invalidVisible
+                                )
+                            );
+                            return {
+                                href,
+                                hasSalesTabs,
+                                homeVisible: !loginVisible && !deviceVisible && !tokenVisible && !tokenDeliveryVisible && !invalidVisible && (href.includes('/HOME') || text.includes('RELATORIOS DE VENDA') || hasAuthenticatedNav),
+                                loginVisible,
+                                portalErrorVisible: href.includes('/_ERROR.HTML') || text.includes('ERROR PROCESSING YOUR REQUEST'),
+                                genericErrorVisible,
+                                invalidVisible,
+                                tokenVisible,
+                                tokenDeliveryVisible,
+                                salesVisible: hasSalesTabs,
+                                bodyLength,
+                            };
+                        })()
+                        """,
+                        timeout=15.0,
+                    ) or {}
+                    if bool(snapshot.get("portalErrorVisible")) or bool(snapshot.get("genericErrorVisible")):
+                        return "portal_error"
+                    if bool(snapshot.get("salesVisible")):
+                        return "sales"
+                    if bool(snapshot.get("homeVisible")):
+                        return "home"
+                    if bool(snapshot.get("loginVisible")):
+                        return "login"
+                    if bool(snapshot.get("invalidVisible")) and (
+                        bool(snapshot.get("tokenVisible")) or bool(snapshot.get("tokenDeliveryVisible"))
+                    ):
+                        return "invalid"
+                    await asyncio.sleep(0.5)
+                return ""
+
+            async def confirm_sales_access_after_token_v2(session_id: str) -> str:
+                try:
+                    await navigate(session_id, credenciais["sales_url"])
+                    return await wait_for_portal_state_v2(
+                        session_id,
+                        {"sales", "home", "token", "token_delivery", "login", "portal_error", "invalid"},
+                        timeout=90.0,
+                        description="A Caixa nao confirmou a sessao ao abrir a area de vendas apos o token",
+                    )
+                except Exception:
+                    return ""
+
+            async def fetch_token_with_portal_watch_v2(
+                session_id: str,
+                total_timeout: float,
+                allow_recent_fallback: bool,
+            ) -> tuple[str, str]:
+                deadline = time.time() + total_timeout
+                first_chunk = True
+                while time.time() < deadline:
+                    state_before = await get_portal_state_v2(session_id)
+                    if state_before in {"sales", "home", "login", "portal_error"}:
+                        return "", state_before
+                    remaining = max(0.0, deadline - time.time())
+                    chunk_timeout = min(12.0, remaining)
+                    if chunk_timeout <= 0:
                         break
-                    if tentativa_token >= 2:
-                        raise RuntimeError("O token informado pela Caixa nao foi aceito apos multiplas tentativas.")
-                    tokens_descartados.add(token)
-                    _emit_pix_status(on_status, "Token rejeitado pela Caixa; o codigo usado foi descartado e a busca vai aguardar um e-mail novo.")
-                await wait_for_condition(
+                    token = str(
+                        await asyncio.to_thread(
+                            _fetch_fiserv_token_from_gmail,
+                            time.time(),
+                            chunk_timeout,
+                            on_status,
+                            tokens_descartados_globais_v2,
+                            allow_recent_fallback if first_chunk else False,
+                        )
+                        or ""
+                    ).strip()
+                    if token:
+                        return token, ""
+                    first_chunk = False
+                    state_after = await get_portal_state_v2(session_id)
+                    if state_after in {"sales", "home", "login", "portal_error"}:
+                        return "", state_after
+                return "", ""
+
+            async def perform_login_step_v2(session_id: str) -> str:
+                _emit_pix_status(on_status, "Autenticando na Azulzinha/Caixa...")
+                try:
+                    login_selectors = await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const user = document.querySelector('#b2-b1-b4-InputMask');
+                            const password = document.querySelector('#b2-b1-Input_Password');
+                            if (user && password) {
+                                user.setAttribute('data-codex-login-user', '1');
+                                password.setAttribute('data-codex-login-pass', '1');
+                                return {
+                                    user: '#b2-b1-b4-InputMask',
+                                    password: '#b2-b1-Input_Password',
+                                };
+                            }
+                            const visible = (el) => {
+                                if (!el || el.disabled) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const fallbackUser = [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                            const fallbackPassword = [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                            if (!fallbackUser || !fallbackPassword) return null;
+                            fallbackUser.setAttribute('data-codex-login-user', '1');
+                            fallbackPassword.setAttribute('data-codex-login-pass', '1');
+                            return {
+                                user: fallbackUser.id ? `#${fallbackUser.id}` : '[data-codex-login-user="1"]',
+                                password: fallbackPassword.id ? `#${fallbackPassword.id}` : '[data-codex-login-pass="1"]',
+                            };
+                        })()
+                        """,
+                        timeout=60.0,
+                        description="A Caixa nao exibiu a tela de login para informar CNPJ e senha",
+                    )
+                except Exception:
+                    login_selectors = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const user = document.querySelector('#b2-b1-b4-InputMask');
+                            const password = document.querySelector('#b2-b1-Input_Password');
+                            if (!user || !password) return null;
+                            user.setAttribute('data-codex-login-user', '1');
+                            password.setAttribute('data-codex-login-pass', '1');
+                            return {
+                                user: '#b2-b1-b4-InputMask',
+                                password: '#b2-b1-Input_Password',
+                            };
+                        })()
+                        """,
+                        timeout=15.0,
+                    )
+                    if not login_selectors:
+                        try:
+                            login_wait_state = await eval_js(
+                                session_id,
+                                """
+                                (() => ({
+                                    href: String(location.href || ''),
+                                    text: String(document.body?.innerText || '').slice(0, 2000),
+                                    hasUser: !!document.querySelector('#b2-b1-b4-InputMask'),
+                                    hasPassword: !!document.querySelector('#b2-b1-Input_Password'),
+                                    bodyLength: String(document.body?.innerText || '').trim().length,
+                                }))()
+                                """,
+                                timeout=15.0,
+                            )
+                            if login_wait_state is not None:
+                                (artifacts_dir / "azulzinha_login_wait_state.json").write_text(
+                                    json.dumps(login_wait_state, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                        except Exception:
+                            pass
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_login_wait_debug.html")
+                        raise
+                login_user_selector = str((login_selectors or {}).get("user") or "#b2-b1-b4-InputMask")
+                login_password_selector = str((login_selectors or {}).get("password") or "#b2-b1-Input_Password")
+                cnpj_digits = re.sub(r"\D", "", str(credenciais["cnpj"] or ""))
+                password_text = str(credenciais["password"] or "")
+                try:
+                    await insert_text(session_id, login_user_selector, cnpj_digits)
+                except Exception:
+                    pass
+                try:
+                    await insert_text(session_id, login_password_selector, password_text)
+                except Exception:
+                    pass
+                await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const setNativeValue = (el, value) => {{
+                            const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                            if (setter) setter.call(el, value); else el.value = value;
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                        }};
+                        const user = document.querySelector({login_user_selector!r}) || [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                        const password = document.querySelector({login_password_selector!r}) || [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                        if (!user || !password) return null;
+                        user.focus();
+                        setNativeValue(user, {cnpj_digits!r});
+                        password.focus();
+                        setNativeValue(password, {password_text!r});
+                        const userValue = String(user?.value || user?.getAttribute('value') || '').replace(/\\D/g, '');
+                        const passwordValue = String(password?.value || password?.getAttribute('value') || '');
+                        return {{
+                            userLen: userValue.length,
+                            passwordLen: passwordValue.length,
+                        }};
+                    }})()
+                    """,
+                    timeout=20.0,
+                ) or {}
+                credential_fill_state = await eval_js(
+                    session_id,
+                    f"""
+                    (() => {{
+                        const visible = (el) => {{
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }};
+                        const user = document.querySelector({login_user_selector!r}) || [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                        const password = document.querySelector({login_password_selector!r}) || [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                        const userValue = String(user?.value || user?.getAttribute('value') || '').replace(/\\D/g, '');
+                        const passwordValue = String(password?.value || password?.getAttribute('value') || '');
+                        return {{
+                            userLen: userValue.length,
+                            passwordLen: passwordValue.length,
+                        }};
+                    }})()
+                    """,
+                    timeout=15.0,
+                ) or {}
+                if int(credential_fill_state.get("userLen") or 0) < len(cnpj_digits) or int(credential_fill_state.get("passwordLen") or 0) < len(password_text):
+                    state_after_fill = await get_portal_state_v2(session_id)
+                    if state_after_fill in {"device", "token_delivery", "token", "sales", "portal_error"}:
+                        return state_after_fill
+                    await capture_portal_html_debug_v2(session_id, "azulzinha_login_fill_debug.html")
+                    raise RuntimeError("Nao foi possivel preencher o login e a senha da Azulzinha/Caixa.")
+                await asyncio.sleep(0.4)
+                await press_tab(session_id)
+                try:
+                    await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const botao = document.querySelector('#b2-b1-confirmar');
+                            return botao && !botao.disabled;
+                        })()
+                        """,
+                        timeout=8.0,
+                    )
+                except Exception:
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const visible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const user = [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                            const password = [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                            for (const el of [user, password]) {
+                                if (!el) continue;
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '0' }));
+                                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                            }
+                            return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                    try:
+                        await wait_for_condition(
+                            session_id,
+                            """
+                            (() => {
+                                const botao = document.querySelector('#b2-b1-confirmar');
+                                return botao && !botao.disabled;
+                            })()
+                            """,
+                            timeout=12.0,
+                        )
+                    except Exception:
+                        state_after_confirm_wait = await get_portal_state_v2(session_id)
+                        if state_after_confirm_wait in {"device", "token_delivery", "token", "sales", "home", "portal_error"}:
+                            return state_after_confirm_wait
+                        try:
+                            button_state = await eval_js(
+                                session_id,
+                                """
+                                (() => {
+                                    const visible = (el) => {
+                                        if (!el) return false;
+                                        const rect = el.getBoundingClientRect();
+                                        const style = getComputedStyle(el);
+                                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                    };
+                                    const user = [...document.querySelectorAll('input:not([type="hidden"]):not([type="password"])')].filter(visible)[0];
+                                    const password = [...document.querySelectorAll('input[type="password"]')].filter(visible)[0];
+                                    const botao = document.querySelector('#b2-b1-confirmar');
+                                    return {
+                                        userValue: String(user?.value || ''),
+                                        passwordLen: String(password?.value || '').length,
+                                        buttonDisabled: botao ? !!botao.disabled : null,
+                                        buttonText: botao ? (botao.innerText || botao.textContent || '').trim() : '',
+                                    };
+                                })()
+                                """,
+                                timeout=10.0,
+                            )
+                            if button_state is not None:
+                                (artifacts_dir / "azulzinha_login_confirm_state.json").write_text(
+                                    json.dumps(button_state, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                        except Exception:
+                            pass
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_login_confirm_debug.html")
+                        raise
+                clicou = await eval_js(
                     session_id,
                     """
                     (() => {
-                        const hasSalesTabs = Boolean(
-                            document.querySelector('header[role="tablist"]') ||
-                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
-                            document.querySelector('#Pix button[role="tab"]')
-                        );
-                        return location.href.includes('/Home') || location.href.includes('/MinhasVendas') || hasSalesTabs;
+                        const botao = document.querySelector('#b2-b1-confirmar');
+                        if (!botao || botao.disabled) return false;
+                        botao.click();
+                        return true;
                     })()
                     """,
+                    timeout=10.0,
+                )
+                if not clicou:
+                    raise RuntimeError("Nao foi possivel confirmar o login da Azulzinha/Caixa.")
+                return await wait_for_portal_state_v2(
+                    session_id,
+                    {"sales", "home", "device", "token_delivery", "token", "login", "portal_error", "invalid"},
                     timeout=90.0,
-                    description="A Caixa nao abriu a area de vendas apos validar o token",
+                    description="A Caixa nao concluiu a etapa inicial do login",
+                )
+
+            async def perform_device_selection_step_v2(session_id: str) -> str:
+                _emit_pix_status(on_status, "Selecionando dispositivo da Caixa...")
+                if not await click_card_by_text(session_id, _azulzinha_device_aliases(company_label), timeout=30.0):
+                    raise RuntimeError(f"Nao foi possivel selecionar o dispositivo da {company_label} na Azulzinha/Caixa.")
+                await asyncio.sleep(1.0)
+                return await wait_for_portal_state_v2(
+                    session_id,
+                    {"sales", "home", "token_delivery", "token", "login", "portal_error", "invalid"},
+                    timeout=45.0,
+                    description="A Caixa nao avancou apos a selecao do dispositivo",
+                )
+
+            async def request_token_via_email_v2(
+                session_id: str,
+                current_state: str | None = None,
+                force_refresh: bool = False,
+            ) -> str:
+                state_local = str(current_state or "").strip() or await get_portal_state_v2(session_id)
+                token_challenge = await inspect_token_challenge_v2(session_id)
+                if bool(token_challenge.get("emailTokenReady")) and not bool(token_challenge.get("appTokenVisible")):
+                    return "token"
+                if state_local not in {"token", "token_delivery", "invalid"}:
+                    state_local = await wait_for_portal_state_v2(
+                        session_id,
+                        {"sales", "home", "login", "device", "token_delivery", "token", "portal_error", "invalid"},
+                        timeout=30.0,
+                        description="A Caixa nao exibiu a etapa de token por e-mail",
+                    )
+                    token_challenge = await inspect_token_challenge_v2(session_id)
+                if state_local == "invalid":
+                    if bool(token_challenge.get("deliveryVisible")) and not bool(token_challenge.get("emailTokenReady")):
+                        state_local = "token_delivery"
+                    else:
+                        state_local = "token"
+                if bool(token_challenge.get("emailTokenReady")) and not bool(token_challenge.get("appTokenVisible")):
+                    return "token"
+                if state_local == "token" and not force_refresh and not await is_app_token_screen_v2(session_id):
+                    return "token"
+
+                abriu = False
+                if state_local == "token":
+                    abriu = bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const link = document.querySelector('a.bold.font-universe.cor-preto');
+                                if (!link) return false;
+                                link.click();
+                                return true;
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+                    if not abriu:
+                        abriu = await click_by_text(
+                            session_id,
+                            ["Receber codigo por e-mail ou SMS", "Reenviar codigo", "Reenviar token"],
+                            timeout=15.0,
+                        )
+                    if abriu:
+                        state_local = await wait_for_portal_state_v2(
+                            session_id,
+                            {"sales", "home", "login", "token_delivery", "token", "portal_error", "invalid"},
+                            timeout=30.0,
+                            description="A Caixa nao abriu a escolha de envio do token",
+                        )
+                        token_challenge = await inspect_token_challenge_v2(session_id)
+                        await asyncio.sleep(1.0)
+                        if state_local == "invalid":
+                            if bool(token_challenge.get("deliveryVisible")) and not bool(token_challenge.get("emailTokenReady")):
+                                state_local = "token_delivery"
+                            else:
+                                state_local = "token"
+
+                if state_local == "token_delivery":
+                    token_challenge = await inspect_token_challenge_v2(session_id)
+                    if bool(token_challenge.get("emailTokenReady")) and not bool(token_challenge.get("appTokenVisible")):
+                        return "token"
+                    selecionou_email = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const norm = (v) => (v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                            const visible = (el) => {
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const candidates = [...document.querySelectorAll('[id$="-Content"], .card-content, .ph.card.card-content')]
+                                .filter(visible)
+                                .map((el) => {
+                                    const text = norm(el.innerText || el.textContent || '');
+                                    if (!text.includes('RECEBER POR E-MAIL') && !text.includes('@GMAIL.COM')) return null;
+                                    const className = (el.className || '').toString().toUpperCase();
+                                    const isCard = className.includes('CARD-CONTENT') || className.includes('PH CARD');
+                                    const textLength = text.length || 9999;
+                                    return { el, score: (isCard ? 1000 : 0) - textLength };
+                                })
+                                .filter(Boolean)
+                                .sort((a, b) => b.score - a.score);
+                            const match = candidates.length ? candidates[0].el : null;
+                            if (!match) return false;
+                            const clickable = match.closest('[id$="-Content"], .card-content, .ph.card.card-content') || match;
+                            clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                            clickable.click();
+                            return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                    if not selecionou_email and not await click_card_by_text(session_id, ["RECEBER POR E-MAIL", "@GMAIL.COM"], timeout=20.0):
+                        if not await click_by_text(session_id, ["Receber por e-mail", "@gmail.com"], timeout=20.0):
+                            raise RuntimeError("Nao foi possivel selecionar o envio do token por e-mail na Azulzinha/Caixa.")
+                    await asyncio.sleep(1.0)
+                    try:
+                        await click_by_text(
+                            session_id,
+                            ["Continuar", "Confirmar", "Receber codigo", "Enviar codigo"],
+                            timeout=4.0,
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8)
+                    try:
+                        state_local = await wait_for_portal_state_v2(
+                            session_id,
+                            {"sales", "home", "login", "token", "portal_error", "invalid"},
+                            timeout=30.0,
+                            description="A Caixa nao exibiu o campo para digitar o token",
+                        )
+                        token_challenge = await inspect_token_challenge_v2(session_id)
+                        if state_local == "invalid":
+                            if bool(token_challenge.get("deliveryVisible")) and not bool(token_challenge.get("emailTokenReady")):
+                                state_local = "token_delivery"
+                            else:
+                                state_local = "token"
+                    except Exception:
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_token_delivery_debug.html")
+                        raise
+                return state_local
+
+            async def submit_token_value_v2(session_id: str, token: str) -> None:
+                confirmed = False
+                token_inputs = await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        return [...document.querySelectorAll('input')]
+                            .filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled && visible(el))
+                            .map((el) => ({
+                                selector: el.id ? `#${el.id}` : '',
+                                maxLength: Number(el.maxLength || 0),
+                                className: String(el.className || ''),
+                            }));
+                    })()
+                    """,
+                    timeout=15.0,
+                ) or []
+                code_selectors = [
+                    str(item.get("selector") or "").strip()
+                    for item in token_inputs
+                    if str(item.get("selector") or "").strip()
+                    and (
+                        int(item.get("maxLength") or 0) == 1
+                        or "input-code" in str(item.get("className") or "").lower()
+                    )
+                ]
+                token_selectors = code_selectors or [
+                    str(item.get("selector") or "").strip()
+                    for item in token_inputs
+                    if str(item.get("selector") or "").strip()
+                ]
+                token_digitos = list(str(token))
+                if token_selectors and len(token_selectors) > 1 and len(token_digitos) >= len(token_selectors):
+                    for idx, selector in enumerate(token_selectors):
+                        if not await focus_selector(session_id, selector):
+                            continue
+                        await eval_js(
+                            session_id,
+                            f"""
+                            (() => {{
+                                const el = document.querySelector({selector!r});
+                                if (!el) return false;
+                                el.value = '';
+                                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                return true;
+                            }})()
+                            """,
+                            timeout=10.0,
+                        )
+                        await cdp("Input.insertText", {"text": token_digitos[idx]}, session_id=session_id)
+                        await asyncio.sleep(0.08)
+                    confirmed = True
+                else:
+                    confirmed = bool(
+                        await eval_js(
+                            session_id,
+                            f"""
+                            (() => {{
+                                const token = {token!r};
+                                const setNativeValue = (el, value) => {{
+                                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                                    if (setter) setter.call(el, value); else el.value = value;
+                                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                                }};
+                                const inputs = [...document.querySelectorAll('input')].filter((el) => (el.type || '').toLowerCase() !== 'hidden' && !el.disabled);
+                                if (inputs.length) {{
+                                    setNativeValue(inputs[inputs.length - 1], '');
+                                    setNativeValue(inputs[inputs.length - 1], token);
+                                    return true;
+                                }}
+                                return false;
+                            }})()
+                            """,
+                            timeout=15.0,
+                        )
+                    )
+                if not confirmed:
+                    raise RuntimeError("Nao foi possivel preencher o token da Azulzinha/Caixa.")
+                await asyncio.sleep(0.4)
+                try:
+                    await wait_for_condition(
+                        session_id,
+                        """
+                        (() => {
+                            const botao = document.querySelector('#b2-b1-confirmar');
+                            return botao && !botao.disabled;
+                        })()
+                        """,
+                        timeout=5.0,
+                    )
+                except Exception:
+                    pass
+                await eval_js(
+                    session_id,
+                    """
+                    (() => {
+                        const buttons = [...document.querySelectorAll('button, input[type="submit"], a')];
+                        const button = buttons.find((el) => /CONFIRMAR|VALIDAR|ENTRAR|CONTINUAR/i.test(el.innerText || el.value || '')) || buttons[0];
+                        button?.click();
+                        return true;
+                    })()
+                    """,
+                    timeout=10.0,
+                )
+
+            async def complete_token_challenge_v2(session_id: str, initial_state: str) -> str:
+                state = str(initial_state or "").strip() or await get_portal_state_v2(session_id)
+                ultimo_token_usado = ""
+                _emit_pix_status(on_status, "Solicitando token por e-mail...")
+                state = await request_token_via_email_v2(session_id, state, force_refresh=False)
+                if state == "token":
+                    await wait_for_token_email_delivery_grace_v2()
+                    state = await get_portal_state_v2(session_id)
+                if state in {"sales", "home", "login", "portal_error"}:
+                    return state
+
+                for tentativa_token in range(3):
+                    if tentativa_token > 0:
+                        espera_extra_apos_rejeicao = 5.0
+                        _emit_pix_status(
+                            on_status,
+                            f"Token rejeitado pela Caixa; descartando o codigo anterior e aguardando {int(espera_extra_apos_rejeicao)}s por um novo e-mail...",
+                        )
+                        await asyncio.sleep(espera_extra_apos_rejeicao)
+                        state = await get_portal_state_v2(session_id)
+                        if state in {"sales", "home", "login", "portal_error"}:
+                            return state
+                        if state == "device":
+                            state = await perform_device_selection_step_v2(session_id)
+                            if state in {"sales", "home", "login", "portal_error"}:
+                                return state
+                        token_challenge = await inspect_token_challenge_v2(session_id)
+                        precisa_reenviar_token = False
+                        if state == "token_delivery":
+                            precisa_reenviar_token = not bool(token_challenge.get("emailTokenReady"))
+                        elif state == "token":
+                            precisa_reenviar_token = bool(token_challenge.get("appTokenVisible"))
+                        elif state == "invalid":
+                            precisa_reenviar_token = bool(token_challenge.get("appTokenVisible")) or (
+                                bool(token_challenge.get("deliveryVisible")) and not bool(token_challenge.get("emailTokenReady"))
+                            )
+                        if precisa_reenviar_token:
+                            state = await request_token_via_email_v2(session_id, state, force_refresh=True)
+                            if state == "token":
+                                state = await get_portal_state_v2(session_id)
+                            elif state in {"sales", "home", "login", "portal_error"}:
+                                return state
+                        else:
+                            _emit_pix_status(
+                                on_status,
+                                "A Caixa manteve a tela de digitacao do token; aguardando um novo e-mail sem reenviar o codigo.",
+                            )
+
+                    espera_token = 180.0 if tentativa_token == 0 else 150.0
+                    token, portal_state_during_fetch = await fetch_token_with_portal_watch_v2(
+                        session_id,
+                        espera_token,
+                        tentativa_token == 0,
+                    )
+                    if portal_state_during_fetch in {"sales", "home", "login", "portal_error"}:
+                        return portal_state_during_fetch
+                    if (not token or token == ultimo_token_usado or token in tokens_descartados_globais_v2) and callable(token_callback):
+                        token = str(token_callback("Informe o token enviado por e-mail pela Azulzinha/Caixa") or "").strip()
+                    if token in tokens_descartados_globais_v2:
+                        _emit_pix_status(on_status, "O token informado ja foi rejeitado anteriormente pela Caixa.")
+                        token = ""
+                    if not token:
+                        if tentativa_token >= 2:
+                            raise RuntimeError("Nao foi possivel obter um token novo enviado por e-mail pela Caixa.")
+                        _emit_pix_status(on_status, "Ainda nao chegou um token novo da Caixa; aguardando mais um pouco antes da proxima tentativa.")
+                        continue
+
+                    state_before_submit = await get_portal_state_v2(session_id)
+                    if state_before_submit in {"sales", "home", "login", "portal_error"}:
+                        return state_before_submit
+                    token_challenge_before_submit = await inspect_token_challenge_v2(session_id)
+                    if state_before_submit == "token_delivery" and not bool(token_challenge_before_submit.get("emailTokenReady")):
+                        state_before_submit = await request_token_via_email_v2(session_id, state_before_submit, force_refresh=False)
+                        if state_before_submit in {"sales", "home", "login", "portal_error"}:
+                            return state_before_submit
+
+                    ultimo_token_usado = token
+                    _emit_pix_status(on_status, f"Confirmando token da Caixa: {token}...")
+                    await submit_token_value_v2(session_id, token)
+                    _emit_pix_status(on_status, "Aguardando a Caixa validar o token...")
+                    await asyncio.sleep(1.5)
+                    resultado_token = await wait_for_post_token_resolution_v2(session_id)
+                    if not resultado_token:
+                        _emit_pix_status(
+                            on_status,
+                            "Validando a sessao da Caixa pela abertura de MinhasVendas...",
+                        )
+                        confirmacao_sessao = await confirm_sales_access_after_token_v2(session_id)
+                        if confirmacao_sessao:
+                            resultado_token = confirmacao_sessao
+
+                    if resultado_token not in {"sales", "home", "invalid", "token", "token_delivery", "login", "portal_error"}:
+                        resultado_token = await confirm_sales_access_after_token_v2(session_id)
+
+                    if resultado_token == "sales":
+                        return "sales"
+                    if resultado_token == "home":
+                        return "home"
+                    if resultado_token == "login":
+                        _emit_pix_status(
+                            on_status,
+                            "A Caixa voltou para a tela de login apos validar o token; refazendo a autenticacao...",
+                        )
+                        return "login"
+                    if resultado_token == "portal_error":
+                        _emit_pix_status(
+                            on_status,
+                            "A Caixa exibiu um erro do portal ao confirmar o token; refazendo a autenticacao...",
+                        )
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_post_token_error.html")
+                        return "portal_error"
+
+                    tokens_descartados_globais_v2.add(token)
+                    if tentativa_token >= 2:
+                        raise RuntimeError("O token informado pela Caixa nao foi aceito apos multiplas tentativas.")
+                raise RuntimeError("A Caixa nao concluiu a validacao do token.")
+
+            async def open_sales_area_from_home_v2(session_id: str, context_label: str) -> str:
+                _emit_pix_status(on_status, "Abrindo Relatorio de vendas da Caixa...")
+
+                async def _click_sales_report_entry() -> bool:
+                    return bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const visible = (el) => {
+                                    if (!el) return false;
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return (
+                                        rect.width > 0 &&
+                                        rect.height > 0 &&
+                                        rect.bottom > 0 &&
+                                        rect.right > 0 &&
+                                        rect.top < window.innerHeight &&
+                                        rect.left < window.innerWidth &&
+                                        style.visibility !== 'hidden' &&
+                                        style.display !== 'none'
+                                    );
+                                };
+                                const trigger = (el) => {
+                                    if (!el) return false;
+                                    const clickable = el.closest('li[opt], a, button, div') || el;
+                                    clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                                    clickable.focus?.();
+                                    clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                    clickable.click();
+                                    clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                    return true;
+                                };
+                                const selectors = [
+                                    'a[data-testid="menu-relatorio-vendas"]',
+                                    'a[data-testid="m-menu-relatorio-vendas"]',
+                                ];
+                                for (const selector of selectors) {
+                                    const el = document.querySelector(selector);
+                                    if (!el || !visible(el)) continue;
+                                    return trigger(el);
+                                }
+                                return false;
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+
+                abriu_vendas = await _click_sales_report_entry()
+                if not abriu_vendas:
+                    expanded = bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                                const visible = (el) => {
+                                    if (!el) return false;
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return (
+                                        rect.width > 0 &&
+                                        rect.height > 0 &&
+                                        rect.bottom > 0 &&
+                                        rect.right > 0 &&
+                                        rect.top < window.innerHeight &&
+                                        rect.left < window.innerWidth &&
+                                        style.visibility !== 'hidden' &&
+                                        style.display !== 'none'
+                                    );
+                                };
+                                const trigger = (el) => {
+                                    if (!el) return false;
+                                    const clickable = el.closest('li[opt], a, button, div') || el;
+                                    clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                                    clickable.focus?.();
+                                    clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                    clickable.click();
+                                    clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                    return true;
+                                };
+                                const selectors = [
+                                    'a[data-testid="menu-vendas"]',
+                                    'a[data-testid="m-menu-vendas"]',
+                                    'a[data-testid="home-card-personalizar-link-vendas"]',
+                                ];
+                                for (const selector of selectors) {
+                                    const el = document.querySelector(selector);
+                                    if (!el || !visible(el)) continue;
+                                    return trigger(el);
+                                }
+                                return false;
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+                    if expanded:
+                        await asyncio.sleep(1.0)
+                        abriu_vendas = await _click_sales_report_entry()
+                if not abriu_vendas:
+                    try:
+                        abriu_vendas = await click_by_text(
+                            session_id,
+                            ["Relatório de vendas", "Relatorio de vendas"],
+                            timeout=10.0,
+                        )
+                    except Exception:
+                        abriu_vendas = False
+                if abriu_vendas:
+                    await asyncio.sleep(1.0)
+                    state_after_click = await wait_for_portal_state_v2(
+                        session_id,
+                        {"sales", "home", "login", "device", "token_delivery", "token", "portal_error", "invalid"},
+                        timeout=60.0,
+                        description=f"A Caixa nao abriu o Relatorio de vendas para {context_label}",
+                    )
+                    _emit_pix_status(on_status, f"Estado do portal apos abrir Relatorio de vendas: {state_after_click or 'desconhecido'}.")
+                    if state_after_click == "sales":
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_sales_entry_debug.html")
+                    if state_after_click != "home":
+                        return state_after_click
+
+                await navigate(session_id, credenciais["sales_url"])
+                state_after_navigation = await wait_for_portal_state_v2(
+                    session_id,
+                    {"sales", "home", "login", "device", "token_delivery", "token", "portal_error", "invalid"},
+                    timeout=60.0,
+                    description=f"A Caixa nao abriu a area de vendas para {context_label}",
+                )
+                _emit_pix_status(on_status, f"Estado do portal apos abrir a URL da area de vendas: {state_after_navigation or 'desconhecido'}.")
+                if state_after_navigation == "sales":
+                    await capture_portal_html_debug_v2(session_id, "azulzinha_sales_entry_debug.html")
+                return state_after_navigation
+
+            async def ensure_authenticated_sales_area(session_id: str, kind: str, context_label: str) -> None:
+                last_state = ""
+                for cycle in range(4):
+                    _check_cancelled()
+                    state = await get_portal_state_v2(session_id)
+                    last_state = state or last_state
+
+                    if state in {"", "loading", "unknown"}:
+                        if cycle == 0:
+                            _emit_pix_status(on_status, "Acessando Azulzinha/Caixa...")
+                            await navigate(session_id, credenciais["login_url"])
+                        else:
+                            await navigate(session_id, credenciais["sales_url"])
+                        state = await wait_for_portal_state_v2(
+                            session_id,
+                            {"sales", "home", "login", "device", "token_delivery", "token", "portal_error", "invalid"},
+                            timeout=90.0,
+                            description=f"A Caixa nao exibiu a tela esperada para {context_label}",
+                        )
+                        last_state = state
+
+                    if state == "portal_error":
+                        _emit_pix_status(
+                            on_status,
+                            f"A Caixa abriu a pagina de erro ao acessar {context_label}; recarregando o portal...",
+                        )
+                        await capture_portal_html_debug_v2(session_id, f"azulzinha_portal_error_{kind}.html")
+                        await asyncio.sleep(2.0)
+                        await navigate(session_id, credenciais["login_url"])
+                        continue
+
+                    if state in {"login", "device", "token_delivery", "token", "invalid"}:
+                        if state == "login":
+                            state = await perform_login_step_v2(session_id)
+                        if state == "device":
+                            state = await perform_device_selection_step_v2(session_id)
+                        if state in {"token_delivery", "token", "invalid"}:
+                            state = await complete_token_challenge_v2(session_id, state)
+                        last_state = state
+
+                    if state == "home":
+                        state = await open_sales_area_from_home_v2(session_id, context_label)
+                        last_state = state or last_state
+
+                    if state == "sales":
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_sales_before_settle.html")
+                        try:
+                            await wait_for_portal_settle(
+                                session_id,
+                                timeout=25.0,
+                                context_label=f"abrir {context_label}",
+                            )
+                            return
+                        except Exception:
+                            state = await get_portal_state_v2(session_id)
+                            last_state = state or last_state
+                            if state in {"login", "portal_error"}:
+                                continue
+                            raise
+
+                    if state == "portal_error":
+                        _emit_pix_status(
+                            on_status,
+                            f"A Caixa abriu a pagina de erro durante a autenticacao de {context_label}; tentando novamente...",
+                        )
+                        await capture_portal_html_debug_v2(session_id, f"azulzinha_auth_error_{kind}.html")
+                        await asyncio.sleep(2.0)
+                        await navigate(session_id, credenciais["login_url"])
+                        continue
+
+                    if state == "login":
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    state = await open_sales_area_from_home_v2(session_id, context_label)
+                    last_state = state
+                    if state == "sales":
+                        await capture_portal_html_debug_v2(session_id, "azulzinha_sales_before_settle.html")
+                        try:
+                            await wait_for_portal_settle(
+                                session_id,
+                                timeout=25.0,
+                                context_label=f"abrir {context_label}",
+                            )
+                            return
+                        except Exception:
+                            state = await get_portal_state_v2(session_id)
+                            last_state = state or last_state
+                            if state in {"login", "portal_error"}:
+                                continue
+                            raise
+
+                await capture_portal_html_debug_v2(session_id, f"azulzinha_sales_area_debug_{kind}.html")
+                raise RuntimeError(
+                    f"A Caixa nao concluiu a autenticacao para abrir {context_label}. Ultimo estado observado: {last_state or 'desconhecido'}."
                 )
 
             async def download_report(session_id: str, kind: str) -> str | None:
-                await navigate(session_id, credenciais["sales_url"])
-                await wait_for_condition(session_id, "document.body && document.body.innerText.length > 20", timeout=60.0)
-                await wait_for_condition(
-                    session_id,
-                    """
-                    (() => {
-                        return Boolean(
-                            document.querySelector('header[role="tablist"]') ||
-                            document.querySelector('#HistoricoVendas button[role="tab"]') ||
-                            document.querySelector('#Pix button[role="tab"]')
-                        );
-                    })()
-                    """,
-                    timeout=60.0,
-                    step=0.5,
-                )
-                if kind == "cartoes":
-                    _emit_pix_status(on_status, "Baixando relatorio de cartoes da Caixa...")
-                    await activate_sales_tab(session_id, "HistoricoVendas", timeout=35.0)
-                    await wait_for_tab_content(session_id, "HistoricoVendas", timeout=45.0)
-                else:
-                    _emit_pix_status(on_status, "Baixando relatorio PIX da Caixa...")
-                    await activate_sales_tab(session_id, "Pix", timeout=35.0)
-                    await wait_for_tab_content(session_id, "Pix", timeout=45.0)
-                await asyncio.sleep(1.0)
-                _emit_pix_status(on_status, f"Aplicando filtro de data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                await set_date_inputs(session_id)
-                _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                await wait_for_export_ready(session_id, kind, timeout=60.0)
-                started_at = _download_start_time()
-                event_start_index = len(event_log)
-                _emit_pix_status(on_status, f"Solicitando arquivo de {'cartoes' if kind == 'cartoes' else 'PIX'} para a Caixa...")
-                await click_export(session_id, "pix" if kind == "pix" else "cartoes")
-                captured = await wait_for_captured_report(session_id, kind, event_start_index, timeout=35.0)
-                if captured:
-                    _emit_pix_status(on_status, f"Relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} recebido e validado.")
-                    return captured
-                _emit_pix_status(on_status, f"Aguardando o download final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                return _persist_downloaded_report(
-                    _wait_for_downloaded_report(download_dir, data_br, kind, started_at, timeout=100.0),
-                    kind,
-                )
+                context_label = f"o relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}"
+                export_ready_timeout = 90.0 if kind == "pix" else 60.0
+                captured_timeout = 60.0 if kind == "pix" else 35.0
+                download_timeout = 150.0 if kind == "pix" else 100.0
+                last_error = None
+                for attempt in range(2):
+                    try:
+                        await ensure_authenticated_sales_area(session_id, kind, context_label)
+                        if kind == "cartoes":
+                            _emit_pix_status(on_status, "Baixando relatorio de cartoes da Caixa...")
+                            await activate_sales_tab(session_id, "HistoricoVendas", timeout=35.0)
+                            await wait_for_tab_content(session_id, "HistoricoVendas", timeout=45.0)
+                            await wait_for_portal_settle(
+                                session_id,
+                                tab_id="HistoricoVendas",
+                                timeout=20.0,
+                                context_label="estabilizar a aba HistoricoVendas",
+                            )
+                        else:
+                            _emit_pix_status(on_status, "Baixando relatorio PIX da Caixa...")
+                            await activate_sales_tab(session_id, "Pix", timeout=35.0)
+                            await wait_for_tab_content(session_id, "Pix", timeout=60.0)
+                            await wait_for_portal_settle(
+                                session_id,
+                                tab_id="Pix",
+                                timeout=25.0,
+                                context_label="estabilizar a aba Pix",
+                            )
+                        await asyncio.sleep(1.0)
+                        _emit_pix_status(on_status, f"Aplicando filtro de data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                        await set_date_inputs(session_id)
+                        await wait_for_portal_settle(
+                            session_id,
+                            tab_id="HistoricoVendas" if kind == "cartoes" else "Pix",
+                            timeout=25.0 if kind == "pix" else 20.0,
+                            context_label=f"aplicar a data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}",
+                        )
+                        _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                        await wait_for_export_ready(session_id, kind, timeout=export_ready_timeout)
+                        await asyncio.sleep(1.0)
+                        started_at = _download_start_time()
+                        event_start_index = len(event_log)
+                        _emit_pix_status(on_status, f"Solicitando arquivo de {'cartoes' if kind == 'cartoes' else 'PIX'} para a Caixa...")
+                        await click_export(session_id, "pix" if kind == "pix" else "cartoes")
+                        captured = await wait_for_captured_report(session_id, kind, event_start_index, timeout=captured_timeout)
+                        if captured:
+                            _emit_pix_status(on_status, f"Relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} recebido e validado.")
+                            return captured
+                        _emit_pix_status(on_status, f"Aguardando o download final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                        saved = _persist_downloaded_report(
+                            _wait_for_downloaded_report(browser_download_dir, data_br, kind, started_at, timeout=download_timeout),
+                            kind,
+                        )
+                        if saved:
+                            return saved
+                        raise RuntimeError(
+                            f"A Caixa nao entregou o arquivo final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}."
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt >= 1:
+                            raise
+                        try:
+                            current_state = str(await eval_js(session_id, sales_area_state_expression, timeout=10.0) or "").strip()
+                        except Exception:
+                            current_state = ""
+                        if current_state == "portal_error" or "_error.html" in str(exc).lower():
+                            retry_message = (
+                                f"A Caixa abriu a pagina de erro ao gerar o relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}; tentando novamente..."
+                            )
+                        else:
+                            retry_message = (
+                                f"A Caixa demorou para gerar o relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}; tentando novamente..."
+                            )
+                        _emit_pix_status(
+                            on_status,
+                            retry_message,
+                        )
+                        await asyncio.sleep(2.0)
+                if last_error:
+                    raise last_error
+                return None
 
             try:
                 target_id = (await cdp("Target.createTarget", {"url": "about:blank"})).get("targetId")
                 if not target_id:
-                    raise RuntimeError("Nao foi possivel abrir a aba oculta da Azulzinha/Caixa.")
-                await _hide_chromium_window(cdp, target_id)
+                    raise RuntimeError("Nao foi possivel abrir a aba da Azulzinha/Caixa.")
+                try:
+                    await cdp("Target.activateTarget", {"targetId": target_id}, timeout=5.0)
+                except Exception:
+                    pass
                 session_id = (await cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True})).get("sessionId")
                 if not session_id:
-                    raise RuntimeError("Nao foi possivel anexar a aba oculta da Azulzinha/Caixa.")
+                    raise RuntimeError("Nao foi possivel anexar a aba da Azulzinha/Caixa.")
                 await cdp("Page.enable", session_id=session_id)
                 await cdp("Runtime.enable", session_id=session_id)
+                try:
+                    await cdp("Page.bringToFront", session_id=session_id, timeout=5.0)
+                except Exception:
+                    pass
                 try:
                     await cdp("Network.enable", {}, session_id=session_id)
                 except Exception:
                     pass
                 try:
-                    await cdp("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": download_dir, "eventsEnabled": True})
+                    await cdp("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": browser_download_dir, "eventsEnabled": True})
                 except Exception:
                     pass
                 try:
                     await cdp(
                         "Page.setDownloadBehavior",
-                        {"behavior": "allow", "downloadPath": download_dir},
+                        {"behavior": "allow", "downloadPath": browser_download_dir},
                         session_id=session_id,
                     )
                 except Exception:
                     pass
-                await ensure_login(session_id)
-                await _hide_chromium_window(cdp, target_id)
+                await ensure_authenticated_sales_area(session_id, company_norm, "a area de vendas")
                 resultado = {"pix": None, "cartoes": None, "avisos": []}
                 if need_cartoes:
                     resultado["cartoes"] = await download_report(session_id, "cartoes")
@@ -3844,7 +6037,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
     _emit_pix_status(on_status, "Abrindo portal da Caixa...")
     proc = _launch_browser_process(chrome_args)
     try:
-        return asyncio.run(asyncio.wait_for(_run(), timeout=300.0))
+        return asyncio.run(asyncio.wait_for(_run(), timeout=480.0))
     finally:
         try:
             proc.terminate()
@@ -3854,6 +6047,8 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 proc.kill()
             except Exception:
                 pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        shutil.rmtree(browser_download_dir, ignore_errors=True)
         _cleanup_azulzinha_debug_artifacts()
 
 
@@ -4327,7 +6522,7 @@ def _build_card_reports_from_caixa_xlsx(caminho_xlsx: str, data_br: str) -> dict
 
 
 def _build_card_reports_from_caixa(caminho: str, data_br: str) -> dict[str, dict]:
-    suffix = Path(caminho).suffix.lower()
+    suffix = _effective_local_report_suffix(caminho)
     if suffix == ".xlsx":
         return _build_card_reports_from_caixa_xlsx(caminho, data_br)
     return _build_card_reports_from_caixa_pdf(caminho, data_br)
@@ -4823,6 +7018,11 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
 ) -> dict:
     texto = _read_pdf_text(caminho_pdf)
     if not _is_mva_clipp_fechamento_text(texto):
+        avisos = list(avisos_usuario or [])
+        avisos.append(
+            "O PDF informado como Fechamento de Caixa da MVA nao corresponde ao layout esperado do fechamento Clipp. "
+            "Ele sera tratado apenas como relatorio local, e a busca automatica dos pagamentos na Azulzinha/Caixa nao sera acionada por este arquivo."
+        )
         return {
             "arquivo": os.path.basename(caminho_pdf),
             "arquivo_tipo": "mva_desconhecido",
@@ -4834,6 +7034,7 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
             "nfces": [],
             "nfces_faltantes_sequencia": [],
             "fiscal_status_map": {},
+            "avisos_usuario": list(dict.fromkeys(avisos)),
         }
 
     linhas_brutas = [corrigir_texto(linha.strip()) for linha in texto.splitlines()]
@@ -5521,17 +7722,10 @@ def _launch_browser_process(chrome_args: list[str]) -> subprocess.Popen:
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
     }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
-        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-        popen_kwargs["startupinfo"] = startupinfo
     return subprocess.Popen(chrome_args, **popen_kwargs)
 
 
 async def _hide_chromium_window(cdp, target_id: str) -> None:
-    """Move/minimize the Chromium window so login automation stays less visible."""
     if not target_id:
         return
     try:
@@ -6168,6 +8362,8 @@ def gerar_relatorios_caixa_eh_zweb(
     last_error = None
     html_pedidos = ""
     html_fechamento = ""
+    caminho_html_pedidos = ""
+    caminho_html_fechamento = ""
     fiscal_status_map = {}
     pix_transactions = []
     pix_error = None
@@ -6226,10 +8422,21 @@ def gerar_relatorios_caixa_eh_zweb(
     if last_error is not None:
         raise last_error
 
+    _emit_pix_status(on_status, "Salvando relatorios do Zweb na pasta atual...")
+    caminho_html_pedidos = _save_zweb_html_report(data_br, "pedidos_importados", html_pedidos)
+    caminho_html_fechamento = _save_zweb_html_report(data_br, "fechamento_caixa", html_fechamento)
+
     _emit_pix_status(on_status, "Processando Pedidos importados...")
-    relatorio = _analisar_html_pedidos_importados_eh(html_pedidos)
+    relatorio = _analisar_html_pedidos_importados_eh(html_pedidos, arquivo=os.path.basename(caminho_html_pedidos))
+    relatorio["caminho"] = caminho_html_pedidos
     _emit_pix_status(on_status, "Processando Fechamento de caixa...")
-    relatorio_fechamento = _analisar_html_fechamento_caixa_eh(html_fechamento)
+    relatorio_fechamento = _analisar_html_fechamento_caixa_eh(html_fechamento, arquivo=os.path.basename(caminho_html_fechamento))
+    relatorio_fechamento["caminho"] = caminho_html_fechamento
+    for report_pagamento in (relatorio_fechamento.get("relatorios_pagamento") or {}).values():
+        if not isinstance(report_pagamento, dict):
+            continue
+        report_pagamento["arquivo"] = os.path.basename(caminho_html_fechamento)
+        report_pagamento["caminho"] = caminho_html_fechamento
     relatorio_fechamento["fiscal_status_map"] = fiscal_status_map or {}
     relatorio = _aplicar_filtro_canceladas_pedidos_eh(relatorio, fiscal_status_map or {})
 
@@ -6254,9 +8461,10 @@ def gerar_relatorios_caixa_eh_zweb(
     if local_pix_pdf:
         _emit_pix_status(on_status, "Lendo relatorio local de PIX...")
         try:
-            if str(local_pix_pdf).lower().endswith(".csv"):
+            pix_suffix = _effective_local_report_suffix(local_pix_pdf)
+            if pix_suffix == ".csv":
                 relatorio_pix = _build_pix_report_from_caixa_csv(local_pix_pdf, data_br)
-            elif str(local_pix_pdf).lower().endswith(".xlsx"):
+            elif pix_suffix == ".xlsx":
                 relatorio_pix = _build_pix_report_from_caixa_xlsx(local_pix_pdf, data_br)
             else:
                 relatorio_pix = _build_pix_report_from_caixa_pdf(local_pix_pdf, data_br)
@@ -6811,23 +9019,23 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             continue
         itens_fechamento = list(report_fechamento.get("itens_autorizados") or [])
         total_caixa_pagamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
-        total_pagamentos = round(float((report_externo or {}).get("total_autorizado", 0.0) or 0.0), 2)
         origem_externa = str((report_externo or {}).get("origem") or "").strip()
         usa_fallback_zweb = origem_externa == "zweb_movimentacoes"
-        status_correlacao = "Finalizado" if report_externo and abs(total_caixa_pagamento - total_pagamentos) < 0.01 else "Divergente"
-        if usa_fallback_zweb:
-            status_correlacao = f"{status_correlacao} (Financeiro Zweb)"
-        correlacao_rows.append(
-            (
-                titulo_pagamento,
-                f"R$ {format_number_br(total_caixa_pagamento)}",
-                f"R$ {format_number_br(total_pagamentos)}",
-                status_correlacao,
-            )
-        )
 
         if not report_externo:
-            _add_alert("Relat?rio ausente", f"{titulo_pagamento}: relat?rio local n?o encontrado na pasta raiz.", "-")
+            correlacao_rows.append(
+                (
+                    titulo_pagamento,
+                    f"R$ {format_number_br(total_caixa_pagamento)}",
+                    "R$ 0,00",
+                    "Divergente",
+                )
+            )
+            _add_alert(
+                "Relat?rio ausente",
+                f"{titulo_pagamento}: relat?rio local n?o encontrado na pasta atual de execucao.",
+                "-",
+            )
             continue
 
         if usa_fallback_zweb:
@@ -6848,6 +9056,22 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             externos_sem_fechamento,
             nf_pool,
             campo_externo=campo_valor,
+        )
+        total_pagamentos = round(
+            sum(float(item.get(campo_valor, 0.0) or 0.0) for item in itens_externos)
+            - sum(float(item.get(campo_valor, 0.0) or 0.0) for item, _nf in _matched_nf),
+            2,
+        )
+        status_correlacao = "Finalizado" if abs(total_caixa_pagamento - total_pagamentos) < 0.01 else "Divergente"
+        if usa_fallback_zweb:
+            status_correlacao = f"{status_correlacao} (Financeiro Zweb)"
+        correlacao_rows.append(
+            (
+                titulo_pagamento,
+                f"R$ {format_number_br(total_caixa_pagamento)}",
+                f"R$ {format_number_br(total_pagamentos)}",
+                status_correlacao,
+            )
         )
 
         for item in externos_restantes:
@@ -7233,7 +9457,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             alert_rows.append(
                 (
                     "Relatório ausente",
-                    f"{titulo_pagamento}: relatório local não encontrado na pasta raiz.",
+                    f"{titulo_pagamento}: relatório local não encontrado na pasta atual de execução.",
                     "-",
                 )
             )

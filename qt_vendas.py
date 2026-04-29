@@ -4,6 +4,7 @@ import sys
 import os
 import re
 import time
+import datetime as dt
 import tempfile
 import queue
 import threading
@@ -11,7 +12,7 @@ import difflib
 from typing import List, Optional
 from pathlib import Path
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets, QtPrintSupport
 
 from utils import (
     source_pdf_async,
@@ -46,7 +47,8 @@ from utils import (
     atualizar_ultimo_feedback,
     listar_vendedores_db,
     set_ui_refs,
-    _runtime_user_dir,
+    _active_report_dir,
+    cleanup_generated_auto_reports,
 )
 from ui_dialogs import messagebox, filedialog, set_parent
 from qt_adapters import (
@@ -56,6 +58,70 @@ from qt_adapters import (
     QtButtonAdapter,
     QtTreeAdapter,
 )
+
+
+_LEXEND_REPORTLAB_FONT_NAME: str | None = None
+
+
+def _get_reportlab_font_names() -> tuple[str, str]:
+    global _LEXEND_REPORTLAB_FONT_NAME
+
+    if _LEXEND_REPORTLAB_FONT_NAME:
+        return (_LEXEND_REPORTLAB_FONT_NAME, _LEXEND_REPORTLAB_FONT_NAME)
+
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        font_path = resource_path(os.path.join("data", "Lexend-Regular.ttf"))
+        if os.path.exists(font_path):
+            font_name = "Lexend"
+            if font_name not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont(font_name, font_path))
+            _LEXEND_REPORTLAB_FONT_NAME = font_name
+            return (font_name, font_name)
+    except Exception:
+        pass
+
+    _LEXEND_REPORTLAB_FONT_NAME = "Helvetica"
+    return ("Helvetica-Bold", "Helvetica")
+
+
+def _create_a4_printer() -> QtPrintSupport.QPrinter:
+    printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.HighResolution)
+    printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.A4))
+    printer.setPageMargins(QtCore.QMarginsF(6, 6, 6, 6), QtGui.QPageLayout.Millimeter)
+    return printer
+
+
+def _resolve_default_printer() -> QtPrintSupport.QPrinter:
+    printer_info = QtPrintSupport.QPrinterInfo.defaultPrinter()
+    printer_name = str(printer_info.printerName() or "").strip()
+    if printer_info.isNull() or not printer_name:
+        raise RuntimeError("Nenhuma impressora padrao esta configurada no Windows.")
+
+    printer = _create_a4_printer()
+    printer.setPrinterName(printer_name)
+    if not printer.isValid():
+        raise RuntimeError(
+            f"A impressora padrao '{printer_name}' nao esta disponivel para impressao."
+        )
+    return printer
+
+
+def _render_html_document_to_printer(
+    html: str,
+    printer: QtPrintSupport.QPrinter,
+    font_family: str | None = None,
+) -> None:
+    document = QtGui.QTextDocument()
+    document.setDefaultFont(
+        QtGui.QFont(font_family or QtWidgets.QApplication.font().family() or "Lexend", 8)
+    )
+    page_rect = printer.pageRect(QtPrintSupport.QPrinter.Point)
+    document.setPageSize(page_rect.size())
+    document.setHtml(html)
+    document.print_(printer)
 
 
 class SourceDialog(QtWidgets.QDialog):
@@ -184,6 +250,46 @@ class LoadingStatusDialog(QtWidgets.QDialog):
         if not self._closing_programmatically:
             self._cancelled = True
         super().closeEvent(event)
+
+
+class AutomationTimeDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget, current_time: QtCore.QTime) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Horario da automacao")
+        self.setModal(True)
+        self.setFixedSize(320, 150)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        label = QtWidgets.QLabel(
+            corrigir_texto("Escolha o horario diario da automacao.")
+        )
+        label.setWordWrap(True)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(label)
+
+        self._time_edit = QtWidgets.QTimeEdit(current_time)
+        self._time_edit.setDisplayFormat("HH:mm")
+        self._time_edit.setAlignment(QtCore.Qt.AlignCenter)
+        self._time_edit.setCalendarPopup(False)
+        self._time_edit.setMinimumWidth(120)
+        layout.addWidget(self._time_edit, alignment=QtCore.Qt.AlignHCenter)
+
+        buttons = QtWidgets.QDialogButtonBox()
+        btn_confirm = buttons.addButton("Confirmar", QtWidgets.QDialogButtonBox.AcceptRole)
+        btn_cancel = buttons.addButton("Cancelar", QtWidgets.QDialogButtonBox.RejectRole)
+        btn_confirm.setStyleSheet("text-align:center;")
+        btn_cancel.setStyleSheet("text-align:center;")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_time(self) -> QtCore.QTime | None:
+        if self.exec() == QtWidgets.QDialog.Accepted:
+            return self._time_edit.time()
+        return None
 
 
 class CaixaCnpjDialog(QtWidgets.QDialog):
@@ -485,6 +591,8 @@ class CaixaReportDialog(QtWidgets.QDialog):
         relatorio_pix: dict | None = None,
     ) -> None:
         super().__init__(parent)
+        self._relatorio_caixa = relatorio_caixa
+        self._fechamento = fechamento
         self._relatorio_pix = relatorio_pix
         self._payment_tab_widgets: dict[str, QtWidgets.QWidget] = {}
         self._payment_reports: dict[str, dict] = {}
@@ -545,6 +653,12 @@ class CaixaReportDialog(QtWidgets.QDialog):
         if len(partes) == 2 and partes[0] == partes[1]:
             return partes[0]
         return periodo_texto
+
+    def _bank_row_has_explicit_origin(self, row: tuple[str, ...] | list[str]) -> bool:
+        if len(row) < 3:
+            return False
+        origem = corrigir_texto(str(row[0] or "")).strip().casefold()
+        return origem == "pix" or origem.startswith("cart")
 
     def _wrap_centered(self, widget: QtWidgets.QWidget, max_width: int | None = None) -> QtWidgets.QWidget:
         if max_width is not None:
@@ -725,7 +839,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             if not row:
                 continue
             origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
-            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+            if self._bank_row_has_explicit_origin(row):
                 bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
             elif len(row) >= 2:
                 bank_rows.append(("PIX", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
@@ -733,7 +847,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             if not row:
                 continue
             origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
-            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+            if self._bank_row_has_explicit_origin(row):
                 bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
             elif len(row) >= 2:
                 bank_rows.append(("Cartão", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
@@ -799,7 +913,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             if not row:
                 continue
             origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
-            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+            if self._bank_row_has_explicit_origin(row):
                 bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
             elif len(row) >= 2:
                 bank_rows.append(("PIX", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
@@ -807,7 +921,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             if not row:
                 continue
             origem = corrigir_texto(str(row[0] or "")).strip() if len(row) >= 1 else ""
-            if len(row) >= 3 and origem.casefold() in {"pix", "cartão", "cartao"}:
+            if self._bank_row_has_explicit_origin(row):
                 bank_rows.append(tuple(corrigir_texto(str(value)) for value in row[:3]))
             elif len(row) >= 2:
                 bank_rows.append(("Cartão", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
@@ -972,7 +1086,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             self._wrap_centered(
                 self._build_summary_frame(
                     summary_items,
-                    {"Total Pend?ncias"},
+                    {"Total Pendências"},
                     fechamento=fechamento,
                     action_widgets=action_widgets,
                 ),
@@ -997,7 +1111,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
 
         table = QtWidgets.QTableWidget()
         table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(("N?mero", "Valor"))
+        table.setHorizontalHeaderLabels(("Número", "Valor"))
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
@@ -1235,7 +1349,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             summary_items = relatorio_pagamento.get("summary_items") or ()
             layout.addWidget(
                 self._wrap_centered(
-                    self._build_summary_frame(summary_items, {"Total Pend?ncias"}),
+                    self._build_summary_frame(summary_items, {"Total Pendências"}),
                     560,
                 )
             )
@@ -1248,42 +1362,42 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 self._wrap_centered(
                     self._build_summary_frame(
                         summary_items,
-                        {corrigir_texto(relatorio_pagamento.get("total_label") or "Total pend?ncias")},
+                        {corrigir_texto(relatorio_pagamento.get("total_label") or "Total pendências")},
                     ),
                     560,
                 )
             )
             sections = [
                 (
-                    "PIX - CF sem Transa??o Banc?ria",
+                    "PIX - CF sem Transação Bancária",
                     ("Fechamento EH", "Valor EH"),
                     list(relatorio_pagamento.get("pix_fechamento_rows") or []),
                     [250, 110],
                     "Nenhum CF PIX sem transa??o banc?ria encontrado.",
                 ),
                 (
-                    "PIX - Transa??o Banc?ria sem CF/NF",
-                    ("M?quina", "Valor Banco"),
+                    "PIX - Transação Bancária sem CF/NF",
+                    ("Máquina", "Valor Banco"),
                     list(relatorio_pagamento.get("pix_maquina_rows") or []),
                     [250, 110],
                     "Nenhuma transa??o PIX sem CF/NF encontrada.",
                 ),
                 (
-                    "Cart?es - CF sem Transa??o Banc?ria",
+                    "Cartões - CF sem Transação Bancária",
                     ("Fechamento EH", "Valor EH"),
                     list(relatorio_pagamento.get("cartao_fechamento_rows") or []),
                     [250, 110],
                     "Nenhum CF de cart?o sem transa??o banc?ria encontrado.",
                 ),
                 (
-                    "Cart?es - Transa??o Banc?ria sem CF/NF",
-                    ("M?quina", "Valor Banco"),
+                    "Cartões - Transação Bancária sem CF/NF",
+                    ("Máquina", "Valor Banco"),
                     list(relatorio_pagamento.get("cartao_maquina_rows") or []),
                     [250, 110],
                     "Nenhuma transa??o de cart?o sem CF/NF encontrada.",
                 ),
                 (
-                    "Observa??es",
+                    "Observações",
                     ("Tipo", "Detalhe", "Valor"),
                     list(relatorio_pagamento.get("observacao_rows") or []),
                     [170, 360, 110],
@@ -1304,7 +1418,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         layout.addLayout(actions)
 
         for title, headers, rows, widths, empty_message in sections:
-            if not rows and not keep_empty_sections and title != "Observa??es":
+            if not rows and not keep_empty_sections and title != "Observações":
                 continue
             label = QtWidgets.QLabel(corrigir_texto(title))
             label.setAlignment(QtCore.Qt.AlignCenter)
@@ -1436,9 +1550,9 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 value_font.setPointSize(value_font.pointSize())
                 value.setFont(value_font)
 
-            if label_text in highlighted_labels and label_text not in {"Total Pend?ncias"}:
+            if label_text in highlighted_labels and label_text not in {"Total Pendências"}:
                 value.setStyleSheet("color:#59C734;")
-            if label_text in {"Total Pend?ncias"}:
+            if label_text in {"Total Pendências"}:
                 cor = "#59C734"
                 if fechamento and fechamento.get("status") != "Confere":
                     cor = "#FF4D4F"
@@ -1480,6 +1594,202 @@ class CaixaReportDialog(QtWidgets.QDialog):
         if table.verticalScrollBar().isVisible():
             width += table.verticalScrollBar().sizeHint().width()
         table.setFixedWidth(width)
+
+    def _create_configured_printer(self) -> QtPrintSupport.QPrinter:
+        return _create_a4_printer()
+
+    def _get_default_printer(self) -> QtPrintSupport.QPrinter:
+        return _resolve_default_printer()
+
+    def _print_section_widths(
+        self,
+        section_title: object,
+        headers: tuple[str, ...],
+        widths: object,
+    ) -> object:
+        normalized_title = corrigir_texto(str(section_title or "")).strip().casefold()
+        if normalized_title == "transacoes bancarias sem cf/nf" and len(headers) == 3:
+            return [85, 325, 170]
+        return widths
+
+    def _column_width_percentages(self, widths: object, column_count: int) -> list[float]:
+        values: list[float] = []
+        for raw in list(widths or [])[:column_count]:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = 0.0
+            values.append(max(0.0, value))
+        if len(values) < column_count:
+            values.extend([0.0] * (column_count - len(values)))
+        total = sum(values)
+        if total <= 0:
+            return []
+        return [(value / total) * 100.0 for value in values]
+
+    def _build_print_document_html(
+        self,
+        title: str,
+        summary_items,
+        sections,
+    ) -> str:
+        from html import escape
+
+        def _cell(value: object) -> str:
+            return escape(corrigir_texto(str(value or "")))
+
+        font_family = escape(corrigir_texto(self.font().family() or "Lexend"))
+        html_parts = [
+            "<html><head><meta charset='utf-8'>",
+            "<style>",
+            f"body{{font-family:'{font_family}',Arial,Helvetica,sans-serif;font-size:7.4pt;color:#000;margin:0;padding:0;}}",
+            ".page{width:100%;max-width:none;margin:0 auto;padding:0;text-align:center;}",
+            "h1{font-size:9pt;text-align:center;margin:0 0 4px 0;white-space:nowrap;overflow-wrap:normal;word-break:normal;}",
+            "h2{font-size:7pt;text-align:center;margin:3px 0 2px 0;font-weight:600;}",
+            "table{width:100%;border-collapse:collapse;table-layout:fixed;margin:0 0 6px 0;}",
+            ".section-table th:last-child,.section-table td:last-child{white-space:nowrap;overflow-wrap:normal;word-break:keep-all;}",
+            "th{background:#000;color:#fff;font-weight:bold;}",
+            "th,td{border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:middle;word-wrap:break-word;overflow-wrap:anywhere;font-size:6.6pt;}",
+            "td{background:#fff;color:#000;}",
+            "</style></head><body><div class='page'>",
+            f"<h1>{_cell(title)}</h1>",
+            "<table><thead><tr><th>Campo</th><th>Valor</th></tr></thead><tbody>",
+        ]
+
+        for label, value in summary_items:
+            html_parts.append(f"<tr><td>{_cell(label)}</td><td>{_cell(value)}</td></tr>")
+        html_parts.append("</tbody></table>")
+
+        for section_title, headers, rows, widths, empty_message in sections:
+            headers = tuple(headers or ())
+            rows = list(rows or [])
+            if section_title:
+                html_parts.append(f"<h2>{_cell(section_title)}</h2>")
+            width_percentages = self._column_width_percentages(
+                self._print_section_widths(section_title, headers, widths),
+                len(headers),
+            )
+            html_parts.append("<table class='section-table'>")
+            if width_percentages:
+                html_parts.append("<colgroup>")
+                for width_pct in width_percentages:
+                    html_parts.append(f"<col style='width:{width_pct:.2f}%'>")
+                html_parts.append("</colgroup>")
+            html_parts.append("<thead><tr>")
+            for header in headers:
+                html_parts.append(f"<th>{_cell(header)}</th>")
+            html_parts.append("</tr></thead><tbody>")
+            if rows:
+                for row in rows:
+                    normalized_row = list(row[: len(headers)])
+                    if len(normalized_row) < len(headers):
+                        normalized_row.extend([""] * (len(headers) - len(normalized_row)))
+                    html_parts.append("<tr>")
+                    for value in normalized_row:
+                        html_parts.append(f"<td>{_cell(value)}</td>")
+                    html_parts.append("</tr>")
+            else:
+                col_span = max(1, len(headers))
+                html_parts.append(f"<tr><td colspan='{col_span}'>{_cell(empty_message)}</td></tr>")
+            html_parts.append("</tbody></table>")
+
+        html_parts.append("</div></body></html>")
+        return "".join(html_parts)
+
+    def _print_html_document(self, html: str, printer: QtPrintSupport.QPrinter) -> None:
+        _render_html_document_to_printer(html, printer, self.font().family() or "Lexend")
+
+    def _print_simple_report_to_default_printer(
+        self,
+        title: str,
+        summary_items,
+        section_title: str,
+        headers,
+        rows,
+        widths,
+        empty_message: str,
+    ) -> None:
+        html = self._build_print_document_html(
+            title=title,
+            summary_items=summary_items,
+            sections=[(section_title, headers, rows, widths, empty_message)],
+        )
+        self._print_html_document(html, self._get_default_printer())
+
+    def _print_sectioned_report_to_default_printer(
+        self,
+        title: str,
+        summary_items,
+        sections,
+    ) -> None:
+        html = self._build_print_document_html(
+            title=title,
+            summary_items=summary_items,
+            sections=sections,
+        )
+        self._print_html_document(html, self._get_default_printer())
+
+    def build_automation_bundle_jobs(self) -> list[tuple[str, str]]:
+        jobs: list[tuple[str, str]] = []
+        if not self._fechamento:
+            return jobs
+
+        fechamento = self._fechamento
+        fechamento_title = (
+            "Fechamento de Caixa - Eletronica Horizonte"
+            if str(fechamento.get("caixa_modelo") or "").upper() == "EH"
+            else "Fechamento de Caixa - MVA"
+        )
+        bank_report = self._get_fechamento_bank_report(fechamento)
+        if bank_report:
+            report = self._enrich_eh_bank_report(fechamento, bank_report)
+            html = self._build_print_document_html(
+                title=fechamento_title,
+                summary_items=report.get("summary_items") or (),
+                sections=self._build_bank_sections(report),
+            )
+            jobs.append((fechamento_title, html))
+            return jobs
+
+        fechamento_rows = [
+            (
+                item.get("numero_exibicao", ""),
+                "-" if item.get("valor") in (None, "") else f"R$ {format_number_br(item.get('valor', 0.0))}",
+            )
+            for item in fechamento.get("registros_conferencia", [])
+        ]
+        if fechamento_rows:
+            fechamento_rows.append(
+                (
+                    "Total faltante",
+                    f"R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}",
+                )
+            )
+        html = self._build_print_document_html(
+            title=fechamento_title,
+            summary_items=self._build_fechamento_summary_items(fechamento),
+            sections=[
+                (
+                    self._build_fechamento_section_title(fechamento),
+                    ("Numero", "Valor"),
+                    fechamento_rows,
+                    [260, 140],
+                    self._build_fechamento_empty_message(fechamento),
+                )
+            ],
+        )
+        jobs.append((fechamento_title, html))
+        return jobs
+
+    def print_automation_jobs(self, jobs: list[tuple[str, str]]) -> list[str]:
+        printed_titles: list[str] = []
+        for title, html in jobs:
+            self._print_html_document(html, self._get_default_printer())
+            printed_titles.append(title)
+        return printed_titles
+
+    def print_automation_bundle(self) -> list[str]:
+        return self.print_automation_jobs(self.build_automation_bundle_jobs())
 
     def _export_davs_pdf(self, relatorio: dict) -> None:
         summary_items = self._build_davs_summary_items(relatorio)
@@ -1594,34 +1904,35 @@ class CaixaReportDialog(QtWidgets.QDialog):
         pdf = canvas.Canvas(path, pagesize=A4)
         width, height = A4
         y = height - 40
+        title_font_name, body_font_name = _get_reportlab_font_names()
 
         def new_page():
             nonlocal y
             pdf.showPage()
             y = height - 40
-            pdf.setFont("Helvetica", 10)
+            pdf.setFont(body_font_name, 9)
 
-        pdf.setFont("Helvetica-Bold", 14)
+        pdf.setFont(title_font_name, 12)
         pdf.drawString(40, y, title)
-        y -= 28
+        y -= 24
 
-        pdf.setFont("Helvetica", 10)
+        pdf.setFont(body_font_name, 9)
         for label, value in summary_items:
             text = f"{label}: {value}"
             for part in self._split_pdf_text(text, 95):
                 if y < 45:
                     new_page()
                 pdf.drawString(40, y, part)
-                y -= 14
-        y -= 10
+                y -= 13
+        y -= 8
 
         if y < 60:
             new_page()
 
-        pdf.setFont("Helvetica-Bold", 10)
+        pdf.setFont(title_font_name, 9)
         pdf.drawString(40, y, " | ".join(headers))
-        y -= 16
-        pdf.setFont("Helvetica", 9)
+        y -= 14
+        pdf.setFont(body_font_name, 8.5)
 
         if not rows:
             pdf.drawString(40, y, empty_message)
@@ -1632,7 +1943,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
                     if y < 45:
                         new_page()
                     pdf.drawString(40, y, part)
-                    y -= 12
+                    y -= 11
 
         pdf.save()
         messagebox.showinfo("Exportado", f"PDF salvo em:\n{path}")
@@ -1647,6 +1958,31 @@ class CaixaReportDialog(QtWidgets.QDialog):
         from html import escape
         from PySide6 import QtPrintSupport
 
+        def _print_section_widths(
+            section_title: object,
+            headers: tuple[str, ...],
+            widths: object,
+        ) -> object:
+            normalized_title = corrigir_texto(str(section_title or "")).strip().casefold()
+            if normalized_title == "transações bancárias sem cf/nf" and len(headers) == 3:
+                return [85, 325, 170]
+            return widths
+
+        def _column_width_percentages(widths: object, column_count: int) -> list[float]:
+            values: list[float] = []
+            for raw in list(widths or [])[:column_count]:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    value = 0.0
+                values.append(max(0.0, value))
+            if len(values) < column_count:
+                values.extend([0.0] * (column_count - len(values)))
+            total = sum(values)
+            if total <= 0:
+                return []
+            return [(value / total) * 100.0 for value in values]
+
         printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.HighResolution)
         printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.A4))
         printer.setPageMargins(QtCore.QMarginsF(6, 6, 6, 6), QtGui.QPageLayout.Millimeter)
@@ -1658,16 +1994,19 @@ class CaixaReportDialog(QtWidgets.QDialog):
         def _cell(value: object) -> str:
             return escape(corrigir_texto(str(value or "")))
 
+        font_family = escape(corrigir_texto(self.font().family() or "Lexend"))
+
         html_parts = [
             "<html><head><meta charset='utf-8'>",
             "<style>",
-            "body{font-family:Arial,Helvetica,sans-serif;font-size:8pt;color:#000;margin:0;padding:0;}",
+            f"body{{font-family:'{font_family}',Arial,Helvetica,sans-serif;font-size:7.4pt;color:#000;margin:0;padding:0;}}",
             ".page{width:100%;max-width:none;margin:0 auto;padding:0;text-align:center;}",
-            "h1{font-size:10.5pt;text-align:center;margin:0 0 5px 0;white-space:nowrap;overflow-wrap:normal;word-break:normal;}",
-            "h2{font-size:8pt;text-align:center;margin:4px 0 2px 0;}",
+            "h1{font-size:9pt;text-align:center;margin:0 0 4px 0;white-space:nowrap;overflow-wrap:normal;word-break:normal;}",
+            "h2{font-size:7pt;text-align:center;margin:3px 0 2px 0;font-weight:600;}",
             "table{width:100%;border-collapse:collapse;table-layout:fixed;margin:0 0 6px 0;}",
+            ".section-table th:last-child,.section-table td:last-child{white-space:nowrap;overflow-wrap:normal;word-break:keep-all;}",
             "th{background:#000;color:#fff;font-weight:bold;}",
-            "th,td{border:1px solid #777;padding:2px;text-align:center;vertical-align:middle;word-wrap:break-word;overflow-wrap:anywhere;font-size:7pt;}",
+            "th,td{border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:middle;word-wrap:break-word;overflow-wrap:anywhere;font-size:6.6pt;}",
             "td{background:#fff;color:#000;}",
             "</style></head><body><div class='page'>",
             f"<h1>{_cell(title)}</h1>",
@@ -1682,14 +2021,27 @@ class CaixaReportDialog(QtWidgets.QDialog):
             headers = tuple(headers or ())
             rows = list(rows or [])
             html_parts.append(f"<h2>{_cell(section_title)}</h2>")
-            html_parts.append("<table><thead><tr>")
+            width_percentages = _column_width_percentages(
+                _print_section_widths(section_title, headers, _widths),
+                len(headers),
+            )
+            html_parts.append("<table class='section-table'>")
+            if width_percentages:
+                html_parts.append("<colgroup>")
+                for width_pct in width_percentages:
+                    html_parts.append(f"<col style='width:{width_pct:.2f}%'>")
+                html_parts.append("</colgroup>")
+            html_parts.append("<thead><tr>")
             for header in headers:
                 html_parts.append(f"<th>{_cell(header)}</th>")
             html_parts.append("</tr></thead><tbody>")
             if rows:
                 for row in rows:
+                    normalized_row = list(row[: len(headers)])
+                    if len(normalized_row) < len(headers):
+                        normalized_row.extend([""] * (len(headers) - len(normalized_row)))
                     html_parts.append("<tr>")
-                    for value in row:
+                    for value in normalized_row:
                         html_parts.append(f"<td>{_cell(value)}</td>")
                     html_parts.append("</tr>")
             else:
@@ -1700,6 +2052,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         html_parts.append("</div></body></html>")
 
         document = QtGui.QTextDocument()
+        document.setDefaultFont(QtGui.QFont(self.font().family() or "Lexend", 8))
         page_rect = printer.pageRect(QtPrintSupport.QPrinter.Point)
         document.setPageSize(page_rect.size())
         document.setHtml("".join(html_parts))
@@ -1917,17 +2270,18 @@ def exportar_planilha_pdf(tree: QtTreeAdapter, titulo: str) -> None:
     c = canvas.Canvas(caminho, pagesize=A4)
     largura, altura = A4
     y = altura - 40
+    title_font_name, body_font_name = _get_reportlab_font_names()
 
-    c.setFont("Helvetica-Bold", 14)
+    c.setFont(title_font_name, 12)
     c.drawString(50, y, titulo)
-    y -= 30
+    y -= 24
 
-    c.setFont("Helvetica-Bold", 10)
+    c.setFont(title_font_name, 9)
     for i, col in enumerate(cols):
         c.drawString(50 + i * 150, y, col)
-    y -= 20
+    y -= 16
 
-    c.setFont("Helvetica", 9)
+    c.setFont(body_font_name, 8.5)
     for row in rows:
         for i, val in enumerate(row):
             c.drawString(50 + i * 150, y, str(val))
@@ -1935,7 +2289,7 @@ def exportar_planilha_pdf(tree: QtTreeAdapter, titulo: str) -> None:
         if y < 40:
             c.showPage()
             y = altura - 40
-            c.setFont("Helvetica", 9)
+            c.setFont(body_font_name, 8.5)
 
     c.save()
     messagebox.showinfo("Sucesso", f"PDF salvo em:\n{caminho}")
@@ -1956,11 +2310,12 @@ def exportar_feedbacks_pdf(vendedor: str, feedbacks: list) -> None:
     c = canvas.Canvas(caminho, pagesize=A4)
     largura, altura = A4
     y = altura - 50
+    title_font_name, body_font_name = _get_reportlab_font_names()
 
-    c.setFont("Helvetica-Bold", 14)
+    c.setFont(title_font_name, 12)
     c.drawString(50, y, f"Feedbacks - {vendedor}")
-    y -= 30
-    c.setFont("Helvetica", 10)
+    y -= 24
+    c.setFont(body_font_name, 9)
 
     feedbacks_por_vendedor = {}
     for fb in feedbacks:
@@ -1969,10 +2324,10 @@ def exportar_feedbacks_pdf(vendedor: str, feedbacks: list) -> None:
 
     for vendedor_nome, lista in feedbacks_por_vendedor.items():
         if len(feedbacks_por_vendedor) > 1:
-            c.setFont("Helvetica-Bold", 12)
+            c.setFont(title_font_name, 10)
             c.drawString(50, y, f"Vendedor: {vendedor_nome}")
-            y -= 20
-            c.setFont("Helvetica", 10)
+            y -= 16
+            c.setFont(body_font_name, 9)
 
         for fb in lista:
             linha = f"{fb['created_at'][:19]} - {fb['feedback']}"
@@ -1981,7 +2336,7 @@ def exportar_feedbacks_pdf(vendedor: str, feedbacks: list) -> None:
                 y -= 15
                 if y < 50:
                     c.showPage()
-                    c.setFont("Helvetica", 10)
+                    c.setFont(body_font_name, 9)
                     y = altura - 50
 
         y -= 10
@@ -2004,6 +2359,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._neon_on = False
         self._neon_hue = 0
         self._showing_graphs = False
+        self._automation_enabled = True
+        self._automation_time = QtCore.QTime(8, 0)
+        self._automation_running = False
+        self._automation_next_run: dt.datetime | None = None
+        self._automation_test_run_at: dt.datetime | None = None
+        self._automation_last_status = "Automacao diaria pronta. Sempre usa o dia anterior."
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2029,6 +2390,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_merge = QtWidgets.QPushButton("Mesclar Planilhas")
         self.btn_tag = QtWidgets.QPushButton("Criar Etiquetas")
         self.btn_feedback = QtWidgets.QPushButton("Feedback")
+        self.btn_automation_test = QtWidgets.QPushButton("Teste automacao (5s)")
         for btn in (
             self.btn_select_pdf,
             self.btn_caixa,
@@ -2040,6 +2402,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_merge,
             self.btn_tag,
             self.btn_feedback,
+            self.btn_automation_test,
         ):
             btn.setSizePolicy(btn_policy)
             btn.setMinimumHeight(36)
@@ -2051,6 +2414,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_feedback,
             self.btn_select_pdf,
             self.btn_caixa,
+            self.btn_automation_test,
             self.btn_clear,
             self.btn_merge,
             self.btn_spreadsheet,
@@ -2081,7 +2445,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_cancel.setSizePolicy(btn_policy)
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.setStyleSheet("text-align:center;")
-        right_panel.addWidget(self.btn_cancel, alignment=QtCore.Qt.AlignHCenter)
+        self.btn_automation_power = QtWidgets.QPushButton()
+        self.btn_automation_power.setFixedSize(36, 36)
+        self.btn_automation_power.setStyleSheet("text-align:center;padding:4px;")
+        self.btn_automation_power.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+
+        cancel_row = QtWidgets.QHBoxLayout()
+        cancel_row.addStretch()
+        cancel_row.addWidget(self.btn_cancel)
+        cancel_row.addWidget(self.btn_automation_power)
+        cancel_row.addStretch()
+        right_panel.addLayout(cancel_row)
 
         self.label_files = QtWidgets.QLabel("Nenhum arquivo carregado ainda")
         self.label_files.setAlignment(QtCore.Qt.AlignCenter)
@@ -2131,6 +2505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_import_neon()
         self._setup_progress_visibility_timer()
         self._setup_graphs_refresh_timer()
+        self._setup_daily_automation_timer()
 
         set_ui_refs(
             btn_cancel=QtButtonAdapter(self.btn_cancel),
@@ -2237,6 +2612,137 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_tag.clicked.connect(lambda: criar_etiquetas(self.tree_main))
         self.btn_tag.setEnabled(False)
         self.btn_feedback.clicked.connect(self._open_feedback)
+        self.btn_automation_power.clicked.connect(self._toggle_automation_power)
+        self.btn_automation_test.clicked.connect(self._schedule_automation_test_run)
+
+    def _setup_daily_automation_timer(self) -> None:
+        self._automation_next_run = self._compute_next_automation_run()
+        self._automation_timer = QtCore.QTimer(self)
+        self._automation_timer.timeout.connect(self._on_automation_timer_tick)
+        self._automation_timer.start(1000)
+        self._refresh_automation_controls_ui()
+
+    def _compute_next_automation_run(self, now: dt.datetime | None = None) -> dt.datetime:
+        now = now or dt.datetime.now()
+        target_time = self._automation_time if self._automation_time.isValid() else QtCore.QTime(8, 0)
+        target = now.replace(
+            hour=target_time.hour(),
+            minute=target_time.minute(),
+            second=0,
+            microsecond=0,
+        )
+        if now >= target:
+            target += dt.timedelta(days=1)
+        return target
+
+    def _automation_target_date_br(self) -> str:
+        return QtCore.QDate.currentDate().addDays(-1).toString("dd/MM/yyyy")
+
+    def _automation_time_text(self) -> str:
+        return self._automation_time.toString("HH:mm") if self._automation_time.isValid() else "08:00"
+
+    def _format_countdown(self, total_seconds: int) -> str:
+        total_seconds = max(0, int(total_seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _refresh_automation_controls_ui(self) -> None:
+        play_icon = self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        stop_icon = self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
+        if self._automation_enabled:
+            next_run = self._automation_next_run or self._compute_next_automation_run()
+            remaining = self._format_countdown(int((next_run - dt.datetime.now()).total_seconds()))
+            tooltip = (
+                f"Automacao ativa para {self._automation_time_text()}.\n"
+                f"Proxima execucao: {next_run.strftime('%d/%m/%Y %H:%M:%S')} (em {remaining}).\n"
+                "Clique para pausar."
+            )
+            self.btn_automation_power.setIcon(stop_icon)
+            self.btn_automation_power.setToolTip(corrigir_texto(tooltip))
+        else:
+            tooltip = (
+                f"Automacao pausada. Ultimo horario configurado: {self._automation_time_text()}.\n"
+                "Clique para escolher o horario e ligar novamente."
+            )
+            self.btn_automation_power.setIcon(play_icon)
+            self.btn_automation_power.setToolTip(corrigir_texto(tooltip))
+        self.btn_automation_power.setEnabled(not self._automation_running)
+
+        if self._automation_test_run_at:
+            test_remaining = self._format_countdown(
+                int((self._automation_test_run_at - dt.datetime.now()).total_seconds())
+            )
+            self.btn_automation_test.setText(f"Teste em {test_remaining}")
+            self.btn_automation_test.setToolTip(
+                corrigir_texto(f"Teste manual agendado para iniciar em {test_remaining}.")
+            )
+        else:
+            self.btn_automation_test.setText("Teste automacao (5s)")
+            self.btn_automation_test.setToolTip(
+                corrigir_texto("Dispara a automacao do dia anterior em 5 segundos.")
+            )
+
+    def _choose_automation_time(self) -> QtCore.QTime | None:
+        dialog = AutomationTimeDialog(self, self._automation_time if self._automation_time.isValid() else QtCore.QTime(8, 0))
+        try:
+            return dialog.selected_time()
+        finally:
+            dialog.deleteLater()
+
+    def _toggle_automation_power(self) -> None:
+        if self._automation_running:
+            return
+        if self._automation_enabled:
+            self._automation_enabled = False
+            self._automation_next_run = None
+            self._automation_last_status = "Automacao pausada pelo usuario."
+            self._refresh_automation_controls_ui()
+            return
+
+        selected_time = self._choose_automation_time()
+        if selected_time is None:
+            return
+
+        self._automation_time = selected_time
+        self._automation_enabled = True
+        self._automation_next_run = self._compute_next_automation_run()
+        self._automation_last_status = (
+            f"Automacao retomada para {self._automation_time_text()}. Proximo alvo: {self._automation_target_date_br()}."
+        )
+        self._refresh_automation_controls_ui()
+
+    def _schedule_automation_test_run(self) -> None:
+        if self._automation_running:
+            return
+        self._automation_test_run_at = dt.datetime.now() + dt.timedelta(seconds=5)
+        self._automation_last_status = (
+            f"Teste de automacao armado para {self._automation_target_date_br()}."
+        )
+        self._refresh_automation_controls_ui()
+
+    def _on_automation_timer_tick(self) -> None:
+        now = dt.datetime.now()
+        if (
+            self._automation_test_run_at is not None
+            and now >= self._automation_test_run_at
+            and not self._automation_running
+        ):
+            self._automation_test_run_at = None
+            self._run_scheduled_automation("teste manual", notify_user=True)
+            return
+
+        if (
+            self._automation_enabled
+            and self._automation_next_run is not None
+            and now >= self._automation_next_run
+            and not self._automation_running
+        ):
+            self._automation_next_run = self._compute_next_automation_run(now + dt.timedelta(seconds=1))
+            self._run_scheduled_automation(f"agenda {self._automation_time_text()}", notify_user=False)
+            return
+
+        self._refresh_automation_controls_ui()
 
     def _handle_pdf_button(self) -> None:
         if not self._confirm_discard_edits("importar PDF"):
@@ -2370,8 +2876,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         auto_download_missing=True,
                         on_status=push_status,
                     )
+                    avisos_cupons = list(relatorio_cupons.get("avisos_usuario") or [])
                     if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
                         relatorio_cupons = analisar_pdf_resumo_nfce(path_cupons)
+                        if avisos_cupons:
+                            relatorio_cupons["avisos_usuario"] = list(
+                                dict.fromkeys(
+                                    list(relatorio_cupons.get("avisos_usuario") or [])
+                                    + avisos_cupons
+                                )
+                            )
                     result["relatorio_cupons"] = relatorio_cupons
             except Exception as exc:
                 result["error"] = str(exc)
@@ -2411,7 +2925,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "cupons": ["fechamento de caixa"],
         }
         base_dirs: list[str] = []
-        for raw in [os.getcwd(), _runtime_user_dir()]:
+        for raw in [_active_report_dir()]:
             if raw and os.path.isdir(raw) and raw not in base_dirs:
                 base_dirs.append(raw)
 
@@ -2435,6 +2949,255 @@ class MainWindow(QtWidgets.QMainWindow):
                         found[key] = path
                         break
         return found
+
+    def _generate_mva_reports_for_automation(self) -> tuple[dict | None, dict | None, str | None]:
+        auto_files = self._auto_find_mva_caixa_files()
+        missing: list[str] = []
+        path_davs = auto_files.get("davs", "")
+        path_orcamentos = auto_files.get("orcamentos", "")
+        path_cupons = auto_files.get("cupons", "")
+
+        if not path_davs:
+            missing.append("DAV MVA")
+        if not path_orcamentos:
+            missing.append("Orcamento")
+        if not path_cupons:
+            missing.append("Fechamento de Caixa")
+        if missing:
+            return None, None, f"Arquivos da MVA nao encontrados automaticamente: {', '.join(missing)}."
+
+        relatorio_davs, relatorio_orcamentos, relatorio_cupons, mva_msg = self._load_mva_reports_with_loading(
+            path_davs,
+            path_orcamentos,
+            path_cupons,
+        )
+        if mva_msg:
+            return None, None, mva_msg
+
+        davs_ok, davs_msg = validar_arquivo_caixa_mva(relatorio_davs, "exportacao_dados_mva")
+        if not davs_ok:
+            return None, None, davs_msg
+
+        orc_ok, orc_msg = validar_arquivo_caixa_mva(relatorio_orcamentos, "orcamentos_mva")
+        if not orc_ok:
+            return None, None, orc_msg
+
+        if relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
+            if relatorio_davs.get("periodo") != relatorio_orcamentos.get("periodo"):
+                return None, None, (
+                    "A Exportacao de dados e o relatorio de Orcamento da MVA precisam ser do mesmo periodo."
+                )
+
+        relatorio = combinar_relatorios_caixa_mva([relatorio_davs, relatorio_orcamentos])
+        if relatorio.get("pedidos_total", 0) <= 0:
+            return None, None, "Nenhum pedido foi encontrado nos arquivos da MVA."
+
+        caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(
+            relatorio,
+            modelo_esperado="MVA",
+        )
+        if not caixa_ok:
+            return None, None, caixa_msg
+
+        resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(
+            relatorio_cupons,
+            modelo_esperado="MVA",
+        )
+        if not resumo_ok:
+            return None, None, resumo_msg
+        if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
+            return None, None, "Nenhum cupom foi encontrado no Fechamento de Caixa da MVA."
+
+        periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
+            relatorio,
+            relatorio_cupons,
+            titulo_secundario="relatorio de Cupons",
+        )
+        if not periodo_ok:
+            return None, None, periodo_msg
+
+        fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_cupons)
+        return relatorio, fechamento, None
+
+    def _generate_eh_reports_for_automation(
+        self,
+        data_br: str,
+    ) -> tuple[dict | None, dict | None, dict | None, list[str], str | None]:
+        relatorio, relatorio_nfce, relatorio_pix, eh_msg = self._load_eh_caixa_reports_with_loading(data_br)
+        if eh_msg == "__cancelled__":
+            return None, None, None, [], "A automacao da EH foi cancelada."
+        if eh_msg:
+            return None, None, None, [], eh_msg
+
+        caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(
+            relatorio,
+            modelo_esperado="EH",
+        )
+        if not caixa_ok:
+            return None, None, None, [], caixa_msg
+        if relatorio.get("pedidos_total", 0) <= 0:
+            return None, None, None, [], "Nenhum pedido foi encontrado no caixa da EH."
+
+        fechamento = None
+        avisos_usuario: list[str] = []
+
+        if relatorio_nfce:
+            resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(
+                relatorio_nfce,
+                modelo_esperado="EH",
+            )
+            if not resumo_ok:
+                return None, None, None, [], resumo_msg
+            if relatorio_nfce.get("quantidade_nfce", 0) <= 0:
+                return None, None, None, [], "Nenhuma NFC-e foi encontrada no Fechamento de caixa do Zweb."
+
+            periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
+                relatorio,
+                relatorio_nfce,
+                titulo_secundario="Fechamento de caixa",
+            )
+            if not periodo_ok:
+                return None, None, None, [], periodo_msg
+
+            fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_nfce)
+            avisos_usuario = list(
+                dict.fromkeys(
+                    list(relatorio_nfce.get("avisos_usuario") or [])
+                    + list((fechamento or {}).get("avisos_usuario") or [])
+                    + list((relatorio_pix or {}).get("avisos_usuario") or [])
+                )
+            )
+        else:
+            avisos_usuario.append(
+                "O Fechamento de caixa do Zweb nao ficou disponivel; a EH sera impressa sem a aba de fechamento."
+            )
+
+        periodo_pix = (relatorio_nfce or {}).get("periodo") or relatorio.get("periodo")
+        if relatorio_pix is None and periodo_pix:
+            relatorio_pix = {
+                "arquivo": "",
+                "periodo": periodo_pix,
+                "quantidade_autorizados": 0,
+                "total_autorizado": 0.0,
+                "itens_autorizados": [],
+                "mensagem": "Nenhum pagamento digital de NFC-e foi encontrado em Financeiro > Movimentacoes para este dia.",
+            }
+        elif relatorio_pix is None:
+            relatorio_pix = {
+                "arquivo": "",
+                "periodo": None,
+                "quantidade_autorizados": 0,
+                "total_autorizado": 0.0,
+                "itens_autorizados": [],
+                "mensagem": "O periodo do caixa nao foi identificado; nao foi possivel consultar os pagamentos digitais do Zweb.",
+            }
+
+        return relatorio, fechamento, relatorio_pix, avisos_usuario, None
+
+    def _collect_automation_print_jobs(
+        self,
+        origem: str,
+        relatorio: dict,
+        fechamento: dict | None = None,
+        relatorio_pix: dict | None = None,
+    ) -> list[tuple[str, str]]:
+        dialog = CaixaReportDialog(self, relatorio, fechamento, relatorio_pix)
+        try:
+            return [
+                (f"{origem}: {titulo}", html)
+                for titulo, html in dialog.build_automation_bundle_jobs()
+            ]
+        finally:
+            dialog.deleteLater()
+
+    def _print_automation_jobs(
+        self,
+        jobs: list[tuple[str, str]],
+    ) -> list[str]:
+        printed_titles: list[str] = []
+        font_family = self.font().family() or "Lexend"
+        for title, html in jobs:
+            _render_html_document_to_printer(
+                html,
+                _resolve_default_printer(),
+                font_family,
+            )
+            printed_titles.append(title)
+        return printed_titles
+
+    def _run_scheduled_automation(self, trigger_label: str, notify_user: bool) -> None:
+        if self._automation_running:
+            return
+
+        self._automation_running = True
+        self.btn_automation_power.setEnabled(False)
+        self.btn_automation_test.setEnabled(False)
+        data_br = self._automation_target_date_br()
+        self._automation_last_status = (
+            f"Automacao iniciada via {trigger_label} para o dia {data_br}."
+        )
+        self._refresh_automation_controls_ui()
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 100)
+
+        printed_titles: list[str] = []
+        print_jobs: list[tuple[str, str]] = []
+        warnings: list[str] = []
+        errors: list[str] = []
+
+        try:
+            relatorio_mva, fechamento_mva, mva_error = self._generate_mva_reports_for_automation()
+            if mva_error:
+                errors.append(f"MVA: {mva_error}")
+            else:
+                print_jobs.extend(
+                    self._collect_automation_print_jobs("MVA", relatorio_mva, fechamento_mva)
+                )
+
+            relatorio_eh, fechamento_eh, relatorio_pix_eh, eh_warnings, eh_error = self._generate_eh_reports_for_automation(data_br)
+            if eh_error:
+                errors.append(f"EH: {eh_error}")
+            else:
+                print_jobs.extend(
+                    self._collect_automation_print_jobs(
+                        "EH",
+                        relatorio_eh,
+                        fechamento_eh,
+                        relatorio_pix_eh,
+                    )
+                )
+                warnings.extend([f"EH: {aviso}" for aviso in eh_warnings if aviso])
+
+            if print_jobs:
+                printed_titles.extend(self._print_automation_jobs(print_jobs))
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            self._automation_running = False
+            self.btn_automation_power.setEnabled(True)
+            self.btn_automation_test.setEnabled(True)
+
+        resumo_partes: list[str] = []
+        if printed_titles:
+            resumo_partes.append(
+                f"Impressos enviados: {len(printed_titles)} ({'; '.join(printed_titles)})."
+            )
+        if warnings:
+            resumo_partes.append("Avisos: " + " | ".join(warnings))
+        if errors:
+            resumo_partes.append("Falhas: " + " | ".join(errors))
+        if not resumo_partes:
+            resumo_partes.append("Nenhum relatorio foi processado.")
+
+        self._automation_last_status = " ".join(resumo_partes)
+        self._refresh_automation_controls_ui()
+
+        if notify_user:
+            title = "Teste da automacao"
+            message = f"Data alvo: {data_br}\n\n{self._automation_last_status}"
+            if errors:
+                messagebox.showwarning(title, message)
+            else:
+                messagebox.showinfo(title, message)
 
     def _handle_caixa_report(self) -> None:
         cnpj = CaixaCnpjDialog(self).choice()
@@ -2572,6 +3335,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     messagebox.showwarning("Período inválido", periodo_msg)
                     return
                 fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_cupons)
+
+            avisos_usuario = list(
+                dict.fromkeys(list((relatorio_cupons or {}).get("avisos_usuario") or []))
+            )
+            if avisos_usuario:
+                messagebox.showwarning("Aviso", "\n\n".join(avisos_usuario))
 
             CaixaReportDialog(self, relatorio, fechamento).exec()
             return
@@ -3132,6 +3901,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def run_app() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.aboutToQuit.connect(cleanup_generated_auto_reports)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

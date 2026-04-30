@@ -240,8 +240,16 @@ def _analisar_pdf_caixa_mva(caminho_pdf: str) -> dict:
                 match = padrao_linha.match(linha)
                 if match:
                     data = match.group("data")
+                    hora = match.group("hora") or ""
+                    data_venda = ""
+                    ordem = ""
                     if data:
                         datas_encontradas.append(datetime.strptime(data, "%d/%m/%Y"))
+                        if hora:
+                            data_venda = f"{data} {hora}"
+                            ordem = datetime.strptime(f"{data} {hora}", "%d/%m/%Y %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            data_venda = data
                     status = match.group("status").strip()
                     fallback_descricao = _normalize_mva_description(match.group("resto"))
                     row_words = linhas_palavras[data_row_idx] if data_row_idx < len(linhas_palavras) else []
@@ -255,6 +263,8 @@ def _analisar_pdf_caixa_mva(caminho_pdf: str) -> dict:
                             "valor": round(parse_number(match.group("valor")), 2),
                             "documento": status,
                             "origem_mva": _mva_report_label(arquivo_tipo),
+                            "data_venda": data_venda,
+                            "ordem": ordem,
                         }
                     )
                     continue
@@ -280,6 +290,9 @@ def _analisar_pdf_caixa_mva(caminho_pdf: str) -> dict:
             "cliente": registro["cliente"],
             "documento": registro["status"],
             "valor": registro["valor"],
+            "data_venda": registro.get("data_venda", ""),
+            "ordem": registro.get("ordem", ""),
+            "origem_mva": registro.get("origem_mva", ""),
         }
         if registro["status"] == "Finalizado":
             total_caixa_bruto += registro["valor"]
@@ -319,11 +332,11 @@ def _analisar_pdf_caixa_mva(caminho_pdf: str) -> dict:
         "total_caixa": total_caixa,
         "itens_caixa": sorted(
             itens_caixa,
-            key=lambda item: item["pedido"],
+            key=lambda item: (str(item.get("ordem") or ""), item["pedido"]),
         ),
         "itens_excluidos": sorted(
             itens_excluidos,
-            key=lambda item: (item["documento"], item["pedido"]),
+            key=lambda item: (str(item.get("ordem") or ""), item["documento"], item["pedido"]),
         ),
     }
 

@@ -53,15 +53,31 @@ Desktop application for reconciling sales reports from two business flows:
   - The app now also recognizes broader authenticated Azulzinha pages and menu/navigation signals as valid portal progress during login and after token confirmation, before the sales tabs appear.
   - When token validation lands on the authenticated dashboard, the flow now opens `Relatorio de vendas` from the live Azulzinha menu instead of relying only on a direct sales URL.
   - If Azulzinha shows the red portal popup such as `Ops, um erro aconteceu, tente novamente mais tarde` while confirming the token, the automation now treats it as a real portal error and restarts authentication instead of hanging on the token screen.
-  - EH bank reconciliation now excludes Azulzinha/Caixa payments that are matched to filtered NF-e entries, so the `Pagamentos` column reflects only the NFC-e universe.
+- EH bank reconciliation now excludes Azulzinha/Caixa payments that are matched to filtered NF-e entries, so the `Pagamentos` column reflects only the NFC-e universe.
+- EH cancelled coupons now count toward `Pendências`, `Total Pendências`, and `Faltante` status even when they stay without a dedicated visible evidence row.
 - Auto-generated EH reports such as downloaded Caixa/Azulzinha files and saved Zweb HTML exports are now deleted automatically when the app closes, so the workspace does not accumulate `_auto` files between sessions.
 - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.
-- The main window now includes a daily automation controller beside `Cancel`; it starts at `08:00` by default, lets the user pick a new schedule time when re-enabled, always runs the EH and MVA cashier flows for the previous day while the app is open, and sends only the resulting `Fechamento de Caixa` reports straight to the Windows default printer.
+- The main window now includes a cashier automation controller beside `Cancel`; while enabled, it runs the same-day morning flow at `13:30` and the same-day afternoon flow at `18:10`, and it still sends only the resulting `Fechamento de Caixa` reports straight to the Windows default printer.
 - The same automation can now be triggered from the UI with a 5-second test countdown, using the same direct-print flow as the scheduled run without an intermediate preview.
+- If the default printer is unavailable during an automatic cashier print, the app now keeps the ready HTML print job as pending, exposes per-company pending-print buttons in the UI, and retries again at `08:00` on the next day while automation remains enabled.
+- Automatic cashier printing now reuses the stable A4 `QTextDocument.print_` path, preserving the expected page size instead of shrinking the report during silent printing.
+- If MVA source files are still missing at one of those slots, the app now leaves a dedicated pending morning/afternoon button in the UI and still prefetches the MVA Caixa/Azulzinha payment files in advance.
+- When a pending MVA morning/afternoon run is resumed from the UI, it now reuses matching local `..._mva_auto` payment files first and only goes back to Azulzinha/Caixa if the current-date payment files are still missing.
+- Both the manual `Caixa` flow and the scheduled/test automation now reuse matching local `..._eh_auto` / `..._mva_auto` payment files first, so they do not attempt a fresh Azulzinha/Caixa login when both payment files for that date are already present.
+- MVA reconciliation now also consults `Minhas Notas` model `65` to detect canceled coupons and bring them into the pending totals/report when they are absent from the local closing report.
+- EH and MVA bank reconciliation now expose canceled coupons in a dedicated `Cupons Cancelados` section instead of mixing them into `CF sem Transação Bancária`.
+- Canceled coupons now leave the EH/MVA payment-matching pool before value-only bank reconciliation, so same-value active coupons keep priority and the canceled CF goes to `Cupons Cancelados`.
+- EH partial/daily closing generation no longer crashes when a canceled coupon is promoted into the dedicated `Cupons Cancelados` section during bank reconciliation.
 - Runs `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
 - MVA closing screens now mirror the EH sectioned `Fechamento de Caixa` structure in the app and in A4 printing, including the same reconciliation sections and observations block.
 - When MVA uses the newer Clipp closing file, the app now also attempts to auto-download missing Caixa/Azulzinha PIX and card reports with the local MVA credentials before reconciling payments.
 - If the MVA `Fechamento de Caixa` PDF is actually a Clipp `Relatório de Vendas` or another unsupported layout, the app now warns that the file will be treated only as a local report and will not trigger automatic Azulzinha/Caixa payment downloads.
+- Manual `Caixa` flows now auto-detect the available closing scope: a single morning closing is generated directly, and when a full-day closing is detected the app lets the user choose between the daily report and an afternoon-only report.
+- Afternoon-only EH/MVA reports now reuse the same closing-window logic as the morning flow, filtering Caixa/Azulzinha payments and the supported cashier data down to the afternoon window instead of keeping the whole day.
+- Closing-report titles now append `(M)` or `(T)` after `MVA` / `Eletrônica Horizonte` whenever the generated scope is morning or afternoon, while daily reports keep the base title.
+- Same-day Caixa/Azulzinha card downloads now switch to the `Hoje` tab instead of `Histórico de vendas`, because the historical calendar only releases dates up to the previous day.
+- The Caixa/Azulzinha PIX export flow now confirms the real `Gerar arquivo` step and keeps monitoring the export until the report is actually captured, instead of bailing out on a short quiet window.
+- Bank reconciliation reports keep only the visible PIX/card sections, and the `Pendências` counter is recalculated from those displayed rows so the summary matches the visible evidence.
 - Shows the EH `Fechamento de Caixa` with total-sales/pending text plus organized tables for PIX/card missing bank transactions and bank-only transactions without CF/NF.
 - Prints sectioned cashier reports through a printer selection dialog.
 - Keeps printed A4 cashier tables on a shared full-width layout so sections stay visually consistent.
@@ -124,6 +140,12 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - O fechamento da MVA agora espelha a estrutura seccionada do `Fechamento de Caixa` da EH no aplicativo e na impressão A4, incluindo as mesmas seções de conciliação e observações.
 - Quando a MVA usa o fechamento novo do Clipp, o app agora também tenta baixar automaticamente os relatórios PIX e cartões da Caixa/Azulzinha com as credenciais locais da MVA antes de conciliar os pagamentos.
 - Se o PDF informado como `Fechamento de Caixa` da MVA for na verdade um `Relatório de Vendas` do Clipp ou outro layout não suportado, o app agora avisa que esse arquivo será tratado apenas como relatório local e não acionará o download automático dos pagamentos da Azulzinha/Caixa.
+- Os fluxos manuais de `Caixa` agora detectam automaticamente o escopo disponível: se existir só o fechamento da manhã, ele gera a manhã direto; se o fechamento do dia inteiro estiver disponível, o app deixa o usuário escolher entre o relatório diário e o relatório só da tarde.
+- Os relatórios só da tarde da EH/MVA agora reutilizam a mesma lógica de janela horária do fechamento da manhã, filtrando os pagamentos da Caixa/Azulzinha e os dados de caixa suportados para a segunda janela do dia, em vez de manter o dia inteiro.
+- Os títulos do `Fechamento de Caixa` agora recebem `(M)` ou `(T)` depois de `MVA` / `Eletrônica Horizonte` quando o relatório gerado for de manhã ou de tarde; no diário o título base permanece igual.
+- No dia corrente, o download de cartões da Caixa/Azulzinha agora troca automaticamente para a aba `Hoje`, porque o calendário de `Histórico de vendas` só libera datas até ontem.
+- O fluxo de exportação PIX da Caixa/Azulzinha agora confirma o passo real de `Gerar arquivo` e continua monitorando a exportação até capturar o relatório de fato, em vez de encerrar por uma janela curta sem eventos.
+- Os relatórios de conciliação bancária agora mantêm apenas as seções visíveis de PIX/cartão, e o contador de `Pendências` passa a ser recalculado por essas linhas exibidas para bater com a evidência visível.
 - Exibe o `Fechamento de Caixa` da EH com texto de total de vendas/pendências e tabelas organizadas para divergências de PIX e cartão.
 - Imprime relatórios seccionados de caixa pela tela de seleção de impressora.
 - Normaliza mojibake e acentuação quebrada em diálogos, relatórios e impressão com `ftfy` e fallback interno.
@@ -144,7 +166,11 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
   - O app agora tambem reconhece telas internas autenticadas mais amplas da Azulzinha e sinais de menu/navegacao como progresso valido do portal durante o login e depois da confirmacao do token, antes mesmo de as abas de vendas aparecerem.
   - Quando a validacao do token cai no dashboard autenticado, o fluxo agora abre `Relatorio de vendas` pelo menu real da Azulzinha em vez de depender apenas da URL direta da area de vendas.
   - Se a Azulzinha exibir o popup vermelho do portal, como `Ops, um erro aconteceu, tente novamente mais tarde`, ao confirmar o token, a automacao agora trata isso como erro real do portal e reinicia a autenticacao em vez de ficar travada na tela do token.
-  - A conciliacao bancaria da EH agora exclui da coluna `Pagamentos` os valores da Azulzinha/Caixa que forem identificados como pertencentes a NF-e filtrada, para refletir apenas o universo de NFC-e.
+- A conciliacao bancaria da EH agora exclui da coluna `Pagamentos` os valores da Azulzinha/Caixa que forem identificados como pertencentes a NF-e filtrada, para refletir apenas o universo de NFC-e.
+- A conciliacao bancaria da EH e da MVA agora tambem separa cupons cancelados em uma secao dedicada `Cupons Cancelados`, em vez de misturar esses CFs em `CF sem Transacao Bancaria`.
+- Os cupons cancelados da EH continuam contando em `Pendências`, `Total Pendências` e no status `Faltante`, agora com exibição dedicada na seção `Cupons Cancelados`.
+- A geracao do fechamento parcial/diario da EH nao quebra mais quando um cupom cancelado e promovido para a secao dedicada `Cupons Cancelados` durante a conciliacao bancaria.
+- A impressao automatica do caixa agora volta a sair em pagina A4 pelo mesmo caminho estavel do `QTextDocument.print_`, evitando o relatorio minusculo na impressao silenciosa.
   - Relatorios automaticos da EH, como downloads da Caixa/Azulzinha e HTMLs exportados do Zweb, agora sao excluidos automaticamente ao fechar o app, para que o workspace nao acumule arquivos `_auto` entre sessoes.
   - Os arquivos temporarios de debug da exportacao da Azulzinha sao limpos automaticamente ao final do fluxo.
   - Relatorios automaticos da EH com nome `_auto` agora ficam disponiveis depois do parse para o usuario abrir, e apenas sobras parciais como `.crdownload` sao limpas.
@@ -152,8 +178,16 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
   - Os relatorios automaticos locais da Caixa/Azulzinha agora ficam presos a sua propria empresa no reaproveitamento, entao a EH nunca reutiliza arquivos `_mva_auto` e a MVA nunca reutiliza arquivos `_eh_auto` de uma execucao anterior.
   - O navegador da Caixa/Azulzinha agora abre em janela visivel durante a automacao, para que o usuario possa inspecionar o fluxo do portal quando precisar.
   - O fluxo agora so entra na etapa de token quando a interface real de token ou de entrega estiver visivel, evitando saltos falsos para fora da tela de login.
-  - A janela principal agora tem um controlador de automacao diaria ao lado de `Cancelar`; ele inicia em `08:00` por padrao, permite escolher um novo horario quando for religado, sempre roda os caixas da EH e da MVA para o dia anterior com o app aberto e envia apenas os relatorios de `Fechamento de Caixa` direto para a impressora padrao do Windows.
-  - O mesmo fluxo de automacao agora pode ser disparado pela interface com um teste de 5 segundos, usando a mesma impressao direta da agenda e sem preview intermediario.
+- A janela principal agora tem um controlador de automacao do caixa ao lado de `Cancelar`; quando ligado, ele roda o fechamento da manha no mesmo dia as `13:30` e o da tarde no mesmo dia as `18:10`, e continua enviando apenas os relatorios de `Fechamento de Caixa` direto para a impressora padrao do Windows.
+- O mesmo fluxo de automacao agora pode ser disparado pela interface com um teste de 5 segundos, usando a mesma impressao direta da agenda e sem preview intermediario.
+- Se a impressora padrao nao estiver disponivel durante a impressao automatica do caixa, o app agora guarda o HTML pronto como impressao pendente, mostra botoes pendentes por empresa na interface e tenta novamente no dia seguinte as `08:00` enquanto a automacao estiver ligada.
+- Se os arquivos-base da MVA ainda estiverem faltando em um desses horarios, o app agora deixa um botao pendente especifico de manha/tarde na interface e mesmo assim adianta o download dos pagamentos da Caixa/Azulzinha da MVA.
+- Quando uma pendencia de manha/tarde da MVA e retomada pelo botao da interface, o app agora reaproveita primeiro os pagamentos locais `..._mva_auto` da mesma data e so volta para a Azulzinha/Caixa se esses arquivos ainda estiverem faltando.
+- Tanto o fluxo manual de `Caixa` quanto a automacao agendada/de teste agora reaproveitam primeiro os pagamentos locais `..._eh_auto` / `..._mva_auto` da data correspondente, sem tentar novo login na Azulzinha/Caixa quando os dois arquivos de pagamento daquele dia ja estiverem presentes.
+- Ao fechar o aplicativo, quando houver relatorios automaticos `_auto` da Azulzinha/Zweb no workspace, o app agora pergunta se o usuario quer manter esses arquivos ou exclui-los antes de encerrar.
+- A conciliacao da MVA agora tambem consulta o `Minhas Notas` no modelo `65` para detectar cupons cancelados e traz-los para as pendencias/totais do relatorio quando eles estiverem ausentes do fechamento local.
+- Quando um CF cancelado da MVA seria tratado como sobra de pagamento, ele agora vai para a secao `Cupons Cancelados` em vez de aparecer em `CF sem Transacao Bancaria`.
+- Cupons cancelados agora saem do pool de conciliacao bancaria da EH/MVA antes do cruzamento por valor, para que um CF ativo de mesmo valor tenha prioridade e o cancelado va para `Cupons Cancelados`.
 ### EH Debug
 
 - EH loading now includes a concise real-time debug panel for Gmail token lookup and portal automation steps, including the code selected for validation.

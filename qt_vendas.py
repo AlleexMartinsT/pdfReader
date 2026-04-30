@@ -4,6 +4,7 @@ import sys
 import os
 import re
 import time
+import json
 import datetime as dt
 import tempfile
 import queue
@@ -22,7 +23,10 @@ from utils import (
     analisar_pdf_fechamento_caixa_mva_clipp,
     combinar_relatorios_caixa_mva,
     comparar_caixa_resumo_nfce,
+    aplicar_escopo_relatorio_caixa,
+    describe_closing_scope,
     gerar_relatorios_caixa_eh_zweb,
+    baixar_relatorios_caixa_eh_azulzinha,
     validar_periodo_relatorios_caixa,
     validar_arquivo_caixa_mva,
     validar_relatorio_pedidos_importados,
@@ -49,6 +53,7 @@ from utils import (
     set_ui_refs,
     _active_report_dir,
     cleanup_generated_auto_reports,
+    list_generated_auto_reports,
 )
 from ui_dialogs import messagebox, filedialog, set_parent
 from qt_adapters import (
@@ -89,8 +94,18 @@ def _get_reportlab_font_names() -> tuple[str, str]:
 
 def _create_a4_printer() -> QtPrintSupport.QPrinter:
     printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.HighResolution)
+    printer.setPageOrientation(QtGui.QPageLayout.Portrait)
     printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.A4))
     printer.setPageMargins(QtCore.QMarginsF(6, 6, 6, 6), QtGui.QPageLayout.Millimeter)
+    printer.setFullPage(False)
+    return printer
+
+
+def _configure_printer_for_a4(printer: QtPrintSupport.QPrinter) -> QtPrintSupport.QPrinter:
+    printer.setPageOrientation(QtGui.QPageLayout.Portrait)
+    printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.A4))
+    printer.setPageMargins(QtCore.QMarginsF(6, 6, 6, 6), QtGui.QPageLayout.Millimeter)
+    printer.setFullPage(False)
     return printer
 
 
@@ -102,6 +117,7 @@ def _resolve_default_printer() -> QtPrintSupport.QPrinter:
 
     printer = _create_a4_printer()
     printer.setPrinterName(printer_name)
+    _configure_printer_for_a4(printer)
     if not printer.isValid():
         raise RuntimeError(
             f"A impressora padrao '{printer_name}' nao esta disponivel para impressao."
@@ -109,16 +125,39 @@ def _resolve_default_printer() -> QtPrintSupport.QPrinter:
     return printer
 
 
+def _pending_print_jobs_path() -> Path:
+    return Path(_active_report_dir()) / "pending_print_jobs.json"
+
+
+def _next_pending_print_retry_dt(now: dt.datetime | None = None) -> dt.datetime:
+    now = now or dt.datetime.now()
+    target = now.replace(hour=8, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)
+    return target
+
+
+def _parse_pending_print_datetime(value: object) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _render_html_document_to_printer(
     html: str,
     printer: QtPrintSupport.QPrinter,
     font_family: str | None = None,
 ) -> None:
+    _configure_printer_for_a4(printer)
     document = QtGui.QTextDocument()
     document.setDefaultFont(
         QtGui.QFont(font_family or QtWidgets.QApplication.font().family() or "Lexend", 8)
     )
     page_rect = printer.pageRect(QtPrintSupport.QPrinter.Point)
+    if page_rect.width() <= 0 or page_rect.height() <= 0:
+        raise RuntimeError("A impressora selecionada nao retornou uma area de pagina valida.")
     document.setPageSize(page_rect.size())
     document.setHtml(html)
     document.print_(printer)
@@ -604,14 +643,17 @@ class CaixaReportDialog(QtWidgets.QDialog):
             for key, report in (fechamento.get("relatorios_pagamento") or {}).items():
                 if report:
                     self._payment_reports[str(key)] = report
-        self.setWindowTitle("Relatório de Caixa")
+        caixa_title = "Relatório de Caixa"
+        if fechamento:
+            caixa_title = self._build_caixa_dialog_title(fechamento)
+        self.setWindowTitle(caixa_title)
         self.resize(840, 640)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
-        title = QtWidgets.QLabel("Relatório de Caixa")
+        title = QtWidgets.QLabel(caixa_title)
         title_font = title.font()
         title_font.setBold(True)
         title_font.setPointSize(15)
@@ -639,10 +681,19 @@ class CaixaReportDialog(QtWidgets.QDialog):
             return "Pedidos Caixa"
         return "DAVs Importados"
 
+    def _build_fechamento_scope_suffix(self, report: dict | None) -> str:
+        escopo_texto = corrigir_texto(str((report or {}).get("escopo_relatorio") or "")).strip().casefold()
+        if escopo_texto.startswith("manh") or escopo_texto == "morning":
+            return " (M)"
+        if escopo_texto.startswith("tard") or escopo_texto == "afternoon":
+            return " (T)"
+        return ""
+
     def _build_caixa_dialog_title(self, relatorio: dict) -> str:
+        suffix = self._build_fechamento_scope_suffix(relatorio)
         if relatorio.get("caixa_modelo") == "EH":
-            return "Fechamento de Caixa - Eletrônica Horizonte"
-        return "Fechamento de Caixa - MVA"
+            return f"Fechamento de Caixa - Eletrônica Horizonte{suffix}"
+        return f"Fechamento de Caixa - MVA{suffix}"
 
 
     def _display_periodo(self, periodo: str | None) -> str:
@@ -793,18 +844,18 @@ class CaixaReportDialog(QtWidgets.QDialog):
         report["status"] = status
         report["caixa_modelo"] = fechamento.get("caixa_modelo") or report.get("caixa_modelo") or "EH"
         report["texto_informativo"] = ""
-        pendencias_count = int(report.get("alertas_count", 0) or 0)
-        if pendencias_count <= 0:
-            pendencias_count = sum(
-                len(report.get(key) or [])
-                for key in (
-                    "pix_fechamento_rows",
-                    "cartao_fechamento_rows",
-                    "pix_maquina_rows",
-                    "cartao_maquina_rows",
-                    "observacao_rows",
-                )
+        hidden_pending_count = int(report.get("hidden_pending_count", 0) or 0)
+        pendencias_count = sum(
+            len(report.get(key) or [])
+            for key in (
+                "cancelados_rows",
+                "pix_fechamento_rows",
+                "cartao_fechamento_rows",
+                "pix_maquina_rows",
+                "cartao_maquina_rows",
             )
+        )
+        pendencias_count += hidden_pending_count
         report["pendencias_count"] = pendencias_count
         report["summary_items"] = (
             ("Período", self._display_periodo(periodo)),
@@ -831,6 +882,11 @@ class CaixaReportDialog(QtWidgets.QDialog):
         cartao_rows = [
             tuple(corrigir_texto(str(value)) for value in row)
             for row in (relatorio_pagamento.get("cartao_fechamento_rows") or [])
+            if row
+        ]
+        cancelados_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("cancelados_rows") or [])
             if row
         ]
 
@@ -882,6 +938,16 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Nenhuma transação bancária sem CF/NF encontrada.",
             ),
         ]
+        sections.insert(
+            3,
+            (
+                "Cupons Cancelados",
+                ("CF", "Valor"),
+                cancelados_rows,
+                [340, 140],
+                "Nenhum cupom cancelado pendente encontrado.",
+            ),
+        )
         return sections
 
     def _build_bank_sections(
@@ -907,6 +973,11 @@ class CaixaReportDialog(QtWidgets.QDialog):
             for row in (relatorio_pagamento.get("cartao_fechamento_rows") or [])
             if row
         ]
+        cancelados_rows = [
+            tuple(corrigir_texto(str(value)) for value in row)
+            for row in (relatorio_pagamento.get("cancelados_rows") or [])
+            if row
+        ]
 
         bank_rows: list[tuple[str, str, str]] = []
         for row in (relatorio_pagamento.get("pix_maquina_rows") or []):
@@ -926,7 +997,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             elif len(row) >= 2:
                 bank_rows.append(("Cartão", corrigir_texto(str(row[0])), corrigir_texto(str(row[1]))))
 
-        return [
+        sections = [
             (
                 "Correlação de Valores",
                 ("Pagamento", "Caixa", "Pagamentos", "Status"),
@@ -956,6 +1027,17 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Nenhuma transação bancária sem CF/NF encontrada.",
             ),
         ]
+        sections.insert(
+            3,
+            (
+                "Cupons Cancelados",
+                (fechamento_label, "Valor"),
+                cancelados_rows,
+                [340, 140],
+                "Nenhum cupom cancelado pendente encontrado.",
+            ),
+        )
+        return sections
 
     def _build_pix_summary_items(self, relatorio_pix: dict):
         summary_label = relatorio_pix.get("summary_label") or "Pagamentos digitais"
@@ -1735,11 +1817,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             return jobs
 
         fechamento = self._fechamento
-        fechamento_title = (
-            "Fechamento de Caixa - Eletronica Horizonte"
-            if str(fechamento.get("caixa_modelo") or "").upper() == "EH"
-            else "Fechamento de Caixa - MVA"
-        )
+        fechamento_title = self._build_caixa_dialog_title(fechamento)
         bank_report = self._get_fechamento_bank_report(fechamento)
         if bank_report:
             report = self._enrich_eh_bank_report(fechamento, bank_report)
@@ -1819,7 +1897,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         if bank_report:
             report = self._enrich_eh_bank_report(fechamento, bank_report)
             self._export_sectioned_report_pdf(
-                title="Fechamento de Caixa - Eletrônica Horizonte" if str(fechamento.get("caixa_modelo") or "").upper() == "EH" else "Fechamento de Caixa - MVA",
+                title=self._build_caixa_dialog_title(fechamento),
                 default_name="relatorio_caixa_fechamento_eh.pdf" if str(fechamento.get("caixa_modelo") or "").upper() == "EH" else "relatorio_caixa_fechamento_mva.pdf",
                 summary_items=report.get("summary_items") or (),
                 sections=self._build_bank_sections(report),
@@ -1842,7 +1920,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 )
             )
         self._export_report_pdf(
-            title=f"Fechamento de Caixa - {'MVA' if fechamento.get('caixa_modelo') == 'MVA' else 'Eletrônica Horizonte'}",
+            title=self._build_caixa_dialog_title(fechamento),
             default_name="relatorio_caixa_fechamento.pdf",
             summary_items=summary_items,
             headers=("Número", "Valor"),
@@ -1853,7 +1931,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
     def _export_pix_pdf(self, relatorio_pix: dict) -> None:
         if relatorio_pix.get("categoria") == "alertas_eh":
             self._export_sectioned_report_pdf(
-                title="Fechamento de Caixa - Eletrônica Horizonte" if str(relatorio_pix.get("caixa_modelo") or "EH").upper() == "EH" else "Fechamento de Caixa - MVA",
+                title=self._build_caixa_dialog_title(relatorio_pix),
                 default_name="relatorio_caixa_fechamento_eh.pdf" if str(relatorio_pix.get("caixa_modelo") or "EH").upper() == "EH" else "relatorio_caixa_fechamento_mva.pdf",
                 summary_items=relatorio_pix.get("summary_items") or (),
                 sections=self._build_bank_sections(relatorio_pix),
@@ -2360,11 +2438,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._neon_hue = 0
         self._showing_graphs = False
         self._automation_enabled = True
-        self._automation_time = QtCore.QTime(8, 0)
+        self._automation_schedule = {
+            "morning": QtCore.QTime(13, 30),
+            "afternoon": QtCore.QTime(18, 10),
+        }
         self._automation_running = False
         self._automation_next_run: dt.datetime | None = None
+        self._automation_next_scope: str | None = None
         self._automation_test_run_at: dt.datetime | None = None
-        self._automation_last_status = "Automacao diaria pronta. Sempre usa o dia anterior."
+        self._automation_test_scope = "morning"
+        self._automation_last_status = "Automacao por turno pronta. Usa o dia atual às 13:30 e 18:10."
+        self._mva_pending_runs: dict[str, dict] = {"morning": {}, "afternoon": {}}
+        self._pending_print_jobs: dict[str, list[dict[str, str]]] = {"EH": [], "MVA": []}
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2391,6 +2476,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_tag = QtWidgets.QPushButton("Criar Etiquetas")
         self.btn_feedback = QtWidgets.QPushButton("Feedback")
         self.btn_automation_test = QtWidgets.QPushButton("Teste automacao (5s)")
+        self.btn_eh_pending_print = QtWidgets.QPushButton("EH impressao pendente")
+        self.btn_mva_pending_print = QtWidgets.QPushButton("MVA impressao pendente")
+        self.btn_mva_pending_morning = QtWidgets.QPushButton("MVA manhã pendente")
+        self.btn_mva_pending_afternoon = QtWidgets.QPushButton("MVA tarde pendente")
         for btn in (
             self.btn_select_pdf,
             self.btn_caixa,
@@ -2403,6 +2492,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_tag,
             self.btn_feedback,
             self.btn_automation_test,
+            self.btn_eh_pending_print,
+            self.btn_mva_pending_print,
+            self.btn_mva_pending_morning,
+            self.btn_mva_pending_afternoon,
         ):
             btn.setSizePolicy(btn_policy)
             btn.setMinimumHeight(36)
@@ -2415,6 +2508,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_select_pdf,
             self.btn_caixa,
             self.btn_automation_test,
+            self.btn_eh_pending_print,
+            self.btn_mva_pending_print,
+            self.btn_mva_pending_morning,
+            self.btn_mva_pending_afternoon,
             self.btn_clear,
             self.btn_merge,
             self.btn_spreadsheet,
@@ -2422,6 +2519,14 @@ class MainWindow(QtWidgets.QMainWindow):
             left_panel.addWidget(btn)
         left_panel.addStretch(3)
         left_panel.addWidget(self.btn_graphs)
+        self.btn_eh_pending_print.setVisible(False)
+        self.btn_eh_pending_print.setEnabled(False)
+        self.btn_mva_pending_print.setVisible(False)
+        self.btn_mva_pending_print.setEnabled(False)
+        self.btn_mva_pending_morning.setVisible(False)
+        self.btn_mva_pending_afternoon.setVisible(False)
+        self.btn_mva_pending_morning.setEnabled(False)
+        self.btn_mva_pending_afternoon.setEnabled(False)
 
         main_layout.addLayout(left_panel, 0)
 
@@ -2505,6 +2610,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_import_neon()
         self._setup_progress_visibility_timer()
         self._setup_graphs_refresh_timer()
+        self._load_pending_print_jobs()
         self._setup_daily_automation_timer()
 
         set_ui_refs(
@@ -2614,32 +2720,270 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_feedback.clicked.connect(self._open_feedback)
         self.btn_automation_power.clicked.connect(self._toggle_automation_power)
         self.btn_automation_test.clicked.connect(self._schedule_automation_test_run)
+        self.btn_eh_pending_print.clicked.connect(
+            lambda: self._run_pending_print_jobs_for_company("EH", notify_user=True)
+        )
+        self.btn_mva_pending_print.clicked.connect(
+            lambda: self._run_pending_print_jobs_for_company("MVA", notify_user=True)
+        )
+        self.btn_mva_pending_morning.clicked.connect(lambda: self._run_pending_mva_scope("morning"))
+        self.btn_mva_pending_afternoon.clicked.connect(lambda: self._run_pending_mva_scope("afternoon"))
 
     def _setup_daily_automation_timer(self) -> None:
-        self._automation_next_run = self._compute_next_automation_run()
+        self._automation_next_run, self._automation_next_scope = self._compute_next_automation_run()
         self._automation_timer = QtCore.QTimer(self)
         self._automation_timer.timeout.connect(self._on_automation_timer_tick)
         self._automation_timer.start(1000)
         self._refresh_automation_controls_ui()
 
-    def _compute_next_automation_run(self, now: dt.datetime | None = None) -> dt.datetime:
+    def _compute_next_automation_run(self, now: dt.datetime | None = None) -> tuple[dt.datetime | None, str | None]:
         now = now or dt.datetime.now()
-        target_time = self._automation_time if self._automation_time.isValid() else QtCore.QTime(8, 0)
-        target = now.replace(
-            hour=target_time.hour(),
-            minute=target_time.minute(),
-            second=0,
-            microsecond=0,
-        )
-        if now >= target:
-            target += dt.timedelta(days=1)
-        return target
+        candidates: list[tuple[dt.datetime, str]] = []
+        for scope_mode, target_time in self._automation_schedule.items():
+            if not target_time.isValid():
+                continue
+            target = now.replace(
+                hour=target_time.hour(),
+                minute=target_time.minute(),
+                second=0,
+                microsecond=0,
+            )
+            if now >= target:
+                target += dt.timedelta(days=1)
+            candidates.append((target, scope_mode))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0]
 
     def _automation_target_date_br(self) -> str:
-        return QtCore.QDate.currentDate().addDays(-1).toString("dd/MM/yyyy")
+        return QtCore.QDate.currentDate().toString("dd/MM/yyyy")
 
-    def _automation_time_text(self) -> str:
-        return self._automation_time.toString("HH:mm") if self._automation_time.isValid() else "08:00"
+    def _automation_time_text(self, scope_mode: str | None = None) -> str:
+        if scope_mode:
+            target_time = self._automation_schedule.get(scope_mode)
+            return target_time.toString("HH:mm") if target_time and target_time.isValid() else "--:--"
+        partes = []
+        for current_scope in ("morning", "afternoon"):
+            partes.append(f"{self._scope_label_text(current_scope)} {self._automation_time_text(current_scope)}")
+        return " / ".join(partes)
+
+    def _scope_label_text(self, scope_mode: str | None) -> str:
+        return "manhã" if str(scope_mode or "").strip() == "morning" else "tarde"
+
+    def _normalize_pending_print_company(self, company: str | None) -> str | None:
+        company_text = str(company or "").strip().upper()
+        if company_text in {"EH", "MVA"}:
+            return company_text
+        return None
+
+    def _load_pending_print_jobs(self) -> None:
+        self._pending_print_jobs = {"EH": [], "MVA": []}
+        path = _pending_print_jobs_path()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        for raw_job in list((payload or {}).get("jobs") or []):
+            if not isinstance(raw_job, dict):
+                continue
+            company = self._normalize_pending_print_company(raw_job.get("company"))
+            title = str(raw_job.get("title") or "").strip()
+            html = str(raw_job.get("html") or "")
+            if not company or not title or not html:
+                continue
+            created_at = _parse_pending_print_datetime(raw_job.get("created_at")) or dt.datetime.now()
+            retry_at = _parse_pending_print_datetime(raw_job.get("retry_at")) or _next_pending_print_retry_dt(created_at)
+            self._pending_print_jobs[company].append(
+                {
+                    "id": str(raw_job.get("id") or f"{company}-{time.time_ns()}").strip(),
+                    "company": company,
+                    "title": title,
+                    "html": html,
+                    "created_at": created_at.replace(microsecond=0).isoformat(),
+                    "retry_at": retry_at.replace(microsecond=0).isoformat(),
+                    "last_error": str(raw_job.get("last_error") or "").strip(),
+                }
+            )
+
+        for company in ("EH", "MVA"):
+            self._pending_print_jobs[company].sort(
+                key=lambda item: (
+                    str(item.get("retry_at") or ""),
+                    str(item.get("created_at") or ""),
+                    str(item.get("title") or ""),
+                )
+            )
+
+    def _save_pending_print_jobs(self) -> None:
+        path = _pending_print_jobs_path()
+        jobs_to_save: list[dict[str, str]] = []
+        for company in ("EH", "MVA"):
+            for raw_job in self._pending_print_jobs.get(company) or []:
+                title = str(raw_job.get("title") or "").strip()
+                html = str(raw_job.get("html") or "")
+                if not title or not html:
+                    continue
+                created_at = _parse_pending_print_datetime(raw_job.get("created_at")) or dt.datetime.now()
+                retry_at = _parse_pending_print_datetime(raw_job.get("retry_at")) or _next_pending_print_retry_dt(created_at)
+                jobs_to_save.append(
+                    {
+                        "id": str(raw_job.get("id") or f"{company}-{time.time_ns()}").strip(),
+                        "company": company,
+                        "title": title,
+                        "html": html,
+                        "created_at": created_at.replace(microsecond=0).isoformat(),
+                        "retry_at": retry_at.replace(microsecond=0).isoformat(),
+                        "last_error": str(raw_job.get("last_error") or "").strip(),
+                    }
+                )
+
+        if not jobs_to_save:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            return
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"jobs": jobs_to_save}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _pending_print_jobs_for_company(self, company: str | None) -> list[dict[str, str]]:
+        company_key = self._normalize_pending_print_company(company)
+        if not company_key:
+            return []
+        return [dict(job) for job in self._pending_print_jobs.get(company_key) or []]
+
+    def _format_pending_print_retry_text(self, jobs: list[dict[str, str]]) -> str:
+        retry_targets = [
+            retry_at
+            for retry_at in (
+                _parse_pending_print_datetime(job.get("retry_at"))
+                for job in jobs
+            )
+            if retry_at is not None
+        ]
+        if not retry_targets:
+            return "08:00 do dia seguinte"
+        retry_at = min(retry_targets)
+        return retry_at.strftime("%d/%m/%Y %H:%M")
+
+    def _prepare_pending_print_jobs(
+        self,
+        jobs: list[dict[str, str]],
+        *,
+        retry_at: dt.datetime,
+        error_message: str | None,
+        company_override: str | None = None,
+    ) -> list[dict[str, str]]:
+        prepared: list[dict[str, str]] = []
+        retry_at_text = retry_at.replace(microsecond=0).isoformat()
+        now_text = dt.datetime.now().replace(microsecond=0).isoformat()
+        for index, raw_job in enumerate(jobs):
+            company = company_override or self._normalize_pending_print_company(raw_job.get("company"))
+            title = str(raw_job.get("title") or "").strip()
+            html = str(raw_job.get("html") or "")
+            if not company or not title or not html:
+                continue
+            prepared.append(
+                {
+                    "id": str(raw_job.get("id") or f"{company}-{time.time_ns()}-{index}").strip(),
+                    "company": company,
+                    "title": title,
+                    "html": html,
+                    "created_at": str(raw_job.get("created_at") or now_text).strip() or now_text,
+                    "retry_at": retry_at_text,
+                    "last_error": str(error_message or raw_job.get("last_error") or "").strip(),
+                }
+            )
+        return prepared
+
+    def _replace_pending_print_jobs(
+        self,
+        company: str,
+        jobs: list[dict[str, str]],
+        *,
+        error_message: str | None = None,
+        now: dt.datetime | None = None,
+    ) -> None:
+        company_key = self._normalize_pending_print_company(company)
+        if not company_key:
+            return
+        now = now or dt.datetime.now()
+        retry_at = _next_pending_print_retry_dt(now)
+        self._pending_print_jobs[company_key] = self._prepare_pending_print_jobs(
+            jobs,
+            retry_at=retry_at,
+            error_message=error_message,
+            company_override=company_key,
+        )
+        self._save_pending_print_jobs()
+
+    def _merge_pending_print_jobs(
+        self,
+        jobs: list[dict[str, str]],
+        *,
+        error_message: str | None = None,
+        now: dt.datetime | None = None,
+    ) -> str:
+        now = now or dt.datetime.now()
+        retry_at = _next_pending_print_retry_dt(now)
+        retry_text = retry_at.strftime("%d/%m/%Y %H:%M")
+        grouped_jobs: dict[str, list[dict[str, str]]] = {"EH": [], "MVA": []}
+        for job in self._prepare_pending_print_jobs(
+            jobs,
+            retry_at=retry_at,
+            error_message=error_message,
+        ):
+            grouped_jobs[job["company"]].append(job)
+
+        merged_companies: list[str] = []
+        for company, company_jobs in grouped_jobs.items():
+            if not company_jobs:
+                continue
+            existing_by_id = {
+                str(item.get("id") or "").strip(): dict(item)
+                for item in self._pending_print_jobs.get(company) or []
+                if str(item.get("id") or "").strip()
+            }
+            for company_job in company_jobs:
+                existing_by_id[company_job["id"]] = company_job
+            merged_jobs = list(existing_by_id.values())
+            merged_jobs.sort(
+                key=lambda item: (
+                    str(item.get("retry_at") or ""),
+                    str(item.get("created_at") or ""),
+                    str(item.get("title") or ""),
+                )
+            )
+            self._pending_print_jobs[company] = merged_jobs
+            merged_companies.append(f"{company} ({len(company_jobs)})")
+
+        self._save_pending_print_jobs()
+        if not merged_companies:
+            return ""
+        return (
+            "Impressao pendente salva para "
+            + ", ".join(merged_companies)
+            + f". Nova tentativa automatica em {retry_text} se a automacao estiver ligada; "
+            + "tambem pode ser disparada pelos botoes pendentes."
+        )
+
+    def _format_pending_print_button_text(self, company: str) -> str:
+        count = len(self._pending_print_jobs_for_company(company))
+        base_label = "EH impressao pendente" if company == "EH" else "MVA impressao pendente"
+        return f"{base_label} ({count})" if count > 1 else base_label
 
     def _format_countdown(self, total_seconds: int) -> str:
         total_seconds = max(0, int(total_seconds))
@@ -2651,19 +2995,22 @@ class MainWindow(QtWidgets.QMainWindow):
         play_icon = self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
         stop_icon = self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
         if self._automation_enabled:
-            next_run = self._automation_next_run or self._compute_next_automation_run()
-            remaining = self._format_countdown(int((next_run - dt.datetime.now()).total_seconds()))
+            next_run = self._automation_next_run
+            next_scope = self._automation_next_scope or "morning"
+            if next_run is None:
+                next_run, next_scope = self._compute_next_automation_run()
+            remaining = self._format_countdown(int((next_run - dt.datetime.now()).total_seconds())) if next_run else "--:--:--"
             tooltip = (
-                f"Automacao ativa para {self._automation_time_text()}.\n"
-                f"Proxima execucao: {next_run.strftime('%d/%m/%Y %H:%M:%S')} (em {remaining}).\n"
+                f"Automacao ativa para manhã {self._automation_time_text('morning')} e tarde {self._automation_time_text('afternoon')}.\n"
+                f"Proxima execucao: {self._scope_label_text(next_scope)} em {next_run.strftime('%d/%m/%Y %H:%M:%S') if next_run else '--'} (em {remaining}).\n"
                 "Clique para pausar."
             )
             self.btn_automation_power.setIcon(stop_icon)
             self.btn_automation_power.setToolTip(corrigir_texto(tooltip))
         else:
             tooltip = (
-                f"Automacao pausada. Ultimo horario configurado: {self._automation_time_text()}.\n"
-                "Clique para escolher o horario e ligar novamente."
+                f"Automacao pausada. Horarios fixos: manhã {self._automation_time_text('morning')} e tarde {self._automation_time_text('afternoon')}.\n"
+                "Clique para ligar novamente."
             )
             self.btn_automation_power.setIcon(play_icon)
             self.btn_automation_power.setToolTip(corrigir_texto(tooltip))
@@ -2675,20 +3022,61 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.btn_automation_test.setText(f"Teste em {test_remaining}")
             self.btn_automation_test.setToolTip(
-                corrigir_texto(f"Teste manual agendado para iniciar em {test_remaining}.")
+                corrigir_texto(
+                    f"Teste manual de {self._scope_label_text(self._automation_test_scope)} agendado para iniciar em {test_remaining}."
+                )
             )
         else:
             self.btn_automation_test.setText("Teste automacao (5s)")
             self.btn_automation_test.setToolTip(
-                corrigir_texto("Dispara a automacao do dia anterior em 5 segundos.")
+                corrigir_texto("Dispara uma simulacao de manha ou tarde em 5 segundos.")
             )
 
-    def _choose_automation_time(self) -> QtCore.QTime | None:
-        dialog = AutomationTimeDialog(self, self._automation_time if self._automation_time.isValid() else QtCore.QTime(8, 0))
-        try:
-            return dialog.selected_time()
-        finally:
-            dialog.deleteLater()
+        pending_eh_print = len(self._pending_print_jobs_for_company("EH"))
+        pending_mva_print = len(self._pending_print_jobs_for_company("MVA"))
+        self.btn_eh_pending_print.setText(self._format_pending_print_button_text("EH"))
+        self.btn_eh_pending_print.setVisible(pending_eh_print > 0)
+        self.btn_eh_pending_print.setEnabled(pending_eh_print > 0 and not self._automation_running)
+        if pending_eh_print:
+            self.btn_eh_pending_print.setToolTip(
+                corrigir_texto(
+                    "Reenvia para impressao o fechamento da EH ja montado que ficou pendente."
+                )
+            )
+
+        self.btn_mva_pending_print.setText(self._format_pending_print_button_text("MVA"))
+        self.btn_mva_pending_print.setVisible(pending_mva_print > 0)
+        self.btn_mva_pending_print.setEnabled(pending_mva_print > 0 and not self._automation_running)
+        if pending_mva_print:
+            self.btn_mva_pending_print.setToolTip(
+                corrigir_texto(
+                    "Reenvia para impressao o fechamento da MVA ja montado que ficou pendente."
+                )
+            )
+
+        pending_morning = bool(self._mva_pending_runs.get("morning"))
+        pending_afternoon = bool(self._mva_pending_runs.get("afternoon"))
+        self.btn_mva_pending_morning.setVisible(pending_morning)
+        self.btn_mva_pending_morning.setEnabled(pending_morning and not self._automation_running)
+        self.btn_mva_pending_afternoon.setVisible(pending_afternoon)
+        self.btn_mva_pending_afternoon.setEnabled(pending_afternoon and not self._automation_running)
+
+    def _choose_automation_scope_for_test(self) -> str | None:
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Teste da automacao")
+        box.setText("Qual fechamento automatico deseja simular?")
+        btn_morning = box.addButton("Manhã", QtWidgets.QMessageBox.AcceptRole)
+        btn_afternoon = box.addButton("Tarde", QtWidgets.QMessageBox.ActionRole)
+        btn_cancel = box.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == btn_morning:
+            return "morning"
+        if clicked == btn_afternoon:
+            return "afternoon"
+        if clicked == btn_cancel:
+            return None
+        return None
 
     def _toggle_automation_power(self) -> None:
         if self._automation_running:
@@ -2696,28 +3084,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._automation_enabled:
             self._automation_enabled = False
             self._automation_next_run = None
+            self._automation_next_scope = None
             self._automation_last_status = "Automacao pausada pelo usuario."
             self._refresh_automation_controls_ui()
             return
 
-        selected_time = self._choose_automation_time()
-        if selected_time is None:
-            return
-
-        self._automation_time = selected_time
         self._automation_enabled = True
-        self._automation_next_run = self._compute_next_automation_run()
+        self._automation_next_run, self._automation_next_scope = self._compute_next_automation_run()
         self._automation_last_status = (
-            f"Automacao retomada para {self._automation_time_text()}. Proximo alvo: {self._automation_target_date_br()}."
+            "Automacao retomada para manhã 13:30 e tarde 18:10."
         )
         self._refresh_automation_controls_ui()
 
     def _schedule_automation_test_run(self) -> None:
         if self._automation_running:
             return
+        scope_mode = self._choose_automation_scope_for_test()
+        if not scope_mode:
+            return
+        self._automation_test_scope = scope_mode
         self._automation_test_run_at = dt.datetime.now() + dt.timedelta(seconds=5)
         self._automation_last_status = (
-            f"Teste de automacao armado para {self._automation_target_date_br()}."
+            f"Teste de automacao da {self._scope_label_text(scope_mode)} armado para {self._automation_target_date_br()}."
         )
         self._refresh_automation_controls_ui()
 
@@ -2729,7 +3117,18 @@ class MainWindow(QtWidgets.QMainWindow):
             and not self._automation_running
         ):
             self._automation_test_run_at = None
-            self._run_scheduled_automation("teste manual", notify_user=True)
+            self._run_scheduled_automation(
+                f"teste manual ({self._scope_label_text(self._automation_test_scope)})",
+                notify_user=True,
+                scope_mode=self._automation_test_scope,
+            )
+            return
+
+        if (
+            self._automation_enabled
+            and not self._automation_running
+            and self._retry_due_pending_print_jobs(now)
+        ):
             return
 
         if (
@@ -2738,8 +3137,13 @@ class MainWindow(QtWidgets.QMainWindow):
             and now >= self._automation_next_run
             and not self._automation_running
         ):
-            self._automation_next_run = self._compute_next_automation_run(now + dt.timedelta(seconds=1))
-            self._run_scheduled_automation(f"agenda {self._automation_time_text()}", notify_user=False)
+            current_scope = self._automation_next_scope or "morning"
+            self._automation_next_run, self._automation_next_scope = self._compute_next_automation_run(now + dt.timedelta(seconds=1))
+            self._run_scheduled_automation(
+                f"agenda {self._automation_time_text(current_scope)}",
+                notify_user=False,
+                scope_mode=current_scope,
+            )
             return
 
         self._refresh_automation_controls_ui()
@@ -2789,7 +3193,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.label_files_var,
         )
 
-    def _load_eh_caixa_reports_with_loading(self, data_br: str) -> tuple[dict | None, dict | None, dict | None, str | None]:
+    def _load_eh_caixa_reports_with_loading(
+        self,
+        data_br: str,
+        *,
+        force_refresh_payments: bool = False,
+    ) -> tuple[dict | None, dict | None, dict | None, str | None]:
         status_queue: queue.Queue[str] = queue.Queue()
         result: dict = {}
         cancel_loading = threading.Event()
@@ -2805,6 +3214,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     data_br,
                     on_status=push_status,
                     cancel_event=cancel_loading,
+                    force_refresh_payments=force_refresh_payments,
                 )
                 result["relatorio"] = relatorio
                 result["relatorio_fechamento"] = relatorio_fechamento
@@ -2853,6 +3263,8 @@ class MainWindow(QtWidgets.QMainWindow):
         path_davs: str,
         path_orcamentos: str,
         path_cupons: str,
+        *,
+        force_refresh_payments: bool = False,
     ) -> tuple[dict | None, dict | None, dict | None, str | None]:
         status_queue: queue.Queue[str] = queue.Queue()
         result: dict = {}
@@ -2874,6 +3286,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     relatorio_cupons = analisar_pdf_fechamento_caixa_mva_clipp(
                         path_cupons,
                         auto_download_missing=True,
+                        force_refresh_payments=force_refresh_payments,
                         on_status=push_status,
                     )
                     avisos_cupons = list(relatorio_cupons.get("avisos_usuario") or [])
@@ -2950,7 +3363,77 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
         return found
 
-    def _generate_mva_reports_for_automation(self) -> tuple[dict | None, dict | None, str | None]:
+    def _choose_daily_or_afternoon_scope(self, company_label: str) -> str | None:
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(f"Caixa {company_label}")
+        box.setText("O fechamento do dia inteiro foi detectado.")
+        box.setInformativeText("Deseja gerar o relatório diário ou só da parte da tarde?")
+        btn_daily = box.addButton("Diário", QtWidgets.QMessageBox.AcceptRole)
+        btn_afternoon = box.addButton("Só tarde", QtWidgets.QMessageBox.ActionRole)
+        box.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == btn_daily:
+            return "daily"
+        if clicked == btn_afternoon:
+            return "afternoon"
+        return None
+    def _resolve_manual_closing_scope(self, relatorio_fechamento: dict | None, company_label: str) -> str | None:
+        info = describe_closing_scope(relatorio_fechamento)
+        if info.get("has_full_day"):
+            return self._choose_daily_or_afternoon_scope(company_label)
+        if info.get("has_morning_only"):
+            return "morning"
+        return "daily"
+
+    def _apply_scope_to_reports(
+        self,
+        relatorio: dict,
+        relatorio_fechamento: dict | None,
+        relatorio_pix: dict | None = None,
+        *,
+        scope_mode: str | None,
+    ) -> tuple[dict, dict | None, dict | None]:
+        if not relatorio_fechamento or not scope_mode:
+            return relatorio, relatorio_fechamento, relatorio_pix
+        return aplicar_escopo_relatorio_caixa(
+            relatorio,
+            relatorio_fechamento,
+            relatorio_pix,
+            scope_mode=scope_mode,
+        )
+
+    def _mark_mva_pending_scope(self, scope_mode: str, data_br: str, message: str) -> None:
+        self._mva_pending_runs[scope_mode] = {
+            "data_br": data_br,
+            "message": message,
+            "scope_mode": scope_mode,
+        }
+
+    def _clear_mva_pending_scope(self, scope_mode: str) -> None:
+        self._mva_pending_runs[scope_mode] = {}
+
+    def _prefetch_mva_payments(self, data_br: str) -> list[str]:
+        avisos: list[str] = []
+        try:
+            baixados = baixar_relatorios_caixa_eh_azulzinha(
+                data_br,
+                company="MVA",
+                need_pix=True,
+                need_cartoes=True,
+            )
+            avisos.extend(list(baixados.get("avisos") or []))
+        except Exception as exc:
+            avisos.append(f"Nao foi possivel adiantar os pagamentos da Azulzinha da MVA: {exc}")
+        return avisos
+
+    def _generate_mva_reports_for_automation(
+        self,
+        data_br: str,
+        *,
+        scope_mode: str,
+        force_refresh_payments: bool = False,
+    ) -> tuple[dict | None, dict | None, list[str], str | None]:
         auto_files = self._auto_find_mva_caixa_files()
         missing: list[str] = []
         path_davs = auto_files.get("davs", "")
@@ -2964,49 +3447,61 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path_cupons:
             missing.append("Fechamento de Caixa")
         if missing:
-            return None, None, f"Arquivos da MVA nao encontrados automaticamente: {', '.join(missing)}."
+            avisos = self._prefetch_mva_payments(data_br)
+            self._mark_mva_pending_scope(
+                scope_mode,
+                data_br,
+                f"Arquivos da MVA ainda ausentes para a {self._scope_label_text(scope_mode)}: {', '.join(missing)}.",
+            )
+            return None, None, avisos, f"Arquivos da MVA nao encontrados automaticamente: {', '.join(missing)}."
 
         relatorio_davs, relatorio_orcamentos, relatorio_cupons, mva_msg = self._load_mva_reports_with_loading(
             path_davs,
             path_orcamentos,
             path_cupons,
+            force_refresh_payments=force_refresh_payments,
         )
         if mva_msg:
-            return None, None, mva_msg
+            self._mark_mva_pending_scope(scope_mode, data_br, mva_msg)
+            return None, None, [], mva_msg
 
         davs_ok, davs_msg = validar_arquivo_caixa_mva(relatorio_davs, "exportacao_dados_mva")
         if not davs_ok:
-            return None, None, davs_msg
+            return None, None, [], davs_msg
 
         orc_ok, orc_msg = validar_arquivo_caixa_mva(relatorio_orcamentos, "orcamentos_mva")
         if not orc_ok:
-            return None, None, orc_msg
+            return None, None, [], orc_msg
 
         if relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
             if relatorio_davs.get("periodo") != relatorio_orcamentos.get("periodo"):
-                return None, None, (
+                return None, None, [], (
                     "A Exportacao de dados e o relatorio de Orcamento da MVA precisam ser do mesmo periodo."
                 )
 
         relatorio = combinar_relatorios_caixa_mva([relatorio_davs, relatorio_orcamentos])
         if relatorio.get("pedidos_total", 0) <= 0:
-            return None, None, "Nenhum pedido foi encontrado nos arquivos da MVA."
+            return None, None, [], "Nenhum pedido foi encontrado nos arquivos da MVA."
 
         caixa_ok, caixa_msg = validar_relatorio_pedidos_importados(
             relatorio,
             modelo_esperado="MVA",
         )
         if not caixa_ok:
-            return None, None, caixa_msg
+            return None, None, [], caixa_msg
 
         resumo_ok, resumo_msg = validar_relatorio_resumo_nfce(
             relatorio_cupons,
             modelo_esperado="MVA",
         )
         if not resumo_ok:
-            return None, None, resumo_msg
+            return None, None, [], resumo_msg
         if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
-            return None, None, "Nenhum cupom foi encontrado no Fechamento de Caixa da MVA."
+            return None, None, [], "Nenhum cupom foi encontrado no Fechamento de Caixa da MVA."
+        if scope_mode == "afternoon" and not describe_closing_scope(relatorio_cupons).get("has_full_day"):
+            aviso = "O fechamento completo da MVA ainda nao esta disponivel para separar a tarde."
+            self._mark_mva_pending_scope(scope_mode, data_br, aviso)
+            return None, None, [], aviso
 
         periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
             relatorio,
@@ -3014,16 +3509,34 @@ class MainWindow(QtWidgets.QMainWindow):
             titulo_secundario="relatorio de Cupons",
         )
         if not periodo_ok:
-            return None, None, periodo_msg
+            return None, None, [], periodo_msg
 
+        relatorio, relatorio_cupons, _ = self._apply_scope_to_reports(
+            relatorio,
+            relatorio_cupons,
+            None,
+            scope_mode=scope_mode,
+        )
         fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_cupons)
-        return relatorio, fechamento, None
+        self._clear_mva_pending_scope(scope_mode)
+        avisos_usuario = list(
+            dict.fromkeys(
+                list((relatorio_cupons or {}).get("avisos_usuario") or [])
+                + list((fechamento or {}).get("avisos_usuario") or [])
+            )
+        )
+        return relatorio, fechamento, avisos_usuario, None
 
     def _generate_eh_reports_for_automation(
         self,
         data_br: str,
+        *,
+        scope_mode: str,
     ) -> tuple[dict | None, dict | None, dict | None, list[str], str | None]:
-        relatorio, relatorio_nfce, relatorio_pix, eh_msg = self._load_eh_caixa_reports_with_loading(data_br)
+        relatorio, relatorio_nfce, relatorio_pix, eh_msg = self._load_eh_caixa_reports_with_loading(
+            data_br,
+            force_refresh_payments=False,
+        )
         if eh_msg == "__cancelled__":
             return None, None, None, [], "A automacao da EH foi cancelada."
         if eh_msg:
@@ -3050,6 +3563,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None, None, None, [], resumo_msg
             if relatorio_nfce.get("quantidade_nfce", 0) <= 0:
                 return None, None, None, [], "Nenhuma NFC-e foi encontrada no Fechamento de caixa do Zweb."
+            if scope_mode == "afternoon" and not describe_closing_scope(relatorio_nfce).get("has_full_day"):
+                return None, None, None, [], "O fechamento completo da EH ainda nao esta disponivel para separar a tarde."
 
             periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
                 relatorio,
@@ -3059,6 +3574,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if not periodo_ok:
                 return None, None, None, [], periodo_msg
 
+            relatorio, relatorio_nfce, relatorio_pix = self._apply_scope_to_reports(
+                relatorio,
+                relatorio_nfce,
+                relatorio_pix,
+                scope_mode=scope_mode,
+            )
             fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_nfce)
             avisos_usuario = list(
                 dict.fromkeys(
@@ -3100,32 +3621,149 @@ class MainWindow(QtWidgets.QMainWindow):
         relatorio: dict,
         fechamento: dict | None = None,
         relatorio_pix: dict | None = None,
-    ) -> list[tuple[str, str]]:
+    ) -> list[dict[str, str]]:
         dialog = CaixaReportDialog(self, relatorio, fechamento, relatorio_pix)
         try:
-            return [
-                (f"{origem}: {titulo}", html)
-                for titulo, html in dialog.build_automation_bundle_jobs()
-            ]
+            company = self._normalize_pending_print_company(origem) or "EH"
+            created_at = dt.datetime.now().replace(microsecond=0).isoformat()
+            job_seed = time.time_ns()
+            jobs: list[dict[str, str]] = []
+            for index, (titulo, html) in enumerate(dialog.build_automation_bundle_jobs()):
+                jobs.append(
+                    {
+                        "id": f"{company}-{job_seed}-{index}",
+                        "company": company,
+                        "title": f"{company}: {titulo}",
+                        "html": html,
+                        "created_at": created_at,
+                        "retry_at": "",
+                        "last_error": "",
+                    }
+                )
+            return jobs
         finally:
             dialog.deleteLater()
 
     def _print_automation_jobs(
         self,
-        jobs: list[tuple[str, str]],
-    ) -> list[str]:
-        printed_titles: list[str] = []
+        jobs: list[dict[str, str]],
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
+        printed_jobs: list[dict[str, str]] = []
         font_family = self.font().family() or "Lexend"
-        for title, html in jobs:
-            _render_html_document_to_printer(
-                html,
-                _resolve_default_printer(),
-                font_family,
-            )
-            printed_titles.append(title)
-        return printed_titles
+        for index, job in enumerate(list(jobs or [])):
+            html = str(job.get("html") or "")
+            if not html:
+                return (
+                    printed_jobs,
+                    [dict(item) for item in jobs[index:]],
+                    "Um dos documentos pendentes de impressao esta vazio.",
+                )
+            try:
+                _render_html_document_to_printer(
+                    html,
+                    _resolve_default_printer(),
+                    font_family,
+                )
+            except Exception as exc:
+                return printed_jobs, [dict(item) for item in jobs[index:]], str(exc)
+            printed_jobs.append(dict(job))
+        return printed_jobs, [], None
 
-    def _run_scheduled_automation(self, trigger_label: str, notify_user: bool) -> None:
+    def _retry_due_pending_print_jobs(self, now: dt.datetime | None = None) -> bool:
+        now = now or dt.datetime.now()
+        due_companies: list[str] = []
+        for company in ("EH", "MVA"):
+            jobs = self._pending_print_jobs_for_company(company)
+            if not jobs:
+                continue
+            if any(
+                (_parse_pending_print_datetime(job.get("retry_at")) or now) <= now
+                for job in jobs
+            ):
+                due_companies.append(company)
+        if not due_companies:
+            return False
+        for company in due_companies:
+            self._run_pending_print_jobs_for_company(
+                company,
+                notify_user=False,
+                trigger_label="retry automatico das 08:00",
+            )
+        return True
+
+    def _run_pending_print_jobs_for_company(
+        self,
+        company: str,
+        *,
+        notify_user: bool,
+        trigger_label: str | None = None,
+    ) -> None:
+        company_key = self._normalize_pending_print_company(company)
+        jobs = self._pending_print_jobs_for_company(company_key)
+        if not company_key or not jobs or self._automation_running:
+            return
+
+        trigger_label = trigger_label or f"botao pendente {company_key}"
+        self._automation_running = True
+        self.btn_automation_power.setEnabled(False)
+        self.btn_automation_test.setEnabled(False)
+        self._automation_last_status = (
+            f"Reimpressao pendente da {company_key} iniciada via {trigger_label}."
+        )
+        self._refresh_automation_controls_ui()
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 100)
+
+        printed_jobs: list[dict[str, str]] = []
+        failed_jobs: list[dict[str, str]] = []
+        error_message: str | None = None
+        try:
+            printed_jobs, failed_jobs, error_message = self._print_automation_jobs(jobs)
+            if failed_jobs:
+                self._replace_pending_print_jobs(
+                    company_key,
+                    failed_jobs,
+                    error_message=error_message,
+                )
+            else:
+                self._replace_pending_print_jobs(company_key, [])
+        finally:
+            self._automation_running = False
+            self.btn_automation_power.setEnabled(True)
+            self.btn_automation_test.setEnabled(True)
+
+        printed_titles = [str(job.get("title") or "").strip() for job in printed_jobs if str(job.get("title") or "").strip()]
+        resumo_partes: list[str] = []
+        if printed_titles:
+            resumo_partes.append(
+                f"Impressos enviados: {len(printed_titles)} ({'; '.join(printed_titles)})."
+            )
+        if failed_jobs:
+            retry_text = self._format_pending_print_retry_text(
+                self._pending_print_jobs_for_company(company_key)
+            )
+            resumo_partes.append(
+                f"Falha de impressao na {company_key}. Nova tentativa prevista para {retry_text}; "
+                "o botao pendente continua disponivel."
+            )
+        elif printed_titles:
+            resumo_partes.append(f"Nenhuma impressao pendente da {company_key} restou na fila local.")
+        if error_message:
+            resumo_partes.append(f"Erro: {error_message}")
+        if not resumo_partes:
+            resumo_partes.append(f"Nenhuma impressao pendente da {company_key} foi processada.")
+
+        self._automation_last_status = " ".join(resumo_partes)
+        self._refresh_automation_controls_ui()
+
+        if notify_user:
+            title = f"{company_key} pendente"
+            message = self._automation_last_status
+            if failed_jobs:
+                messagebox.showwarning(title, message)
+            else:
+                messagebox.showinfo(title, message)
+
+    def _run_scheduled_automation(self, trigger_label: str, notify_user: bool, *, scope_mode: str) -> None:
         if self._automation_running:
             return
 
@@ -3134,26 +3772,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_automation_test.setEnabled(False)
         data_br = self._automation_target_date_br()
         self._automation_last_status = (
-            f"Automacao iniciada via {trigger_label} para o dia {data_br}."
+            f"Automacao iniciada via {trigger_label} para a {self._scope_label_text(scope_mode)} de {data_br}."
         )
         self._refresh_automation_controls_ui()
         QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 100)
 
         printed_titles: list[str] = []
-        print_jobs: list[tuple[str, str]] = []
+        print_jobs: list[dict[str, str]] = []
         warnings: list[str] = []
         errors: list[str] = []
 
         try:
-            relatorio_mva, fechamento_mva, mva_error = self._generate_mva_reports_for_automation()
+            relatorio_mva, fechamento_mva, mva_warnings, mva_error = self._generate_mva_reports_for_automation(
+                data_br,
+                scope_mode=scope_mode,
+            )
             if mva_error:
                 errors.append(f"MVA: {mva_error}")
             else:
                 print_jobs.extend(
                     self._collect_automation_print_jobs("MVA", relatorio_mva, fechamento_mva)
                 )
+            warnings.extend([f"MVA: {aviso}" for aviso in mva_warnings if aviso])
 
-            relatorio_eh, fechamento_eh, relatorio_pix_eh, eh_warnings, eh_error = self._generate_eh_reports_for_automation(data_br)
+            relatorio_eh, fechamento_eh, relatorio_pix_eh, eh_warnings, eh_error = self._generate_eh_reports_for_automation(
+                data_br,
+                scope_mode=scope_mode,
+            )
             if eh_error:
                 errors.append(f"EH: {eh_error}")
             else:
@@ -3168,7 +3813,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 warnings.extend([f"EH: {aviso}" for aviso in eh_warnings if aviso])
 
             if print_jobs:
-                printed_titles.extend(self._print_automation_jobs(print_jobs))
+                printed_jobs, failed_jobs, print_error = self._print_automation_jobs(print_jobs)
+                printed_titles.extend(
+                    [
+                        str(job.get("title") or "").strip()
+                        for job in printed_jobs
+                        if str(job.get("title") or "").strip()
+                    ]
+                )
+                if failed_jobs:
+                    queue_message = self._merge_pending_print_jobs(
+                        failed_jobs,
+                        error_message=print_error,
+                    )
+                    if queue_message:
+                        warnings.append(queue_message)
+                if print_error:
+                    errors.append(print_error)
         except Exception as exc:
             errors.append(str(exc))
         finally:
@@ -3193,11 +3854,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if notify_user:
             title = "Teste da automacao"
-            message = f"Data alvo: {data_br}\n\n{self._automation_last_status}"
+            message = f"Escopo: {self._scope_label_text(scope_mode)}\nData alvo: {data_br}\n\n{self._automation_last_status}"
             if errors:
                 messagebox.showwarning(title, message)
             else:
                 messagebox.showinfo(title, message)
+
+    def _run_pending_mva_scope(self, scope_mode: str) -> None:
+        payload = dict(self._mva_pending_runs.get(scope_mode) or {})
+        if not payload:
+            return
+        data_br = str(payload.get("data_br") or self._automation_target_date_br()).strip()
+        relatorio_mva, fechamento_mva, avisos_usuario, mva_error = self._generate_mva_reports_for_automation(
+            data_br,
+            scope_mode=scope_mode,
+            force_refresh_payments=False,
+        )
+        self._refresh_automation_controls_ui()
+        if mva_error:
+            messagebox.showwarning(
+                f"MVA {self._scope_label_text(scope_mode)}",
+                f"{payload.get('message') or mva_error}\n\n{mva_error}",
+            )
+            return
+        if avisos_usuario:
+            messagebox.showwarning("Aviso", "\n\n".join(avisos_usuario))
+        CaixaReportDialog(self, relatorio_mva, fechamento_mva).exec()
 
     def _handle_caixa_report(self) -> None:
         cnpj = CaixaCnpjDialog(self).choice()
@@ -3269,6 +3951,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 path_davs,
                 path_orcamentos,
                 path_cupons,
+                force_refresh_payments=False,
             )
             if mva_msg:
                 messagebox.showerror("Erro", f"Erro ao analisar PDF de Caixa:\n{mva_msg}")
@@ -3334,10 +4017,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not periodo_ok:
                     messagebox.showwarning("Período inválido", periodo_msg)
                     return
+                scope_mode = self._resolve_manual_closing_scope(relatorio_cupons, "MVA")
+                if scope_mode is None:
+                    return
+                relatorio, relatorio_cupons, _ = self._apply_scope_to_reports(
+                    relatorio,
+                    relatorio_cupons,
+                    None,
+                    scope_mode=scope_mode,
+                )
                 fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_cupons)
 
             avisos_usuario = list(
-                dict.fromkeys(list((relatorio_cupons or {}).get("avisos_usuario") or []))
+                dict.fromkeys(
+                    list((relatorio_cupons or {}).get("avisos_usuario") or [])
+                    + list((fechamento or {}).get("avisos_usuario") or [])
+                )
             )
             if avisos_usuario:
                 messagebox.showwarning("Aviso", "\n\n".join(avisos_usuario))
@@ -3353,7 +4048,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not data_caixa:
             return
 
-        relatorio, relatorio_nfce, relatorio_pix, eh_msg = self._load_eh_caixa_reports_with_loading(data_caixa)
+        relatorio, relatorio_nfce, relatorio_pix, eh_msg = self._load_eh_caixa_reports_with_loading(
+            data_caixa,
+            force_refresh_payments=False,
+        )
         if eh_msg == "__cancelled__":
             return
 
@@ -3397,6 +4095,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if not periodo_ok:
                 messagebox.showwarning("Período inválido", periodo_msg)
                 return
+            scope_mode = self._resolve_manual_closing_scope(relatorio_nfce, "EH")
+            if scope_mode is None:
+                return
+            relatorio, relatorio_nfce, relatorio_pix = self._apply_scope_to_reports(
+                relatorio,
+                relatorio_nfce,
+                relatorio_pix,
+                scope_mode=scope_mode,
+            )
             fechamento = comparar_caixa_resumo_nfce(relatorio, relatorio_nfce)
             avisos_usuario = list(
                 dict.fromkeys(
@@ -3858,6 +4565,38 @@ class MainWindow(QtWidgets.QMainWindow):
         return False
 
 
+    def _confirm_generated_auto_reports_cleanup(self) -> bool:
+        auto_reports = list_generated_auto_reports()
+        if not auto_reports:
+            return True
+
+        dlg = QtWidgets.QMessageBox(self)
+        dlg.setWindowTitle("Relatorios automaticos")
+        dlg.setText(
+            "Foram encontrados relatorios automaticos da Azulzinha/Zweb no workspace.\n"
+            "Deseja manter esses arquivos apos fechar o aplicativo?"
+        )
+        dlg.setInformativeText(
+            f"Arquivos encontrados: {len(auto_reports)}.\n"
+            "Escolha 'Manter' para preservar os relatorios ou 'Excluir' para limpa-los ao fechar."
+        )
+        dlg.setIcon(QtWidgets.QMessageBox.Question)
+        btn_keep = dlg.addButton("Manter", QtWidgets.QMessageBox.AcceptRole)
+        btn_delete = dlg.addButton("Excluir", QtWidgets.QMessageBox.DestructiveRole)
+        btn_cancel = dlg.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
+        dlg.setDefaultButton(btn_keep)
+        dlg.exec()
+
+        clicked = dlg.clickedButton()
+        if clicked == btn_keep:
+            return True
+        if clicked == btn_delete:
+            cleanup_generated_auto_reports()
+            return True
+        if clicked == btn_cancel:
+            return False
+        return False
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._edit_mode or self._table_dirty:
             dlg = QtWidgets.QMessageBox(self)
@@ -3879,16 +4618,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.table_main.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
                     self._set_online_tables_editable(False)
                     self.btn_edit_table.setText("Editar tabela")
+                    if not self._confirm_generated_auto_reports_cleanup():
+                        event.ignore()
+                        return
                     event.accept()
                     return
                 event.ignore()
                 return
             if clicked == btn_discard:
+                if not self._confirm_generated_auto_reports_cleanup():
+                    event.ignore()
+                    return
                 event.accept()
                 return
             if clicked == btn_cancel:
                 event.ignore()
                 return
+        if not self._confirm_generated_auto_reports_cleanup():
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def _sort_table(self, tree: QtTreeAdapter, cols, idx: int) -> None:
@@ -3901,7 +4649,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def run_app() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    app.aboutToQuit.connect(cleanup_generated_auto_reports)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

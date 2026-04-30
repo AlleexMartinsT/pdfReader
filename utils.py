@@ -1220,23 +1220,25 @@ def _integrate_local_payment_reports(
     local_pix_pdf = local_payment_reports.get("pix")
     local_card_pdf = local_payment_reports.get("cartoes")
     avisos.extend(local_payment_reports.get("avisos") or [])
+    scope_windows = _report_scope_windows(relatorio_fechamento)
+    scope_label = " dentro do escopo horário do fechamento" if scope_windows else ""
 
     relatorios_pagamento = dict(relatorio_fechamento.get("relatorios_pagamento") or {})
-    relatorio_pix = relatorio_pix_padrao
+    relatorio_pix = _filter_payment_report_to_scope(relatorio_pix_padrao, scope_windows)
 
     if local_card_pdf:
         try:
             relatorios_cartao = _build_card_reports_from_caixa(local_card_pdf, data_br)
-            relatorios_validos = {
-                key: report
-                for key, report in relatorios_cartao.items()
-                if report.get("itens_autorizados")
-            }
+            relatorios_validos = {}
+            for key, report in relatorios_cartao.items():
+                report_filtrado = _filter_payment_report_to_scope(report, scope_windows)
+                if report_filtrado.get("itens_autorizados"):
+                    relatorios_validos[key] = report_filtrado
             if relatorios_validos:
                 relatorios_pagamento.update(relatorios_validos)
             else:
                 avisos.append(
-                    f'O arquivo "{os.path.basename(local_card_pdf)}" não trouxe transações de cartão para {data_br} e foi ignorado.'
+                    f'O arquivo "{os.path.basename(local_card_pdf)}" não trouxe transações de cartão para {data_br}{scope_label} e foi ignorado.'
                 )
         except Exception as exc:
             avisos.append(
@@ -1252,16 +1254,17 @@ def _integrate_local_payment_reports(
                 relatorio_pix = _build_pix_report_from_caixa_xlsx(local_pix_pdf, data_br)
             else:
                 relatorio_pix = _build_pix_report_from_caixa_pdf(local_pix_pdf, data_br)
+            relatorio_pix = _filter_payment_report_to_scope(relatorio_pix, scope_windows)
             if relatorio_pix.get("quantidade_autorizados", 0) <= 0:
                 avisos.append(
-                    f'O arquivo "{os.path.basename(local_pix_pdf)}" não trouxe transações PIX para {data_br} e foi ignorado.'
+                    f'O arquivo "{os.path.basename(local_pix_pdf)}" não trouxe transações PIX para {data_br}{scope_label} e foi ignorado.'
                 )
-                relatorio_pix = relatorio_pix_padrao
+                relatorio_pix = _filter_payment_report_to_scope(relatorio_pix_padrao, scope_windows)
         except Exception as exc:
             avisos.append(
                 f'Não foi possível ler o arquivo "{os.path.basename(local_pix_pdf)}" para {data_br}: {exc}'
             )
-            relatorio_pix = relatorio_pix_padrao
+            relatorio_pix = _filter_payment_report_to_scope(relatorio_pix_padrao, scope_windows)
 
     relatorio_fechamento["relatorios_pagamento"] = relatorios_pagamento
     if relatorio_pix:
@@ -2146,6 +2149,29 @@ def cleanup_generated_auto_reports(report_dir: str | os.PathLike | None = None) 
             pass
 
 
+def list_generated_auto_reports(report_dir: str | os.PathLike | None = None) -> list[Path]:
+    try:
+        base_dir = Path(report_dir or _active_report_dir())
+    except TypeError:
+        return []
+    if not base_dir.exists() or not base_dir.is_dir():
+        return []
+
+    try:
+        candidates = list(base_dir.iterdir())
+    except Exception:
+        return []
+
+    report_paths: list[Path] = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if not _is_generated_auto_report_path(candidate):
+            continue
+        report_paths.append(candidate)
+    return sorted(report_paths, key=lambda item: item.name.casefold())
+
+
 def baixar_relatorios_caixa_eh_azulzinha(
     data_br: str,
     on_status=None,
@@ -2358,6 +2384,13 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             or (safe_suffix.lower() == ".xlsx" and "data da venda" in text_norm and "valor bruto" in text_norm and "status" in text_norm)
                         ):
                             return str(target)
+                        if safe_suffix.lower() == ".xlsx":
+                            try:
+                                card_reports = _build_card_reports_from_caixa_xlsx(str(target), data_br)
+                            except Exception:
+                                card_reports = {}
+                            if any(report.get("itens_autorizados") for report in card_reports.values()):
+                                return str(target)
                 except Exception:
                     pass
                 try:
@@ -2456,7 +2489,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         suggested = str(params.get("suggestedFilename") or "").lower()
                         url = str(params.get("url") or "").lower()
                         if kind == "pix":
-                            return suggested.endswith(".csv") or "csv" in suggested or "pix" in url
+                            return (
+                                suggested.endswith((".csv", ".xlsx", ".pdf"))
+                                or any(token in suggested for token in ("csv", "xlsx", "pix"))
+                                or "pix" in url
+                            )
                         return suggested.endswith(".pdf") or "pdf" in suggested or "historico" in url
                     if method == "Network.requestWillBeSent":
                         if str(message.get("sessionId") or "") != str(session_id):
@@ -2464,7 +2501,14 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         request = params.get("request") or {}
                         url = str(request.get("url") or "").lower()
                         if kind == "pix":
-                            return "pix" in url and ("export" in url or "download" in url or "csv" in url)
+                            return (
+                                "pix" in url
+                                or "export" in url
+                                or "download" in url
+                                or "screenservices" in url
+                                or "gerar" in url
+                                or "arquivo" in url
+                            )
                         return "historico" in url and ("export" in url or "download" in url or "pdf" in url)
                     if method != "Network.responseReceived":
                         return False
@@ -2478,8 +2522,14 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     if kind == "pix":
                         return (
                             "text/csv" in mime_type
+                            or "application/json" in mime_type
+                            or "spreadsheet" in mime_type
+                            or "excel" in mime_type
+                            or ".xlsx" in content_disposition
                             or "csv" in content_disposition
-                            or ("pix" in url and ("export" in url or "download" in url))
+                            or "pdf" in content_disposition
+                            or ("pix" in url)
+                            or ("export" in url or "download" in url or "screenservices" in url or "gerar" in url or "arquivo" in url)
                         )
                     return (
                         "application/pdf" in mime_type
@@ -2564,7 +2614,9 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         return direct_saved
                     event = await wait_for_event(is_candidate, timeout=min(5.0, max(0.5, deadline - time.time())), start_index=event_start_index)
                     if not event:
-                        break
+                        await asyncio.sleep(0.5)
+                        event_start_index = len(event_log)
+                        continue
                     method = str(event.get("method") or "")
                     params = event.get("params") or {}
                     if method == "Browser.downloadWillBegin":
@@ -2756,11 +2808,27 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     }};
                     const nodes = [...document.querySelectorAll('button, a, [role="button"], li, span, div, label')].filter(visible);
                     for (const target of targets) {{
-                        const node = nodes.find((el) => norm(el.innerText || el.textContent).includes(target));
-                        if (node) {{
-                            const clickable = node.closest('button, a, [role="button"], label, li, div') || node;
-                            clickable.scrollIntoView({{ block: 'center', inline: 'center' }});
-                            clickable.click();
+                        const matches = nodes
+                            .map((el) => {{
+                                const text = norm(el.innerText || el.textContent || '');
+                                if (!text.includes(target)) return null;
+                                const clickable = el.closest('button, a, [role="button"], label') || el.closest('li, div, span') || el;
+                                const clickableText = norm(clickable.innerText || clickable.textContent || '');
+                                const role = norm(clickable.getAttribute('role') || '');
+                                const tag = norm(clickable.tagName || '');
+                                const interactiveScore = tag === 'BUTTON' || tag === 'A' || tag === 'LABEL' || role === 'BUTTON' ? 500 : 0;
+                                const exactScore = clickableText === target || text === target ? 200 : 0;
+                                return {{
+                                    clickable,
+                                    score: interactiveScore + exactScore - clickableText.length,
+                                }};
+                            }})
+                            .filter(Boolean)
+                            .sort((a, b) => b.score - a.score);
+                        const match = matches.length ? matches[0].clickable : null;
+                        if (match) {{
+                            match.scrollIntoView({{ block: 'center', inline: 'center' }});
+                            match.click();
                             return true;
                         }}
                     }}
@@ -3075,12 +3143,18 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     session_id=session_id,
                 )
 
-            async def click_selector_native(session_id: str, selector: str) -> bool:
+            async def click_selector_native(session_id: str, selector: str, root_selector: str | None = None) -> bool:
                 rect = await eval_js(
                     session_id,
                     f"""
                     (() => {{
-                        const el = document.querySelector({selector!r});
+                        const root = {root_selector!r} ? document.querySelector({root_selector!r}) : document;
+                        if (!root) return null;
+                        const el = [...root.querySelectorAll({selector!r})].find((candidate) => {{
+                            const r = candidate.getBoundingClientRect();
+                            const style = getComputedStyle(candidate);
+                            return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        }});
                         if (!el) return null;
                         const r = el.getBoundingClientRect();
                         const style = getComputedStyle(el);
@@ -3232,9 +3306,358 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     pass
                 await asyncio.sleep(0.8)
 
-            async def wait_for_export_ready(session_id: str, kind: str, timeout: float = 60.0) -> None:
+            async def ensure_all_establishments_selected(
+                session_id: str,
+                tab_id: str,
+                timeout: float = 25.0,
+            ) -> bool:
+                expression = f"""
+                (() => {{
+                    const visible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const content = document.querySelector("#{tab_id}Content [role='tabpanel']");
+                    if (!content || content.getAttribute('aria-hidden') === 'true') return 'missing-content';
+                    const filterTrigger = [
+                        ...content.querySelectorAll(
+                            '[data-testid="vendas-hoje-link-filtrar"], [data-testid="historico-vendas-container-filtros"], [data-testid*="container-filtros"], [data-testid*="link-filtrar"]'
+                        )
+                    ].find(visible);
+                    const sidebar = [
+                        ...document.querySelectorAll('aside.osui-sidebar, [role="complementary"]')
+                    ].find((el) => visible(el) && (
+                        el.querySelector('[data-testid="generic-filter-btn-resultados"]') ||
+                        el.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]') ||
+                        el.querySelector('[data-testid="generic-filter-check-all-estabelecimentos"]')
+                    ));
+                    if (!filterTrigger && !sidebar) return 'no-filter';
+                    if (!sidebar) {{
+                        if (!filterTrigger) return 'no-filter';
+                        filterTrigger.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        filterTrigger.click();
+                        return 'opening';
+                    }}
+                    const title = sidebar.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]');
+                    if (!title) return 'no-estabelecimentos';
+                    const titleWrapper = title.closest('[role="button"]') || title.closest('.osui-accordion-item__title') || title;
+                    const accordionItem = title.closest('.osui-accordion-item');
+                    const contentWrapper = accordionItem
+                        ? accordionItem.querySelector('.osui-accordion-item__content, [id$="ContentWrapper"]')
+                        : null;
+                    const collapsed = Boolean(
+                        contentWrapper && (
+                            contentWrapper.getAttribute('aria-hidden') === 'true' ||
+                            String(contentWrapper.className || '').includes('--is-collapsed')
+                        )
+                    );
+                    if (collapsed) {{
+                        titleWrapper.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        titleWrapper.click();
+                        return 'expanding';
+                    }}
+                    const establishmentChecks = [
+                        ...sidebar.querySelectorAll('[data-testid^="generic-filter-check-estabelecimento-"]')
+                    ].filter((el) => !el.disabled);
+                    if (!establishmentChecks.length) return 'no-estabelecimentos';
+                    if (establishmentChecks.length > 1) {{
+                        const checkedCount = establishmentChecks.filter((el) => el.checked).length;
+                        if (checkedCount < establishmentChecks.length) {{
+                            const checkAll = sidebar.querySelector('[data-testid="generic-filter-check-all-estabelecimentos"]');
+                            if (checkAll && !checkAll.disabled && visible(checkAll)) {{
+                                checkAll.click();
+                                return 'selecting-all';
+                            }}
+                            const unchecked = establishmentChecks.filter((el) => !el.checked);
+                            for (const checkbox of unchecked) {{
+                                checkbox.click();
+                            }}
+                            return unchecked.length ? 'selecting-manual' : 'selected';
+                        }}
+                    }}
+                    const applyButton = sidebar.querySelector('[data-testid="generic-filter-btn-resultados"]');
+                    if (!applyButton || !visible(applyButton) || applyButton.disabled) return 'ready';
+                    applyButton.click();
+                    return establishmentChecks.length > 1 ? 'applied-multiple' : 'applied-single';
+                }})()
+                """
+                deadline = time.time() + timeout
+                found_filter = False
+                applied_multiple = False
+                while time.time() < deadline:
+                    _check_cancelled()
+                    state = str(await eval_js(session_id, expression, timeout=15.0) or "").strip()
+                    if state in {
+                        "opening",
+                        "expanding",
+                        "selecting-all",
+                        "selecting-manual",
+                        "selected",
+                    }:
+                        found_filter = True
+                        await asyncio.sleep(0.6)
+                        continue
+                    if state in {"applied-multiple", "applied-single"}:
+                        found_filter = True
+                        applied_multiple = state == "applied-multiple"
+                        try:
+                            await wait_for_condition(
+                                session_id,
+                                """
+                                (() => {
+                                    const visible = (el) => {
+                                        if (!el) return false;
+                                        const rect = el.getBoundingClientRect();
+                                        const style = getComputedStyle(el);
+                                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                    };
+                                    const sidebar = [
+                                        ...document.querySelectorAll('aside.osui-sidebar, [role="complementary"]')
+                                    ].find((el) => visible(el) && (
+                                        el.querySelector('[data-testid="generic-filter-btn-resultados"]') ||
+                                        el.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]')
+                                    ));
+                                    return !sidebar;
+                                })()
+                                """,
+                                timeout=15.0,
+                                step=0.25,
+                            )
+                        except Exception:
+                            pass
+                        await wait_for_portal_settle(
+                            session_id,
+                            tab_id=tab_id,
+                            timeout=20.0,
+                            context_label=f"aplicar os estabelecimentos da aba {tab_id}",
+                        )
+                        return applied_multiple
+                    if state in {"ready", "no-estabelecimentos"}:
+                        return applied_multiple
+                    if state in {"no-filter", "missing-content"}:
+                        return False
+                    await asyncio.sleep(0.5)
+                if found_filter:
+                    raise RuntimeError(
+                        f"A Caixa nao concluiu a aplicacao do filtro de estabelecimentos na aba {tab_id}."
+                    )
+                return False
+
+            async def list_establishment_filter_options(
+                session_id: str,
+                tab_id: str,
+                timeout: float = 25.0,
+            ) -> list[str]:
+                expression = f"""
+                (() => {{
+                    const visible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const content = document.querySelector("#{tab_id}Content [role='tabpanel']");
+                    if (!content || content.getAttribute('aria-hidden') === 'true') return '';
+                    const filterTrigger = [
+                        ...content.querySelectorAll(
+                            '[data-testid="vendas-hoje-link-filtrar"], [data-testid="historico-vendas-container-filtros"], [data-testid*="container-filtros"], [data-testid*="link-filtrar"]'
+                        )
+                    ].find(visible);
+                    const sidebar = [
+                        ...document.querySelectorAll('aside.osui-sidebar, [role="complementary"]')
+                    ].find((el) => visible(el) && (
+                        el.querySelector('[data-testid="generic-filter-btn-resultados"]') ||
+                        el.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]')
+                    ));
+                    if (!filterTrigger && !sidebar) return JSON.stringify([]);
+                    if (!sidebar) {{
+                        if (!filterTrigger) return JSON.stringify([]);
+                        filterTrigger.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        filterTrigger.click();
+                        return '';
+                    }}
+                    const title = sidebar.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]');
+                    if (!title) return JSON.stringify([]);
+                    const titleWrapper = title.closest('[role="button"]') || title.closest('.osui-accordion-item__title') || title;
+                    const accordionItem = title.closest('.osui-accordion-item');
+                    const contentWrapper = accordionItem
+                        ? accordionItem.querySelector('.osui-accordion-item__content, [id$="ContentWrapper"]')
+                        : null;
+                    const collapsed = Boolean(
+                        contentWrapper && (
+                            contentWrapper.getAttribute('aria-hidden') === 'true' ||
+                            String(contentWrapper.className || '').includes('--is-collapsed')
+                        )
+                    );
+                    if (collapsed) {{
+                        titleWrapper.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        titleWrapper.click();
+                        return '';
+                    }}
+                    const options = [
+                        ...sidebar.querySelectorAll('[data-testid^="generic-filter-check-estabelecimento-"]')
+                    ]
+                        .filter((el) => !el.disabled)
+                        .map((el) => String(el.getAttribute('data-testid') || '').replace('generic-filter-check-estabelecimento-', '').trim())
+                        .filter(Boolean);
+                    return JSON.stringify(options);
+                }})()
+                """
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    raw = await eval_js(session_id, expression, timeout=15.0)
+                    text = str(raw or "").strip()
+                    if not text:
+                        await asyncio.sleep(0.5)
+                        continue
+                    try:
+                        options = json.loads(text)
+                    except Exception:
+                        options = []
+                    if isinstance(options, list):
+                        return [str(item).strip() for item in options if str(item).strip()]
+                    return []
+                return []
+
+            async def apply_establishment_filter_selection(
+                session_id: str,
+                tab_id: str,
+                selected_ids: list[str],
+                timeout: float = 25.0,
+            ) -> int:
+                desired_ids = [str(item).strip() for item in selected_ids if str(item).strip()]
+                if not desired_ids:
+                    return 0
+                desired_ids_js = json.dumps(desired_ids, ensure_ascii=False)
+                expression = f"""
+                (() => {{
+                    const desired = new Set({desired_ids_js});
+                    const visible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const content = document.querySelector("#{tab_id}Content [role='tabpanel']");
+                    if (!content || content.getAttribute('aria-hidden') === 'true') return 'missing-content';
+                    const filterTrigger = [
+                        ...content.querySelectorAll(
+                            '[data-testid="vendas-hoje-link-filtrar"], [data-testid="historico-vendas-container-filtros"], [data-testid*="container-filtros"], [data-testid*="link-filtrar"]'
+                        )
+                    ].find(visible);
+                    const sidebar = [
+                        ...document.querySelectorAll('aside.osui-sidebar, [role="complementary"]')
+                    ].find((el) => visible(el) && (
+                        el.querySelector('[data-testid="generic-filter-btn-resultados"]') ||
+                        el.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]')
+                    ));
+                    if (!filterTrigger && !sidebar) return 'no-filter';
+                    if (!sidebar) {{
+                        if (!filterTrigger) return 'no-filter';
+                        filterTrigger.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        filterTrigger.click();
+                        return 'opening';
+                    }}
+                    const title = sidebar.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]');
+                    if (!title) return 'no-estabelecimentos';
+                    const titleWrapper = title.closest('[role="button"]') || title.closest('.osui-accordion-item__title') || title;
+                    const accordionItem = title.closest('.osui-accordion-item');
+                    const contentWrapper = accordionItem
+                        ? accordionItem.querySelector('.osui-accordion-item__content, [id$="ContentWrapper"]')
+                        : null;
+                    const collapsed = Boolean(
+                        contentWrapper && (
+                            contentWrapper.getAttribute('aria-hidden') === 'true' ||
+                            String(contentWrapper.className || '').includes('--is-collapsed')
+                        )
+                    );
+                    if (collapsed) {{
+                        titleWrapper.scrollIntoView({{ block: 'center', inline: 'center' }});
+                        titleWrapper.click();
+                        return 'expanding';
+                    }}
+                    const establishmentChecks = [
+                        ...sidebar.querySelectorAll('[data-testid^="generic-filter-check-estabelecimento-"]')
+                    ]
+                        .filter((el) => !el.disabled)
+                        .map((el) => {{
+                            const value = String(el.getAttribute('data-testid') || '').replace('generic-filter-check-estabelecimento-', '').trim();
+                            return {{ el, value }};
+                        }})
+                        .filter((entry) => entry.value);
+                    if (!establishmentChecks.length) return 'no-estabelecimentos';
+                    const needsToggle = establishmentChecks.filter((entry) => desired.has(entry.value) !== entry.el.checked);
+                    if (needsToggle.length) {{
+                        needsToggle[0].el.click();
+                        return 'toggling';
+                    }}
+                    const applyButton = sidebar.querySelector('[data-testid="generic-filter-btn-resultados"]');
+                    if (!applyButton || !visible(applyButton) || applyButton.disabled) return 'ready';
+                    applyButton.click();
+                    return 'applied';
+                }})()
+                """
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    state = str(await eval_js(session_id, expression, timeout=15.0) or "").strip()
+                    if state in {"opening", "expanding", "toggling"}:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if state == "applied":
+                        try:
+                            await wait_for_condition(
+                                session_id,
+                                """
+                                (() => {
+                                    const visible = (el) => {
+                                        if (!el) return false;
+                                        const rect = el.getBoundingClientRect();
+                                        const style = getComputedStyle(el);
+                                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                    };
+                                    const sidebar = [
+                                        ...document.querySelectorAll('aside.osui-sidebar, [role="complementary"]')
+                                    ].find((el) => visible(el) && (
+                                        el.querySelector('[data-testid="generic-filter-btn-resultados"]') ||
+                                        el.querySelector('[data-testid="generic-filter-accordion-title-estabelecimentos"]')
+                                    ));
+                                    return !sidebar;
+                                })()
+                                """,
+                                timeout=15.0,
+                                step=0.25,
+                            )
+                        except Exception:
+                            pass
+                        await wait_for_portal_settle(
+                            session_id,
+                            tab_id=tab_id,
+                            timeout=20.0,
+                            context_label=f"aplicar o estabelecimento {', '.join(desired_ids)} na aba {tab_id}",
+                        )
+                        return len(desired_ids)
+                    if state in {"ready", "no-estabelecimentos"}:
+                        return len(desired_ids)
+                    if state in {"no-filter", "missing-content"}:
+                        return 0
+                    await asyncio.sleep(0.5)
+                raise RuntimeError(
+                    f"A Caixa nao concluiu a selecao de estabelecimento(s) na aba {tab_id}."
+                )
+
+            async def wait_for_export_ready(
+                session_id: str,
+                kind: str,
+                *,
+                tab_id: str | None = None,
+                timeout: float = 60.0,
+            ) -> None:
                 export_selector = '[data-testid="exportar-pix-van"]' if kind == "pix" else '[data-testid^="exportar-"]'
-                content_id = "PixContent" if kind == "pix" else "HistoricoVendasContent"
+                content_id = f"{tab_id}Content" if tab_id else ("PixContent" if kind == "pix" else "HistoricoVendasContent")
                 expression = f"""
                 (() => {{
                     const text = (document.body?.innerText || '')
@@ -3254,7 +3677,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     const busyNodes = [...content.querySelectorAll('[aria-busy="true"], .ph-item, .ph-picture, .ph-picture-small, .spinner-border, .spinner-grow, .loading, .skeleton, .ant-skeleton')]
                         .filter(visible);
                     if (busyNodes.length) return '';
-                    const exportBtn = document.querySelector({export_selector!r});
+                    const exportBtn = [...content.querySelectorAll({export_selector!r})].find(visible);
                     if (!exportBtn) return '';
                     return !exportBtn.disabled ? 'ready' : '';
                 }})()
@@ -3286,7 +3709,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             f"""
                             (() => {{
                                 const content = document.querySelector("#{content_id} [role='tabpanel']");
-                                const exportBtn = document.querySelector({export_selector!r});
+                                const exportBtn = content ? [...content.querySelectorAll({export_selector!r})].find((el) => {{
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                }}) : null;
                                 const placeholderNodes = content ? [...content.querySelectorAll('.ph-item, .ph-picture, .ph-picture-small')] : [];
                                 return {{
                                     contentFound: !!content,
@@ -3331,7 +3758,8 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     f"A Caixa abriu a pagina de erro ao preparar a exportacao do relatorio de {'PIX' if kind == 'pix' else 'cartoes'}."
                 )
 
-            async def click_export(session_id: str, kind: str) -> None:
+            async def click_export(session_id: str, kind: str, tab_id: str | None = None) -> None:
+                tab_content_selector = f"#{tab_id}Content [role='tabpanel']" if tab_id else None
                 await eval_js(
                     session_id,
                     """
@@ -3407,7 +3835,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     """,
                 )
                 try:
-                    await wait_for_export_ready(session_id, kind, timeout=45.0)
+                    await wait_for_export_ready(session_id, kind, tab_id=tab_id, timeout=45.0)
                 except Exception:
                     pass
                 direct_selectors = (
@@ -3421,7 +3849,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     ]
                 )
                 for selector in direct_selectors:
-                    if await click_selector_native(session_id, selector):
+                    if await click_selector_native(session_id, selector, root_selector=tab_content_selector):
                         if kind == "pix":
                             try:
                                 await wait_for_condition(
@@ -3470,32 +3898,42 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                             const style = getComputedStyle(el);
                                             return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
                                         };
-                                        const csvNode = [...document.querySelectorAll('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span, input')]
+                                        const excelNode = [...document.querySelectorAll('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span, input')]
                                             .filter(visible)
                                             .find((el) => {
                                                 const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('value') || '');
                                                 const attrs = norm(`${el.id || ''} ${el.name || ''} ${el.value || ''}`);
-                                                return text === 'CSV' || text.includes(' CSV') || attrs.includes('CSV');
+                                                return (
+                                                    text === 'EXCEL' ||
+                                                    text.includes('XLSX') ||
+                                                    text.includes('PLANILHA') ||
+                                                    attrs.includes('EXCEL') ||
+                                                    attrs.includes('XLSX')
+                                                );
                                             });
-                                        const target = csvNode?.closest('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span') || csvNode;
+                                        const target = excelNode?.closest('button, a, [role="button"], [role="option"], [role="menuitem"], label, div, span') || excelNode;
                                         target?.click();
-                                        if (csvNode && csvNode.tagName === 'INPUT') {
-                                            csvNode.checked = true;
-                                            csvNode.dispatchEvent(new Event('input', { bubbles: true }));
-                                            csvNode.dispatchEvent(new Event('change', { bubbles: true }));
+                                        if (excelNode && excelNode.tagName === 'INPUT') {
+                                            excelNode.checked = true;
+                                            excelNode.dispatchEvent(new Event('input', { bubbles: true }));
+                                            excelNode.dispatchEvent(new Event('change', { bubbles: true }));
                                         }
                                         return !!target;
                                     })()
                                     """,
                                 )
                                 await asyncio.sleep(0.6)
-                                if await click_selector_native(session_id, '[data-testid="pix-van-gerar-arquivo"]'):
+                                clicked_generate = await click_selector_native(session_id, '[data-testid="pix-van-gerar-arquivo"]')
+                                if not clicked_generate:
+                                    clicked_generate = await click_by_text(session_id, ["Gerar arquivo", "Baixar arquivo", "Download"], timeout=4.0)
+                                if clicked_generate:
                                     await asyncio.sleep(1.0)
                                     return
+                                raise RuntimeError("Nao foi possivel confirmar a geracao do arquivo PIX na Azulzinha/Caixa.")
                             except Exception:
                                 pass
                             await asyncio.sleep(1.0)
-                            return
+                            continue
                         else:
                             try:
                                 await wait_for_condition(
@@ -3585,9 +4023,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         const directSelectors = wantCsv
                             ? ['button[data-testid="exportar-pix-van"]', '[data-testid="exportar-pix-van"]']
                             : ['button[data-testid^="exportar-"]', '[data-testid^="exportar-"]'];
+                        const root = {tab_content_selector!r} ? document.querySelector({tab_content_selector!r}) : document;
+                        if (!root) return false;
                         const explicit = directSelectors
-                            .map((selector) => document.querySelector(selector))
-                            .find((el) => el && !el.disabled);
+                            .flatMap((selector) => [...root.querySelectorAll(selector)])
+                            .find((el) => el && !el.disabled && visible(el));
                         if (explicit) {{
                             explicit.scrollIntoView({{ block: 'center', inline: 'center' }});
                             explicit.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
@@ -3595,7 +4035,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             explicit.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
                             return true;
                         }}
-                        const buttons = [...document.querySelectorAll('button, a, [role="button"]')].filter(visible);
+                        const buttons = [...root.querySelectorAll('button, a, [role="button"]')].filter(visible);
                         const preferred = buttons.find((el) => {{
                             const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('mattooltip') || el.title || '');
                             return !el.disabled && (text.includes('EXPORTAR') || text.includes('IMPRIMIR') || text.includes(wantCsv ? 'CSV' : 'PDF'));
@@ -5904,55 +6344,229 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 export_ready_timeout = 90.0 if kind == "pix" else 60.0
                 captured_timeout = 60.0 if kind == "pix" else 35.0
                 download_timeout = 150.0 if kind == "pix" else 100.0
+                today_br = datetime.now().strftime("%d/%m/%Y")
+                use_today_tab = kind == "cartoes" and data_br == today_br
+                active_tab_id = "Hoje" if use_today_tab else ("HistoricoVendas" if kind == "cartoes" else "Pix")
                 last_error = None
+
+                def _copy_establishment_variant(saved_path: str, establishment_id: str) -> str | None:
+                    try:
+                        source = Path(saved_path)
+                    except Exception:
+                        return None
+                    if not source.exists():
+                        return None
+                    target = source.with_name(f"{source.stem}_est{establishment_id}{source.suffix}")
+                    try:
+                        shutil.copy2(source, target)
+                        return str(target)
+                    except Exception:
+                        return None
+
+                def _combine_establishment_reports(
+                    captured_paths: list[tuple[str, str]],
+                    report_kind: str,
+                ) -> str | None:
+                    if not captured_paths:
+                        return None
+                    if len(captured_paths) == 1:
+                        return captured_paths[0][0]
+                    if report_kind == "cartoes":
+                        columns = [
+                            "Data da venda",
+                            "Cód. de autorização",
+                            "Comprovante da venda",
+                            "Produto",
+                            "Parcelado",
+                            "Bandeira",
+                            "Canal",
+                            "Terminal",
+                            "Valor bruto",
+                            "Status",
+                            "Número do estabelecimento",
+                            "Final do cartão",
+                            "Cód. Ref. Cartão",
+                        ]
+                        rows_out: list[dict[str, object]] = []
+                        seen: set[tuple[str, str, float, str, str]] = set()
+                        for path_value, establishment_id in captured_paths:
+                            reports = _build_card_reports_from_caixa(path_value, data_br)
+                            for report_key, produto in (
+                                ("cartao_credito_caixa", "Crédito"),
+                                ("cartao_debito_caixa", "Débito"),
+                            ):
+                                for item in list((reports.get(report_key) or {}).get("itens_autorizados") or []):
+                                    numero = str(item.get("numero") or "").strip()
+                                    data_venda = str(item.get("data_venda") or "").strip()
+                                    valor = round(float(item.get("valor_bruto", 0.0) or 0.0), 2)
+                                    dedupe_key = (numero, data_venda, valor, produto, str(establishment_id or "").strip())
+                                    if dedupe_key in seen:
+                                        continue
+                                    seen.add(dedupe_key)
+                                    rows_out.append(
+                                        {
+                                            "Data da venda": data_venda,
+                                            "Cód. de autorização": numero,
+                                            "Comprovante da venda": item.get("numero_exibicao") or numero,
+                                            "Produto": produto,
+                                            "Parcelado": "-",
+                                            "Bandeira": "",
+                                            "Canal": "",
+                                            "Terminal": "",
+                                            "Valor bruto": valor,
+                                            "Status": "Autorizada",
+                                            "Número do estabelecimento": establishment_id,
+                                            "Final do cartão": "",
+                                            "Cód. Ref. Cartão": "",
+                                        }
+                                    )
+                        if not rows_out:
+                            return None
+                        final_path = artifacts_dir / f"Historico_Simplificado_de_vendas_{data_br.replace('/', '-')}_{company_norm}_auto.xlsx"
+                        import pandas as pd
+
+                        pd.DataFrame(rows_out, columns=columns).to_excel(final_path, index=False)
+                        return str(final_path)
+
+                    headers = ["Data da venda", "Cód. de autorização", "Valor bruto", "Status"]
+                    rows_out: list[dict[str, object]] = []
+                    seen: set[tuple[str, str, float, str]] = set()
+                    for path_value, _establishment_id in captured_paths:
+                        suffix = _effective_local_report_suffix(path_value)
+                        if suffix == ".csv":
+                            report = _build_pix_report_from_caixa_csv(path_value, data_br)
+                        elif suffix == ".xlsx":
+                            report = _build_pix_report_from_caixa_xlsx(path_value, data_br)
+                        else:
+                            report = _build_pix_report_from_caixa_pdf(path_value, data_br)
+                        for item in list(report.get("itens_autorizados") or []):
+                            data_venda = str(item.get("data_venda") or "").strip()
+                            codigo = str(item.get("nome") or "").strip()
+                            valor = round(float(item.get("valor_bruto", 0.0) or 0.0), 2)
+                            status = str(item.get("situacao") or "").strip() or "APROVADA"
+                            dedupe_key = (data_venda, codigo, valor, status)
+                            if dedupe_key in seen:
+                                continue
+                            seen.add(dedupe_key)
+                            rows_out.append(
+                                {
+                                    "Data da venda": data_venda,
+                                    "Cód. de autorização": codigo,
+                                    "Valor bruto": valor,
+                                    "Status": status,
+                                }
+                            )
+                    if not rows_out:
+                        return None
+                    final_path = artifacts_dir / f"Relatorio_de_Vendas_Pix_{data_br.replace('/', '-')}_{company_norm}_auto.csv"
+                    with open(final_path, "w", encoding="utf-8-sig", newline="") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=headers, delimiter=";")
+                        writer.writeheader()
+                        for row in rows_out:
+                            writer.writerow(row)
+                    return str(final_path)
+
+                async def export_current_selection() -> str | None:
+                    await wait_for_export_ready(session_id, kind, tab_id=active_tab_id, timeout=export_ready_timeout)
+                    await asyncio.sleep(1.0)
+                    started_at = _download_start_time()
+                    event_start_index = len(event_log)
+                    _emit_pix_status(on_status, f"Solicitando arquivo de {'cartoes' if kind == 'cartoes' else 'PIX'} para a Caixa...")
+                    await click_export(session_id, "pix" if kind == "pix" else "cartoes", tab_id=active_tab_id)
+                    captured = await wait_for_captured_report(session_id, kind, event_start_index, timeout=captured_timeout)
+                    if captured:
+                        _emit_pix_status(on_status, f"Relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} recebido e validado.")
+                        return captured
+                    _emit_pix_status(on_status, f"Aguardando o download final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                    return _persist_downloaded_report(
+                        _wait_for_downloaded_report(browser_download_dir, data_br, kind, started_at, timeout=download_timeout),
+                        kind,
+                    )
+
                 for attempt in range(2):
                     try:
                         await ensure_authenticated_sales_area(session_id, kind, context_label)
                         if kind == "cartoes":
                             _emit_pix_status(on_status, "Baixando relatorio de cartoes da Caixa...")
-                            await activate_sales_tab(session_id, "HistoricoVendas", timeout=35.0)
-                            await wait_for_tab_content(session_id, "HistoricoVendas", timeout=45.0)
+                            await activate_sales_tab(session_id, active_tab_id, timeout=35.0)
+                            await wait_for_tab_content(session_id, active_tab_id, timeout=45.0)
                             await wait_for_portal_settle(
                                 session_id,
-                                tab_id="HistoricoVendas",
+                                tab_id=active_tab_id,
                                 timeout=20.0,
-                                context_label="estabilizar a aba HistoricoVendas",
+                                context_label=f"estabilizar a aba {active_tab_id}",
                             )
                         else:
                             _emit_pix_status(on_status, "Baixando relatorio PIX da Caixa...")
-                            await activate_sales_tab(session_id, "Pix", timeout=35.0)
-                            await wait_for_tab_content(session_id, "Pix", timeout=60.0)
+                            await activate_sales_tab(session_id, active_tab_id, timeout=35.0)
+                            await wait_for_tab_content(session_id, active_tab_id, timeout=60.0)
                             await wait_for_portal_settle(
                                 session_id,
-                                tab_id="Pix",
+                                tab_id=active_tab_id,
                                 timeout=25.0,
-                                context_label="estabilizar a aba Pix",
+                                context_label=f"estabilizar a aba {active_tab_id}",
                             )
                         await asyncio.sleep(1.0)
-                        _emit_pix_status(on_status, f"Aplicando filtro de data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                        await set_date_inputs(session_id)
-                        await wait_for_portal_settle(
+                        if use_today_tab:
+                            _emit_pix_status(on_status, "Usando a aba Hoje da Caixa para baixar o relatorio de cartoes do dia corrente...")
+                        else:
+                            _emit_pix_status(on_status, f"Aplicando filtro de data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                            await set_date_inputs(session_id)
+                            await wait_for_portal_settle(
+                                session_id,
+                                tab_id=active_tab_id,
+                                timeout=25.0 if kind == "pix" else 20.0,
+                                context_label=f"aplicar a data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}",
+                            )
+                        establishment_options = await list_establishment_filter_options(
                             session_id,
-                            tab_id="HistoricoVendas" if kind == "cartoes" else "Pix",
-                            timeout=25.0 if kind == "pix" else 20.0,
-                            context_label=f"aplicar a data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}",
+                            active_tab_id,
+                            timeout=25.0,
                         )
+                        if company_norm == "mva" and len(establishment_options) > 1:
+                            _emit_pix_status(
+                                on_status,
+                                f"Baixando o relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} separadamente para cada estabelecimento da MVA...",
+                            )
+                            captured_paths: list[tuple[str, str]] = []
+                            for establishment_id in establishment_options:
+                                _emit_pix_status(
+                                    on_status,
+                                    f"Aplicando o estabelecimento {establishment_id} na Caixa antes da exportacao...",
+                                )
+                                applied_count = await apply_establishment_filter_selection(
+                                    session_id,
+                                    active_tab_id,
+                                    [establishment_id],
+                                    timeout=25.0,
+                                )
+                                if applied_count <= 0:
+                                    continue
+                                _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                                saved = await export_current_selection()
+                                if not saved:
+                                    continue
+                                variant_path = _copy_establishment_variant(saved, establishment_id)
+                                if variant_path:
+                                    captured_paths.append((variant_path, establishment_id))
+                            combined = _combine_establishment_reports(captured_paths, kind)
+                            if combined:
+                                return combined
+                            raise RuntimeError(
+                                f"A Caixa nao entregou um arquivo valido do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} para os estabelecimentos da MVA."
+                            )
+                        establishments_applied = await ensure_all_establishments_selected(
+                            session_id,
+                            active_tab_id,
+                            timeout=25.0,
+                        )
+                        if establishments_applied:
+                            _emit_pix_status(
+                                on_status,
+                                "Aplicados todos os estabelecimentos disponiveis no filtro da Caixa antes da exportacao...",
+                            )
                         _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                        await wait_for_export_ready(session_id, kind, timeout=export_ready_timeout)
-                        await asyncio.sleep(1.0)
-                        started_at = _download_start_time()
-                        event_start_index = len(event_log)
-                        _emit_pix_status(on_status, f"Solicitando arquivo de {'cartoes' if kind == 'cartoes' else 'PIX'} para a Caixa...")
-                        await click_export(session_id, "pix" if kind == "pix" else "cartoes")
-                        captured = await wait_for_captured_report(session_id, kind, event_start_index, timeout=captured_timeout)
-                        if captured:
-                            _emit_pix_status(on_status, f"Relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} recebido e validado.")
-                            return captured
-                        _emit_pix_status(on_status, f"Aguardando o download final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                        saved = _persist_downloaded_report(
-                            _wait_for_downloaded_report(browser_download_dir, data_br, kind, started_at, timeout=download_timeout),
-                            kind,
-                        )
+                        saved = await export_current_selection()
                         if saved:
                             return saved
                         raise RuntimeError(
@@ -6665,29 +7279,37 @@ def _build_eh_alerts_report(
     pix_maquina_rows: list[tuple[str, str]] | None = None,
     cartao_fechamento_rows: list[tuple[str, str]] | None = None,
     cartao_maquina_rows: list[tuple[str, str]] | None = None,
+    cancelados_rows: list[tuple[str, str]] | None = None,
     allow_empty: bool = False,
 ) -> dict | None:
     pix_fechamento_rows = list(pix_fechamento_rows or [])
     pix_maquina_rows = list(pix_maquina_rows or [])
     cartao_fechamento_rows = list(cartao_fechamento_rows or [])
     cartao_maquina_rows = list(cartao_maquina_rows or [])
+    cancelados_rows = list(cancelados_rows or [])
+    tipos_alerta_exibidos = {"Cupom cancelado"}
 
     observacao_rows = [
         row
         for row in rows
         if row and row[0] not in {"CF sem Transação Bancária", "Transação Bancária sem CF/NF"}
     ]
+    observacao_rows = [row for row in observacao_rows if row and row[0] not in tipos_alerta_exibidos]
     total_rows = (
         len(pix_fechamento_rows)
         + len(pix_maquina_rows)
         + len(cartao_fechamento_rows)
         + len(cartao_maquina_rows)
+        + len(cancelados_rows)
         + len(observacao_rows)
     )
     if total_rows <= 0 and not allow_empty:
         return None
 
     table_rows: list[tuple[str, ...]] = []
+    if cancelados_rows:
+        table_rows.append(("Cupons Cancelados", "", ""))
+        table_rows.extend(cancelados_rows)
     for section_title, section_rows in (
         ("PIX - CF sem Transação Bancária", pix_fechamento_rows),
         ("PIX - Transação Bancária sem CF/NF", pix_maquina_rows),
@@ -6707,6 +7329,10 @@ def _build_eh_alerts_report(
                 continue
             valor = row[-1]
             total += parse_number(valor)
+    for row in cancelados_rows:
+        if not row:
+            continue
+        total += parse_number(row[-1])
 
     report = _build_generic_aux_report(
         categoria="alertas_eh",
@@ -6727,8 +7353,23 @@ def _build_eh_alerts_report(
     report["pix_maquina_rows"] = pix_maquina_rows
     report["cartao_fechamento_rows"] = cartao_fechamento_rows
     report["cartao_maquina_rows"] = cartao_maquina_rows
+    report["cancelados_rows"] = cancelados_rows
     report["observacao_rows"] = observacao_rows
     return report
+
+
+def _count_visible_alert_rows(report: dict | None) -> int:
+    report = report or {}
+    return sum(
+        len(report.get(key) or [])
+        for key in (
+            "cancelados_rows",
+            "pix_fechamento_rows",
+            "cartao_fechamento_rows",
+            "pix_maquina_rows",
+            "cartao_maquina_rows",
+        )
+    )
 
 
 def _build_eh_card_mismatch_report(
@@ -6841,6 +7482,7 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
     total_abertura = 0.0
     total_sangria = 0.0
     total_geral = 0.0
+    fechamento_janelas: list[dict] = []
 
     section_pattern = re.compile(
         r'<div class="mt-4">\s*<div class="d-flex justify-content-between">\s*'
@@ -6861,6 +7503,11 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
 
     for match in section_pattern.finditer(html_text):
         titulo = _clean_zweb_html_value(match.group("titulo"))
+        fechamento_janela = _build_scope_window(match.group("abertura"), match.group("fechamento"))
+        if fechamento_janela:
+            fechamento_janelas.append(fechamento_janela)
+        scope_abertura = str((fechamento_janela or {}).get("abertura") or "").strip()
+        scope_fechamento = str((fechamento_janela or {}).get("fechamento") or "").strip()
         meta_pagamento = _build_zweb_payment_report_meta(titulo)
         bucket_pagamento = None
         if meta_pagamento:
@@ -6901,6 +7548,8 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
                     "numero_exibicao": _display_fiscal_number(numero_normalizado),
                     "descricao": titulo,
                     "data_venda": data_exibicao,
+                    "scope_abertura": scope_abertura,
+                    "scope_fechamento": scope_fechamento,
                     "valor": valor,
                 }
             if bucket_pagamento is not None:
@@ -6910,6 +7559,8 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
                             "numero": numero_normalizado,
                             "numero_exibicao": _display_fiscal_number(numero_normalizado),
                             "data_venda": data_exibicao,
+                            "scope_abertura": scope_abertura,
+                            "scope_fechamento": scope_fechamento,
                             "valor_bruto": valor_parcela,
                         }
                     )
@@ -6972,6 +7623,7 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
             "table_mode": "numero_data_valor",
         }
 
+    fechamento_janelas = _normalize_scope_windows(fechamento_janelas)
     return {
         "arquivo": arquivo,
         "arquivo_tipo": "fechamento_caixa_zweb",
@@ -6990,6 +7642,8 @@ def _analisar_html_fechamento_caixa_eh(html_text: str, arquivo: str = "Fechament
         "total_sangria": total_sangria,
         "totalizadores": totalizadores,
         "relatorios_pagamento": relatorios_pagamento,
+        "fechamento_janelas": fechamento_janelas,
+        "fechamento_parcial": _is_partial_scope_windows(fechamento_janelas),
         "nfces": itens_nfce,
         "nfces_faltantes_sequencia": _find_missing_fiscal_numbers([item["numero"] for item in itens_nfce]),
         "fiscal_status_map": {},
@@ -7012,6 +7666,7 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
     company: str = "MVA",
     avisos_usuario: list[str] | None = None,
     auto_download_missing: bool = False,
+    force_refresh_payments: bool = False,
     on_status=None,
     cancel_event: threading.Event | None = None,
     token_callback=None,
@@ -7031,6 +7686,8 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
             "quantidade_nfce": 0,
             "total_nfce": 0.0,
             "relatorios_pagamento": {},
+            "fechamento_janelas": [],
+            "fechamento_parcial": False,
             "nfces": [],
             "nfces_faltantes_sequencia": [],
             "fiscal_status_map": {},
@@ -7059,6 +7716,19 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
     if match_periodo:
         periodo = f"{match_periodo.group(1)} - {match_periodo.group(2)}"
     data_base = _extract_period_range(periodo or "")[0] or ""
+    fechamento_janelas = _normalize_scope_windows(
+        [
+            {
+                "abertura": match.group(1),
+                "fechamento": match.group(2),
+            }
+            for match in re.finditer(
+                r"\b\d+\s*-\s*Abertura\s*:\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s*-\s*Fechamento\s*:\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})",
+                corrigir_texto(texto),
+                re.IGNORECASE,
+            )
+        ]
+    )
 
     payment_aliases = [
         ("Pagamento Instantâneo (PIX)", ("PAGAMENTO INSTANTANEO (PIX)", "PAGAMENTO INSTANTANEO")),
@@ -7208,6 +7878,8 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
         "total_geral": total_nfce,
         "totalizadores": totais_pagamento,
         "relatorios_pagamento": relatorios_pagamento,
+        "fechamento_janelas": fechamento_janelas,
+        "fechamento_parcial": _is_partial_scope_windows(fechamento_janelas),
         "nfces": itens_nfce,
         "nfces_faltantes_sequencia": _find_missing_fiscal_numbers([item["numero"] for item in itens_nfce]),
         "fiscal_status_map": {},
@@ -7218,15 +7890,15 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
         local_payment_reports = _find_eh_local_payment_reports(data_br, company=company)
         need_pix = not bool(local_payment_reports.get("pix"))
         need_cartoes = not bool(local_payment_reports.get("cartoes"))
-        if need_pix or need_cartoes:
+        if force_refresh_payments or need_pix or need_cartoes:
             try:
                 baixados = baixar_relatorios_caixa_eh_azulzinha(
                     data_br,
                     on_status=on_status,
                     cancel_event=cancel_event,
                     token_callback=token_callback,
-                    need_pix=need_pix,
-                    need_cartoes=need_cartoes,
+                    need_pix=force_refresh_payments or need_pix,
+                    need_cartoes=force_refresh_payments or need_cartoes,
                     company=company,
                 )
                 avisos.extend(list(baixados.get("avisos") or []))
@@ -7453,11 +8125,12 @@ def combinar_relatorios_caixa_mva(relatorios: list[dict]) -> dict:
         ),
         "itens_caixa": sorted(
             itens_caixa,
-            key=lambda item: item.get("pedido", ""),
+            key=lambda item: (str(item.get("ordem") or ""), item.get("pedido", "")),
         ),
         "itens_excluidos": sorted(
             itens_excluidos,
             key=lambda item: (
+                str(item.get("ordem") or ""),
                 item.get("documento", ""),
                 item.get("origem_mva", ""),
                 item.get("pedido", ""),
@@ -7506,6 +8179,408 @@ def _extract_period_range(periodo: str) -> tuple[str | None, str | None]:
     if not match:
         return None, None
     return match.group(1), match.group(2)
+
+
+def _parse_scope_datetime(value: object) -> datetime | None:
+    text = corrigir_texto(str(value or "")).strip()
+    if not text:
+        return None
+
+    normalized = _normalize_ascii_text(text)
+    for fmt in (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+
+    match = re.search(
+        r"(\d{2}/\d{2}/\d{4})\s*(?:as\s*)?(\d{2}:\d{2})(?::(\d{2}))?",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match:
+        seconds = match.group(3) or "00"
+        try:
+            return datetime.strptime(
+                f"{match.group(1)} {match.group(2)}:{seconds}",
+                "%d/%m/%Y %H:%M:%S",
+            )
+        except ValueError:
+            return None
+
+    return None
+
+
+def _build_scope_window(abertura: object, fechamento: object) -> dict | None:
+    abertura_dt = _parse_scope_datetime(abertura)
+    fechamento_dt = _parse_scope_datetime(fechamento)
+    if not abertura_dt or not fechamento_dt or fechamento_dt < abertura_dt:
+        return None
+    return {
+        "abertura": abertura_dt.strftime("%d/%m/%Y %H:%M:%S"),
+        "fechamento": fechamento_dt.strftime("%d/%m/%Y %H:%M:%S"),
+    }
+
+
+def _normalize_scope_windows(windows: object) -> list[dict]:
+    normalized: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in list(windows or []):
+        if isinstance(raw, dict):
+            opening = raw.get("abertura")
+            closing = raw.get("fechamento")
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            opening, closing = raw[0], raw[1]
+        else:
+            continue
+        window = _build_scope_window(opening, closing)
+        if not window:
+            continue
+        key = (window["abertura"], window["fechamento"])
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(window)
+    normalized.sort(key=lambda item: (item["abertura"], item["fechamento"]))
+    return normalized
+
+
+def _scope_window_datetimes(window: dict) -> tuple[datetime | None, datetime | None]:
+    return _parse_scope_datetime(window.get("abertura")), _parse_scope_datetime(window.get("fechamento"))
+
+
+def _is_partial_scope_windows(windows: object) -> bool:
+    normalized = _normalize_scope_windows(windows)
+    if not normalized:
+        return False
+    if len(normalized) > 1:
+        return False
+    opening_dt, closing_dt = _scope_window_datetimes(normalized[0])
+    if not opening_dt or not closing_dt:
+        return False
+    duration_hours = max(0.0, (closing_dt - opening_dt).total_seconds() / 3600.0)
+    if duration_hours >= 8.5 and opening_dt.hour <= 10 and closing_dt.hour >= 16:
+        return False
+    return True
+
+
+def _report_scope_windows(report: dict | None) -> list[dict]:
+    return _normalize_scope_windows((report or {}).get("fechamento_janelas"))
+
+
+def _scope_window_key(window: dict | None) -> tuple[str, str]:
+    window = window or {}
+    return (
+        str(window.get("abertura") or "").strip(),
+        str(window.get("fechamento") or "").strip(),
+    )
+
+
+def _scope_windows_for_mode(windows: object, mode: str | None) -> list[dict]:
+    normalized = _normalize_scope_windows(windows)
+    mode_norm = _normalize_ascii_text(mode or "")
+    if not normalized or mode_norm in {"", "daily", "diario"}:
+        return normalized
+    if mode_norm in {"morning", "manha"}:
+        return normalized[:1]
+    if mode_norm in {"afternoon", "tarde"}:
+        return normalized[1:] if len(normalized) > 1 else []
+    return normalized
+
+
+def _detect_closing_scope_kind(report: dict | None) -> str:
+    windows = _report_scope_windows(report)
+    if not windows:
+        return "daily"
+    if len(windows) > 1:
+        return "daily"
+    opening_dt, closing_dt = _scope_window_datetimes(windows[0])
+    if opening_dt and closing_dt and closing_dt.hour < 15:
+        return "morning"
+    return "partial"
+
+
+def describe_closing_scope(report: dict | None) -> dict:
+    windows = _report_scope_windows(report)
+    detected = _detect_closing_scope_kind(report)
+    available_modes = ["daily"]
+    if windows:
+        available_modes = ["morning"] if len(windows) == 1 else ["daily", "afternoon", "morning"]
+    return {
+        "detected": detected,
+        "windows": windows,
+        "available_modes": available_modes,
+        "has_morning_only": detected == "morning",
+        "has_full_day": len(windows) > 1,
+    }
+
+
+def _scope_mode_label(mode: str | None) -> str:
+    mode_norm = _normalize_ascii_text(mode or "")
+    if mode_norm in {"morning", "manha"}:
+        return "Manhã"
+    if mode_norm in {"afternoon", "tarde"}:
+        return "Tarde"
+    return "Diário"
+
+
+def _item_within_scope_windows(item: dict, windows: list[dict]) -> bool:
+    if not windows:
+        return True
+    item_scope_key = _scope_window_key(
+        {
+            "abertura": (item or {}).get("scope_abertura"),
+            "fechamento": (item or {}).get("scope_fechamento"),
+        }
+    )
+    if any(item_scope_key):
+        valid_scope_keys = {_scope_window_key(window) for window in windows}
+        return item_scope_key in valid_scope_keys
+    item_dt = _parse_scope_datetime((item or {}).get("ordem")) or _parse_scope_datetime((item or {}).get("data_venda"))
+    if item_dt is None:
+        return True
+    for window in windows:
+        opening_dt, closing_dt = _scope_window_datetimes(window)
+        if opening_dt and closing_dt and opening_dt <= item_dt <= closing_dt:
+            return True
+    return False
+
+
+def _filter_payment_report_to_scope(report: dict | None, windows: list[dict]) -> dict | None:
+    if not report:
+        return report
+    normalized_windows = _normalize_scope_windows(windows)
+    if not normalized_windows:
+        return report
+
+    filtered = dict(report)
+    items = [dict(item) for item in list(report.get("itens_autorizados") or []) if _item_within_scope_windows(item, normalized_windows)]
+    filtered["itens_autorizados"] = items
+    filtered["quantidade_autorizados"] = len(items)
+    filtered["total_autorizado"] = round(sum(float(item.get("valor_bruto", 0.0) or 0.0) for item in items), 2)
+
+    if "itens_todos" in report:
+        all_items = [dict(item) for item in list(report.get("itens_todos") or []) if _item_within_scope_windows(item, normalized_windows)]
+        filtered["itens_todos"] = all_items
+
+    if "quantidade_relatorio" in filtered:
+        filtered["quantidade_relatorio"] = len(items)
+    if "total_relatorio" in filtered:
+        filtered["total_relatorio"] = filtered["total_autorizado"]
+
+    if filtered.get("quantidade_autorizados", 0) <= 0 and filtered.get("empty_message"):
+        filtered["mensagem"] = filtered.get("empty_message")
+    filtered["escopo_horario_aplicado"] = list(normalized_windows)
+    return filtered
+
+
+def _filter_items_to_scope(items: list[dict] | None, windows: list[dict]) -> list[dict]:
+    normalized_windows = _normalize_scope_windows(windows)
+    if not normalized_windows:
+        return [dict(item) for item in list(items or [])]
+    return [
+        dict(item)
+        for item in list(items or [])
+        if _item_within_scope_windows(item, normalized_windows)
+    ]
+
+
+def _derive_scope_numbers(items: list[dict]) -> set[str]:
+    numbers: set[str] = set()
+    for item in items:
+        numero = _normalize_fiscal_number(item.get("numero") or item.get("pedido") or "")
+        if numero:
+            numbers.add(numero)
+    return numbers
+
+
+def _filter_eh_caixa_report_to_scope(relatorio_caixa: dict, relatorio_fechamento: dict, windows: list[dict]) -> dict:
+    filtered = dict(relatorio_caixa or {})
+    scoped_nfces = list(relatorio_fechamento.get("nfces") or [])
+    scoped_numbers = _derive_scope_numbers(scoped_nfces)
+    scoped_ints = sorted(int(numero) for numero in scoped_numbers if numero.isdigit())
+    min_num = scoped_ints[0] if scoped_ints else None
+    max_num = scoped_ints[-1] if scoped_ints else None
+
+    def _item_in_scope(item: dict) -> bool:
+        numero = _normalize_fiscal_number(item.get("pedido", ""))
+        if not numero or not numero.isdigit():
+            return False
+        if numero in scoped_numbers:
+            return True
+        if min_num is None or max_num is None:
+            return False
+        numero_int = int(numero)
+        return min_num <= numero_int <= max_num
+
+    itens_caixa = [dict(item) for item in list(relatorio_caixa.get("itens_caixa") or []) if _item_in_scope(item)]
+    itens_excluidos = [dict(item) for item in list(relatorio_caixa.get("itens_excluidos") or []) if _item_in_scope(item)]
+
+    pedidos_balcao = len(
+        [
+            item
+            for item in itens_caixa
+            if _is_eh_counter_client(item.get("cliente", ""))
+        ]
+    )
+    pedidos_excluidos_cliente = len(
+        [
+            item
+            for item in itens_excluidos
+            if "CLIENTE DIFERENTE" in _normalize_caixa_client(item.get("motivo", ""))
+        ]
+    )
+    pedidos_excluidos_documento = len(
+        [
+            item
+            for item in itens_excluidos
+            if "NF-E" in _normalize_caixa_client(item.get("motivo", ""))
+        ]
+    )
+    total_caixa = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_caixa), 2)
+    total_excluido = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_excluidos), 2)
+
+    filtered.update(
+        {
+            "pedidos_total": len(itens_caixa) + len(itens_excluidos),
+            "pedidos_balcao": pedidos_balcao,
+            "pedidos_caixa": len(itens_caixa),
+            "pedidos_excluidos": len(itens_excluidos),
+            "pedidos_excluidos_cliente": pedidos_excluidos_cliente,
+            "pedidos_excluidos_documento": pedidos_excluidos_documento,
+            "total_documento": round(total_caixa + total_excluido, 2),
+            "total_excluido": total_excluido,
+            "total_caixa": total_caixa,
+            "itens_caixa": sorted(
+                itens_caixa,
+                key=lambda item: (item.get("pedido", ""), str(item.get("cliente", "")).casefold()),
+            ),
+            "itens_excluidos": sorted(
+                itens_excluidos,
+                key=lambda item: (-float(item.get("valor", 0.0) or 0.0), str(item.get("cliente", "")).casefold(), item.get("pedido", "")),
+            ),
+            "escopo_horario_aplicado": list(_normalize_scope_windows(windows)),
+        }
+    )
+    return filtered
+
+
+def _filter_generic_caixa_report_to_scope(relatorio_caixa: dict, windows: list[dict]) -> dict:
+    filtered = dict(relatorio_caixa or {})
+    itens_caixa = _filter_items_to_scope(relatorio_caixa.get("itens_caixa") or [], windows)
+    itens_excluidos = _filter_items_to_scope(relatorio_caixa.get("itens_excluidos") or [], windows)
+    total_caixa = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_caixa), 2)
+    total_excluido = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_excluidos), 2)
+    pedidos_editando = len(
+        [
+            item
+            for item in itens_excluidos
+            if _normalize_caixa_client(item.get("documento", "")) == "EDITANDO"
+        ]
+    )
+    pedidos_outros_status = max(0, len(itens_excluidos) - pedidos_editando)
+    filtered.update(
+        {
+            "pedidos_total": len(itens_caixa) + len(itens_excluidos),
+            "pedidos_caixa": len(itens_caixa),
+            "pedidos_excluidos": len(itens_excluidos),
+            "pedidos_editando": pedidos_editando,
+            "pedidos_outros_status": pedidos_outros_status,
+            "total_documento": round(total_caixa + total_excluido, 2),
+            "total_excluido": total_excluido,
+            "total_caixa": total_caixa,
+            "itens_caixa": sorted(itens_caixa, key=lambda item: item.get("pedido", "")),
+            "itens_excluidos": sorted(
+                itens_excluidos,
+                key=lambda item: (item.get("documento", ""), item.get("origem_mva", ""), item.get("pedido", "")),
+            ),
+            "escopo_horario_aplicado": list(_normalize_scope_windows(windows)),
+        }
+    )
+    return filtered
+
+
+def _filter_fechamento_report_to_scope(relatorio_fechamento: dict, windows: list[dict]) -> dict:
+    normalized_windows = _normalize_scope_windows(windows)
+    if not normalized_windows:
+        return dict(relatorio_fechamento or {})
+
+    filtered = dict(relatorio_fechamento or {})
+    nfces = _filter_items_to_scope(relatorio_fechamento.get("nfces") or [], normalized_windows)
+    relatorios_pagamento = {}
+    for key, report in dict(relatorio_fechamento.get("relatorios_pagamento") or {}).items():
+        relatorios_pagamento[key] = _filter_payment_report_to_scope(report, normalized_windows)
+
+    totalizadores = {}
+    for report in relatorios_pagamento.values():
+        if not isinstance(report, dict):
+            continue
+        titulo = str(report.get("forma_pagamento") or report.get("summary_label") or "").strip()
+        if titulo:
+            totalizadores[titulo] = round(float(report.get("total_autorizado", 0.0) or 0.0), 2)
+
+    filtered.update(
+        {
+            "quantidade_nfce": len(nfces),
+            "total_nfce": round(sum(float(item.get("valor", 0.0) or 0.0) for item in nfces), 2),
+            "total_geral": round(sum(float(item.get("valor", 0.0) or 0.0) for item in nfces), 2),
+            "nfces": sorted(
+                nfces,
+                key=lambda item: (
+                    str(item.get("data_venda") or ""),
+                    str(item.get("numero") or ""),
+                ),
+            ),
+            "nfces_faltantes_sequencia": _find_missing_fiscal_numbers(
+                [_normalize_fiscal_number(item.get("numero", "")) for item in nfces]
+            ),
+            "relatorios_pagamento": relatorios_pagamento,
+            "fechamento_janelas": list(normalized_windows),
+            "fechamento_parcial": _is_partial_scope_windows(normalized_windows),
+            "totalizadores": totalizadores or dict(relatorio_fechamento.get("totalizadores") or {}),
+            "escopo_horario_aplicado": list(normalized_windows),
+        }
+    )
+    return filtered
+
+
+def aplicar_escopo_relatorio_caixa(
+    relatorio_caixa: dict,
+    relatorio_fechamento: dict,
+    relatorio_pix: dict | None = None,
+    *,
+    scope_mode: str | None = None,
+) -> tuple[dict, dict, dict | None]:
+    windows = _scope_windows_for_mode((relatorio_fechamento or {}).get("fechamento_janelas"), scope_mode)
+    mode_norm = _normalize_ascii_text(scope_mode or "")
+    if not windows or mode_norm in {"", "daily", "diario"}:
+        caixa_copy = dict(relatorio_caixa or {})
+        fechamento_copy = dict(relatorio_fechamento or {})
+        pix_copy = dict(relatorio_pix) if isinstance(relatorio_pix, dict) else relatorio_pix
+        for report in (caixa_copy, fechamento_copy, pix_copy):
+            if isinstance(report, dict):
+                report["escopo_relatorio"] = _scope_mode_label(scope_mode)
+        return caixa_copy, fechamento_copy, pix_copy
+
+    fechamento_filtrado = _filter_fechamento_report_to_scope(relatorio_fechamento, windows)
+    if str((relatorio_caixa or {}).get("caixa_modelo") or "").upper() == "MVA":
+        caixa_filtrado = _filter_generic_caixa_report_to_scope(relatorio_caixa, windows)
+    else:
+        caixa_filtrado = _filter_eh_caixa_report_to_scope(relatorio_caixa, fechamento_filtrado, windows)
+    pix_filtrado = _filter_payment_report_to_scope(relatorio_pix, windows) if relatorio_pix else relatorio_pix
+
+    escopo_label = _scope_mode_label(scope_mode)
+    for report in (caixa_filtrado, fechamento_filtrado, pix_filtrado):
+        if isinstance(report, dict):
+            report["escopo_relatorio"] = escopo_label
+            report["escopo_horario_aplicado"] = list(windows)
+
+    return caixa_filtrado, fechamento_filtrado, pix_filtrado
 
 
 def _period_to_iso_date(periodo: str) -> str | None:
@@ -7769,6 +8844,7 @@ def gerar_relatorios_caixa_eh_zweb(
     on_status=None,
     cancel_event: threading.Event | None = None,
     token_callback=None,
+    force_refresh_payments: bool = False,
 ) -> tuple[dict, dict, dict]:
     cancel_event = cancel_event or threading.Event()
 
@@ -7790,19 +8866,19 @@ def gerar_relatorios_caixa_eh_zweb(
     local_card_pdf = local_payment_reports.get("cartoes")
     avisos_usuario: list[str] = list(local_payment_reports.get("avisos") or [])
 
-    if not local_pix_pdf or not local_card_pdf:
+    if force_refresh_payments or not local_pix_pdf or not local_card_pdf:
         try:
             baixados = baixar_relatorios_caixa_eh_azulzinha(
                 data_br,
                 on_status=on_status,
                 cancel_event=cancel_event,
                 token_callback=token_callback,
-                need_pix=not bool(local_pix_pdf),
-                need_cartoes=not bool(local_card_pdf),
+                need_pix=force_refresh_payments or not bool(local_pix_pdf),
+                need_cartoes=force_refresh_payments or not bool(local_card_pdf),
             )
-            if not local_pix_pdf and baixados.get("pix"):
+            if baixados.get("pix"):
                 local_pix_pdf = baixados.get("pix")
-            if not local_card_pdf and baixados.get("cartoes"):
+            if baixados.get("cartoes"):
                 local_card_pdf = baixados.get("cartoes")
             avisos_usuario.extend(baixados.get("avisos") or [])
         except Exception as exc:
@@ -8439,19 +9515,23 @@ def gerar_relatorios_caixa_eh_zweb(
         report_pagamento["caminho"] = caminho_html_fechamento
     relatorio_fechamento["fiscal_status_map"] = fiscal_status_map or {}
     relatorio = _aplicar_filtro_canceladas_pedidos_eh(relatorio, fiscal_status_map or {})
+    scope_windows = _report_scope_windows(relatorio_fechamento)
+    scope_label = " dentro do escopo horário do fechamento" if scope_windows else ""
 
     if local_card_pdf:
         _emit_pix_status(on_status, "Lendo relatorio local de cartoes...")
         try:
             relatorios_cartao = _build_card_reports_from_caixa(local_card_pdf, data_br)
-            relatorios_validos = {
-                key: report for key, report in relatorios_cartao.items() if report.get("itens_autorizados")
-            }
+            relatorios_validos = {}
+            for key, report in relatorios_cartao.items():
+                report_filtrado = _filter_payment_report_to_scope(report, scope_windows)
+                if report_filtrado.get("itens_autorizados"):
+                    relatorios_validos[key] = report_filtrado
             if relatorios_validos:
                 relatorio_fechamento["relatorios_pagamento"].update(relatorios_validos)
             else:
                 avisos_usuario.append(
-                    f'O arquivo "{os.path.basename(local_card_pdf)}" não trouxe transações de cartão para {data_br} e foi ignorado.'
+                    f'O arquivo "{os.path.basename(local_card_pdf)}" não trouxe transações de cartão para {data_br}{scope_label} e foi ignorado.'
                 )
         except Exception as exc:
             avisos_usuario.append(
@@ -8468,18 +9548,28 @@ def gerar_relatorios_caixa_eh_zweb(
                 relatorio_pix = _build_pix_report_from_caixa_xlsx(local_pix_pdf, data_br)
             else:
                 relatorio_pix = _build_pix_report_from_caixa_pdf(local_pix_pdf, data_br)
+            relatorio_pix = _filter_payment_report_to_scope(relatorio_pix, scope_windows)
             if relatorio_pix.get("quantidade_autorizados", 0) <= 0:
                 avisos_usuario.append(
-                    f'O arquivo "{os.path.basename(local_pix_pdf)}" não trouxe transações PIX para {data_br} e foi ignorado.'
+                    f'O arquivo "{os.path.basename(local_pix_pdf)}" não trouxe transações PIX para {data_br}{scope_label} e foi ignorado.'
                 )
-                relatorio_pix = _build_pix_report_from_zweb_movimentations(data_iso, pix_transactions, erro=pix_error)
+                relatorio_pix = _filter_payment_report_to_scope(
+                    _build_pix_report_from_zweb_movimentations(data_iso, pix_transactions, erro=pix_error),
+                    scope_windows,
+                )
         except Exception as exc:
             avisos_usuario.append(
                 f'Não foi possível ler o arquivo "{os.path.basename(local_pix_pdf)}" para {data_br}: {exc}'
             )
-            relatorio_pix = _build_pix_report_from_zweb_movimentations(data_iso, pix_transactions, erro=str(exc))
+            relatorio_pix = _filter_payment_report_to_scope(
+                _build_pix_report_from_zweb_movimentations(data_iso, pix_transactions, erro=str(exc)),
+                scope_windows,
+            )
     else:
-        relatorio_pix = _build_pix_report_from_zweb_movimentations(data_iso, pix_transactions, erro=pix_error)
+        relatorio_pix = _filter_payment_report_to_scope(
+            _build_pix_report_from_zweb_movimentations(data_iso, pix_transactions, erro=pix_error),
+            scope_windows,
+        )
 
     if avisos_usuario:
         relatorio_fechamento["avisos_usuario"] = list(dict.fromkeys(avisos_usuario))
@@ -8640,9 +9730,12 @@ def _authenticate_minhas_notas(login: str, password: str) -> str:
 def _fetch_minhas_notas_nfes(
     access_token: str,
     data_iso: str,
+    *,
+    model: str = "55",
     cache_namespace: str = "",
 ) -> list[dict]:
-    cache_key = ((cache_namespace or access_token[-8:]).lower(), data_iso)
+    model_text = str(model or "55").strip() or "55"
+    cache_key = ((cache_namespace or access_token[-8:]).lower(), data_iso, model_text)
     if cache_key in _MINHAS_NOTAS_CACHE:
         return [dict(item) for item in _MINHAS_NOTAS_CACHE[cache_key]]
 
@@ -8662,7 +9755,7 @@ def _fetch_minhas_notas_nfes(
             json={
                 "page": pagina,
                 "maxResults": max_results,
-                "model": "55",
+                "model": model_text,
                 "fromEmission": data_iso,
                 "toEmission": data_iso,
             },
@@ -8690,10 +9783,13 @@ def _fetch_minhas_notas_nfes(
                 "numero": str(item.get("number") or "").strip(),
                 "valor": valor,
                 "status": int(item.get("status") or 0),
+                "model": model_text,
                 "tipo": str(item.get("type") or "").strip(),
                 "cliente": str(item.get("customerName") or "").strip(),
                 "cpf_cnpj": str(item.get("customerIdentification") or "").strip(),
                 "emissao": str(item.get("emission") or "").strip(),
+                "cancelada": bool(item.get("canceledXmlFile")) or int(item.get("status") or 0) == 2,
+                "canceled_xml": str(item.get("canceledXmlFile") or "").strip(),
             }
         )
 
@@ -8701,29 +9797,68 @@ def _fetch_minhas_notas_nfes(
     return [dict(item) for item in normalizados]
 
 
-def _match_davs_with_minhas_notas_nfes(
-    davs_sem_cupom: list[dict],
+def _load_minhas_notas_mva_context(
     periodo: str,
-) -> tuple[list[dict], list[dict], str | None]:
+) -> tuple[list[dict], dict[str, dict], str | None]:
     data_iso = _period_to_iso_date(periodo)
-    if not data_iso or not davs_sem_cupom:
-        return list(davs_sem_cupom), [], None
+    if not data_iso:
+        return [], {}, None
 
     credenciais = _load_minhas_notas_credentials()
     if not credenciais:
-        return list(davs_sem_cupom), [], None
+        return [], {}, None
 
     try:
         login, password = credenciais
         access_token = _authenticate_minhas_notas(login, password)
-        nfes = [
-            item
-            for item in _fetch_minhas_notas_nfes(access_token, data_iso, cache_namespace=login)
-            if item.get("status") == 1 and item.get("tipo") == "1"
-        ]
+        nfes_modelo_55 = _fetch_minhas_notas_nfes(
+            access_token,
+            data_iso,
+            model="55",
+            cache_namespace=login,
+        )
+        nfces_modelo_65 = _fetch_minhas_notas_nfes(
+            access_token,
+            data_iso,
+            model="65",
+            cache_namespace=login,
+        )
     except Exception as exc:
-        return list(davs_sem_cupom), [], str(exc)
+        return [], {}, str(exc)
 
+    nfes_ativas = [
+        item
+        for item in nfes_modelo_55
+        if item.get("status") == 1 and item.get("tipo") == "1"
+    ]
+
+    fiscal_status_map: dict[str, dict] = {}
+    for item in sorted(
+        nfces_modelo_65,
+        key=lambda dado: (
+            str(dado.get("numero") or ""),
+            str(dado.get("emissao") or ""),
+        ),
+    ):
+        numero = _normalize_fiscal_number(item.get("numero", ""))
+        if not numero or numero in fiscal_status_map:
+            continue
+        fiscal_status_map[numero] = {
+            "numero": numero,
+            "numero_exibicao": _display_fiscal_number(numero),
+            "valor": round(float(item.get("valor", 0.0) or 0.0), 2),
+            "cancelada": bool(item.get("cancelada")),
+            "status_codigo": int(item.get("status") or 0),
+            "emissao": str(item.get("emissao") or "").strip(),
+        }
+
+    return nfes_ativas, fiscal_status_map, None
+
+
+def _match_davs_with_minhas_notas_nfes_from_items(
+    davs_sem_cupom: list[dict],
+    nfes: list[dict],
+) -> tuple[list[dict], list[dict]]:
     nfes_por_valor = {}
     for item in sorted(
         nfes,
@@ -8755,7 +9890,144 @@ def _match_davs_with_minhas_notas_nfes(
             }
         )
 
+    return restantes, encontrados
+
+
+def _match_davs_with_minhas_notas_nfes(
+    davs_sem_cupom: list[dict],
+    periodo: str,
+) -> tuple[list[dict], list[dict], str | None]:
+    data_iso = _period_to_iso_date(periodo)
+    if not data_iso or not davs_sem_cupom:
+        return list(davs_sem_cupom), [], None
+
+    nfes_ativas, _fiscal_status_map, erro = _load_minhas_notas_mva_context(periodo)
+    if erro:
+        return list(davs_sem_cupom), [], erro
+
+    restantes, encontrados = _match_davs_with_minhas_notas_nfes_from_items(
+        davs_sem_cupom,
+        nfes_ativas,
+    )
     return restantes, encontrados, None
+
+
+def _build_mva_cancelled_coupon_pool(
+    itens_nfce: list[dict],
+    fiscal_status_map: dict[str, dict],
+) -> dict[str, dict]:
+    numeros_presentes = {
+        _normalize_fiscal_number(item.get("numero", ""))
+        for item in itens_nfce or []
+        if _normalize_fiscal_number(item.get("numero", ""))
+    }
+    return {
+        numero: info
+        for numero, info in (fiscal_status_map or {}).items()
+        if numero not in numeros_presentes and bool((info or {}).get("cancelada"))
+    }
+
+
+def _match_davs_with_mva_cancelled_coupons(
+    davs_sem_cupom: list[dict],
+    cancelados_ausentes: dict[str, dict],
+) -> tuple[list[dict], dict[str, dict]]:
+    cancelados_por_valor: dict[float, list[tuple[str, dict]]] = {}
+    for numero, info in sorted(cancelados_ausentes.items(), key=lambda item: int(item[0])):
+        valor = round(float((info or {}).get("valor", 0.0) or 0.0), 2)
+        cancelados_por_valor.setdefault(valor, []).append((numero, info))
+
+    restantes: list[dict] = []
+    cancelados_correspondentes: dict[str, dict] = {}
+    for item in sorted(davs_sem_cupom, key=lambda dado: dado.get("pedido", "")):
+        valor = round(float(item.get("valor", 0.0) or 0.0), 2)
+        candidatos = cancelados_por_valor.get(valor) or []
+        if not candidatos:
+            restantes.append(item)
+            continue
+        numero, info = candidatos.pop(0)
+        cancelados_correspondentes[numero] = info
+
+    return restantes, cancelados_correspondentes
+
+
+def _build_mva_cancelled_coupon_registros(
+    cfs_faltantes: list[str],
+    cancelados_ausentes: dict[str, dict],
+) -> list[dict]:
+    registros: list[dict] = []
+    numeros_registrados: set[str] = set()
+
+    for numero in cfs_faltantes:
+        if not numero or numero in numeros_registrados:
+            continue
+        info = cancelados_ausentes.get(numero) or {}
+        observacao = "Cupom cancelado" if info.get("cancelada") else "Cupom faltante na sequencia"
+        valor = info.get("valor") if info.get("cancelada") else None
+        registros.append(
+            {
+                "numero": numero,
+                "numero_exibicao": f"CF {_display_fiscal_number(numero)}",
+                "origem": "CF",
+                "observacao": observacao,
+                "valor": valor,
+            }
+        )
+        numeros_registrados.add(numero)
+
+    for numero, info in sorted(cancelados_ausentes.items(), key=lambda item: int(item[0])):
+        if numero in numeros_registrados:
+            continue
+        registros.append(
+            {
+                "numero": numero,
+                "numero_exibicao": f"CF {_display_fiscal_number(numero)}",
+                "origem": "CF",
+                "observacao": "Cupom cancelado",
+                "valor": info.get("valor"),
+            }
+        )
+        numeros_registrados.add(numero)
+
+    return registros
+
+
+def _build_cancelados_rows_from_pendencias(pendencias: list[dict]) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for item in pendencias or []:
+        numero_exibicao = str(item.get("numero_exibicao") or item.get("numero") or "-").strip()
+        if numero_exibicao.upper().startswith("CF "):
+            cf_label = numero_exibicao
+        else:
+            cf_label = f"CF {numero_exibicao}"
+        valor = item.get("valor")
+        valor_texto = "-" if valor in (None, "") else f"R$ {format_number_br(valor)}"
+        rows.append((cf_label, valor_texto))
+    return rows
+
+
+def _split_cancelled_payment_items(
+    itens_fechamento: list[dict],
+    fiscal_status_map: dict[str, dict],
+) -> tuple[list[dict], list[dict]]:
+    itens_ativos: list[dict] = []
+    itens_cancelados: list[dict] = []
+    for item in itens_fechamento or []:
+        numero = _normalize_fiscal_number(item.get("numero", "") or item.get("numero_exibicao", ""))
+        if numero and (fiscal_status_map.get(numero) or {}).get("cancelada"):
+            info = fiscal_status_map.get(numero) or {}
+            itens_cancelados.append(
+                {
+                    "numero": numero,
+                    "numero_exibicao": item.get("numero_exibicao")
+                    or info.get("numero_exibicao")
+                    or _display_fiscal_number(numero),
+                    "valor": round(float(item.get("valor_bruto", item.get("valor", 0.0)) or 0.0), 2),
+                }
+            )
+            continue
+        itens_ativos.append(item)
+    return itens_ativos, itens_cancelados
 
 
 def _find_missing_fiscal_numbers(numbers: list[str]) -> list[str]:
@@ -8926,8 +10198,30 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             entry["valor"] = round(float(entry.get("valor") or 0.0) + valor_normalizado, 2)
 
     pedidos_cancelados = []
+    pedidos_cancelados_map: dict[str, dict] = {}
+    pedidos_cancelados_numeros: set[str] = set()
     numeros_pedidos_conferidos = set()
     numeros_pedidos_pendentes = set()
+
+    for item in relatorio_caixa.get("itens_excluidos", []) or []:
+        motivo_item = corrigir_texto(str(item.get("motivo", ""))).strip()
+        documento_item = _normalize_caixa_client(item.get("documento", ""))
+        if "cupom cancelado" not in motivo_item.casefold() and "CANCELADA" not in documento_item:
+            continue
+        numero = _normalize_fiscal_number(item.get("pedido", ""))
+        if not numero or numero in pedidos_cancelados_numeros:
+            continue
+        valor = round(float(item.get("valor", 0.0)), 2)
+        pendencia = {
+            "numero": numero,
+            "numero_exibicao": _display_fiscal_number(numero),
+            "valor": valor,
+            "motivo": motivo_item or "Cupom cancelado",
+        }
+        pedidos_cancelados.append(pendencia)
+        pedidos_cancelados_map[numero] = dict(pendencia)
+        pedidos_cancelados_numeros.add(numero)
+        _add_alert("Cupom cancelado", f"CF {pendencia['numero_exibicao']}: {pendencia['motivo']}", _money_text(valor))
 
     for item in itens_caixa:
         numero = _normalize_fiscal_number(item.get("pedido", ""))
@@ -8951,7 +10245,11 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             "motivo": motivo,
         }
         if (fiscal_status_map.get(numero) or {}).get("cancelada"):
+            if numero in pedidos_cancelados_numeros:
+                continue
             pedidos_cancelados.append(pendencia)
+            pedidos_cancelados_map[numero] = dict(pendencia)
+            pedidos_cancelados_numeros.add(numero)
             _add_alert("Cupom cancelado", f"CF {pendencia['numero_exibicao']}: {motivo}", _money_text(valor))
         else:
             numeros_pedidos_pendentes.add(numero)
@@ -9018,6 +10316,25 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         if not report_fechamento:
             continue
         itens_fechamento = list(report_fechamento.get("itens_autorizados") or [])
+        itens_fechamento, itens_fechamento_cancelados = _split_cancelled_payment_items(
+            itens_fechamento,
+            fiscal_status_map,
+        )
+        for item_cancelado in itens_fechamento_cancelados:
+            numero_cancelado = str(item_cancelado.get("numero") or "")
+            if numero_cancelado in pedidos_cancelados_map:
+                continue
+            pedidos_cancelados_map[numero_cancelado] = {
+                "numero": numero_cancelado,
+                "numero_exibicao": item_cancelado.get("numero_exibicao") or _display_fiscal_number(numero_cancelado),
+                "valor": item_cancelado.get("valor"),
+                "motivo": f"{titulo_pagamento} cancelado permaneceu no fechamento",
+            }
+            _add_alert(
+                "Cupom cancelado",
+                f"CF {pedidos_cancelados_map[numero_cancelado]['numero_exibicao']}: {pedidos_cancelados_map[numero_cancelado]['motivo']}",
+                _money_text(item_cancelado.get("valor")),
+            )
         total_caixa_pagamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
         origem_externa = str((report_externo or {}).get("origem") or "").strip()
         usa_fallback_zweb = origem_externa == "zweb_movimentacoes"
@@ -9038,7 +10355,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             )
             continue
 
-        if usa_fallback_zweb:
+        if False and usa_fallback_zweb:
             _add_alert(
                 "Origem alternativa",
                 f"{titulo_pagamento}: valor confirmado via Financeiro > Movimentações do Zweb, sem relatório da Caixa/Azulzinha.",
@@ -9062,6 +10379,12 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             - sum(float(item.get(campo_valor, 0.0) or 0.0) for item, _nf in _matched_nf),
             2,
         )
+        if usa_fallback_zweb:
+            _add_alert(
+                "Origem alternativa",
+                f"{titulo_pagamento}: valor confirmado via Financeiro > MovimentaÃ§Ãµes do Zweb, sem relatÃ³rio da Caixa/Azulzinha.",
+                f"R$ {format_number_br(total_pagamentos)}",
+            )
         status_correlacao = "Finalizado" if abs(total_caixa_pagamento - total_pagamentos) < 0.01 else "Divergente"
         if usa_fallback_zweb:
             status_correlacao = f"{status_correlacao} (Financeiro Zweb)"
@@ -9168,12 +10491,14 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                     )
                 )
 
+    pedidos_cancelados = list(pedidos_cancelados_map.values())
     registros = list(registros_map.values())
-    valor_canceladas_ignoradas = round(sum(item.get("valor", 0.0) for item in pedidos_cancelados), 2)
-    valor_faltantes = round(
+    valor_canceladas_pendentes = round(sum(item.get("valor", 0.0) for item in pedidos_cancelados), 2)
+    valor_registros_pendentes = round(
         sum(float(item.get("valor", 0.0)) for item in registros if item.get("valor") not in (None, "")),
         2,
     )
+    valor_faltantes = round(valor_registros_pendentes + valor_canceladas_pendentes, 2)
     total_caixa = round(float(relatorio_caixa.get("total_caixa", 0.0)), 2)
     total_resumo = round(float(relatorio_nfce.get("total_nfce", 0.0)), 2)
 
@@ -9202,17 +10527,20 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             )
             for item in card_machine_only
         ],
+        cancelados_rows=_build_cancelados_rows_from_pendencias(pedidos_cancelados),
     )
     if alertas_report:
         alertas_report["hidden_in_menu"] = True
         alertas_report["summary_items"] = [
             ("Per?odo", str(relatorio_caixa.get("periodo") or "N?o identificado")),
-            ("Pend?ncias", str(len(alert_rows))),
+            ("Pend?ncias", str(_count_visible_alert_rows(alertas_report))),
             ("Total Pend?ncias", f"R$ {format_number_br(valor_faltantes)}"),
         ]
         alertas_report["correlacao_rows"] = correlacao_rows
         alertas_report["valor_total_vendas"] = total_caixa
         alertas_report["valor_pendente"] = valor_faltantes
+        alertas_report["hidden_pending_count"] = 0
+        alertas_report["hidden_pending_value"] = 0.0
         alertas_report["texto_informativo"] = ""
         relatorios_pagamento[alertas_report["categoria"]] = alertas_report
         for key in (
@@ -9227,7 +10555,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 relatorios_pagamento[key]["hidden_in_menu"] = True
 
     status = "Confere"
-    if registros or any(row for row in alert_rows if row[0] not in {"Cupom cancelado"}):
+    if registros or alert_rows:
         status = "Faltante"
     if alertas_report:
         alertas_report["status"] = status
@@ -9250,7 +10578,9 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         "valor_faltantes": valor_faltantes,
         "status": status,
         "canceladas_ignoradas_count": len(pedidos_cancelados),
-        "canceladas_ignoradas_valor": valor_canceladas_ignoradas,
+        "canceladas_ignoradas_valor": valor_canceladas_pendentes,
+        "canceladas_pendentes_count": len(pedidos_cancelados),
+        "canceladas_pendentes_valor": valor_canceladas_pendentes,
         "avisos_usuario": list(relatorio_nfce.get("avisos_usuario") or []),
         "relatorios_pagamento": relatorios_pagamento,
         "alertas_count": len(alert_rows),
@@ -9365,8 +10695,16 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
     itens_caixa = relatorio_caixa.get("itens_caixa", [])
     itens_nfce = relatorio_fechamento.get("nfces", [])
     relatorios_pagamento = dict(relatorio_fechamento.get("relatorios_pagamento") or {})
+    _nfes_ativas, fiscal_status_map_mva, erro_minhas_notas = _load_minhas_notas_mva_context(
+        relatorio_caixa.get("periodo", "")
+    )
 
     davs_sem_cupom = _infer_mva_davs_sem_cupom(itens_caixa, itens_nfce)
+    cancelados_ausentes = _build_mva_cancelled_coupon_pool(itens_nfce, fiscal_status_map_mva)
+    davs_sem_cupom, _cancelados_correspondentes = _match_davs_with_mva_cancelled_coupons(
+        davs_sem_cupom,
+        cancelados_ausentes,
+    )
     cfs_faltantes = sorted(
         {
             _normalize_fiscal_number(numero)
@@ -9388,23 +10726,35 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
                 "valor": round(float(item.get("valor", 0.0)), 2),
             }
         )
-    for numero in cfs_faltantes:
-        registros.append(
-            {
-                "numero": numero,
-                "numero_exibicao": f"CF {_display_fiscal_number(numero)}",
-                "origem": "CF",
-                "observacao": "Cupom faltante na sequência",
-                "valor": None,
-            }
+    registros.extend(
+        _build_mva_cancelled_coupon_registros(
+            cfs_faltantes,
+            cancelados_ausentes,
         )
+    )
+    cupons_cancelados = [
+        item for item in registros
+        if item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado"
+    ]
+    registros_alerta = [
+        item for item in registros
+        if not (item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado")
+    ]
+
+    cancelados_pagamento_map = {str(item.get("numero") or ""): dict(item) for item in cupons_cancelados}
 
     correlacao_rows = []
     pix_fechamento_only: list[dict] = []
     pix_machine_only: list[dict] = []
     card_fechamento_only: list[dict] = []
     card_machine_only: list[dict] = []
-    alert_rows: list[tuple[str, str, str]] = _build_mva_conferencia_observation_rows(registros)
+    alert_rows: list[tuple[str, str, str]] = _build_mva_conferencia_observation_rows(registros_alerta)
+    if erro_minhas_notas:
+        avisos_minhas_notas = [
+            "Nao foi possivel consultar o status dos cupons da MVA no Minhas Notas nesta analise."
+        ]
+    else:
+        avisos_minhas_notas = []
 
     dinheiro_report = relatorios_pagamento.get("dinheiro") or {}
     dinheiro_total = round(float(dinheiro_report.get("total_autorizado", 0.0) or 0.0), 2)
@@ -9440,6 +10790,26 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         if not report_fechamento:
             continue
         itens_fechamento = list(report_fechamento.get("itens_autorizados") or [])
+        itens_fechamento, itens_fechamento_cancelados = _split_cancelled_payment_items(
+            itens_fechamento,
+            fiscal_status_map_mva,
+        )
+        for item_cancelado in itens_fechamento_cancelados:
+            numero_cancelado = str(item_cancelado.get("numero") or "")
+            if numero_cancelado not in cancelados_pagamento_map:
+                cancelados_pagamento_map[numero_cancelado] = {
+                    "numero": numero_cancelado,
+                    "numero_exibicao": item_cancelado.get("numero_exibicao") or _display_fiscal_number(numero_cancelado),
+                    "valor": item_cancelado.get("valor"),
+                    "observacao": "Cupom cancelado",
+                }
+                alert_rows.append(
+                    (
+                        "Cupom cancelado",
+                        f"{titulo_pagamento}: CF {cancelados_pagamento_map[numero_cancelado]['numero_exibicao']} cancelado permaneceu no fechamento",
+                        f"R$ {format_number_br(item_cancelado.get('valor', 0.0))}",
+                    )
+                )
         itens_externos = list((report_externo or {}).get("itens_autorizados") or [])
         total_fechamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
         total_externo = round(float((report_externo or {}).get("total_autorizado", 0.0) or 0.0), 2)
@@ -9484,6 +10854,9 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
                 card_machine_only.append(payload)
 
         for item in fechamento_sem_externo:
+            numero = _normalize_fiscal_number(item.get("numero", "") or item.get("numero_exibicao", ""))
+            if numero and (fiscal_status_map_mva.get(numero) or {}).get("cancelada"):
+                continue
             valor = round(float(item.get("valor_bruto", 0.0)), 2)
             payload = {
                 "titulo": titulo_pagamento,
@@ -9528,6 +10901,21 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             )
         )
 
+    cancelados_visiveis = list(cancelados_pagamento_map.values())
+    numeros_cancelados_registro = {
+        str(item.get("numero") or "")
+        for item in cupons_cancelados
+        if str(item.get("numero") or "")
+    }
+    valor_cancelados_pagamento_adicionais = round(
+        sum(
+            float(item.get("valor", 0.0) or 0.0)
+            for item in cancelados_visiveis
+            if str(item.get("numero") or "") not in numeros_cancelados_registro
+        ),
+        2,
+    )
+
     alertas_report = _build_eh_alerts_report(
         relatorio_caixa.get("periodo"),
         alert_rows,
@@ -9547,6 +10935,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             (str(item.get("titulo") or "Cartão"), str(item.get("data_venda") or "-"), f"R$ {format_number_br(item.get('valor', 0.0))}")
             for item in card_machine_only
         ],
+        cancelados_rows=_build_cancelados_rows_from_pendencias(cancelados_visiveis),
         allow_empty=True,
     )
 
@@ -9560,7 +10949,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         sum(float(item.get("valor", 0.0)) for item in pix_fechamento_only + card_fechamento_only + pix_machine_only + card_machine_only),
         2,
     )
-    valor_faltantes = round(valor_davs_pendentes + valor_banco_pendente, 2)
+    valor_faltantes = round(valor_davs_pendentes + valor_banco_pendente + valor_cancelados_pagamento_adicionais, 2)
 
     if alertas_report:
         alertas_report["hidden_in_menu"] = True
@@ -9570,6 +10959,10 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             ("Pendências", str(len(alert_rows))),
             ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
         ]
+        alertas_report["summary_items"][1] = (
+            str(alertas_report["summary_items"][1][0]),
+            str(_count_visible_alert_rows(alertas_report)),
+        )
         alertas_report["correlacao_rows"] = correlacao_rows
         alertas_report["valor_total_vendas"] = total_caixa
         alertas_report["valor_pendente"] = valor_faltantes
@@ -9591,10 +10984,19 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         alertas_report["status"] = status
 
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
+    cupons_cancelados = [
+        item for item in registros
+        if item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado"
+    ]
+    subtitle = str(relatorio_fechamento.get("subtitle") or "").strip()
+    if cupons_cancelados:
+        subtitle = (
+            (subtitle + " ") if subtitle else ""
+        ) + f"Cupons cancelados identificados no Minhas Notas: {len(cupons_cancelados)}."
     return {
         "fechamento_modelo": "MVA",
         "caixa_modelo": "MVA",
-        "subtitle": relatorio_fechamento.get("subtitle"),
+        "subtitle": subtitle,
         "arquivo_caixa": relatorio_caixa.get("arquivo"),
         "arquivo_resumo": relatorio_fechamento.get("arquivo"),
         "arquivo_resumo_titulo": relatorio_fechamento.get("arquivo_resumo_titulo") or "Arquivo Fechamento",
@@ -9607,6 +11009,11 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         "faltantes_titulo": "DAVs/CF faltantes",
         "valor_faltantes": valor_faltantes,
         "status": status,
+        "cupons_cancelados_count": len(cupons_cancelados),
+        "cupons_cancelados_valor": round(
+            sum(float(item.get("valor", 0.0) or 0.0) for item in cupons_cancelados),
+            2,
+        ),
         "secao_titulo": "DAVs/CF para conferência",
         "empty_message": "Nenhum DAV/CF faltante encontrado.",
         "registros_conferencia": sorted(
@@ -9618,7 +11025,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         ),
         "relatorios_pagamento": relatorios_pagamento,
         "alertas_count": len(alert_rows),
-        "avisos_usuario": list(relatorio_fechamento.get("avisos_usuario") or []),
+        "avisos_usuario": list(relatorio_fechamento.get("avisos_usuario") or []) + avisos_minhas_notas,
     }
 
 
@@ -9635,9 +11042,20 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
     ]
 
     davs_sem_cupom = _infer_mva_davs_sem_cupom(itens_caixa, itens_nfce)
-    davs_sem_cupom, nfes_identificadas, erro_minhas_notas = _match_davs_with_minhas_notas_nfes(
+    nfes_ativas, fiscal_status_map_mva, erro_minhas_notas = _load_minhas_notas_mva_context(
+        relatorio_caixa.get("periodo", "")
+    )
+    if nfes_ativas:
+        davs_sem_cupom, nfes_identificadas = _match_davs_with_minhas_notas_nfes_from_items(
+            davs_sem_cupom,
+            nfes_ativas,
+        )
+    else:
+        nfes_identificadas = []
+    cancelados_ausentes = _build_mva_cancelled_coupon_pool(itens_nfce, fiscal_status_map_mva)
+    davs_sem_cupom, _cancelados_correspondentes = _match_davs_with_mva_cancelled_coupons(
         davs_sem_cupom,
-        relatorio_caixa.get("periodo", ""),
+        cancelados_ausentes,
     )
     cfs_faltantes = sorted(
         {
@@ -9660,22 +11078,26 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
                 "valor": round(float(item.get("valor", 0.0)), 2),
             }
         )
-    for numero in cfs_faltantes:
-        registros.append(
-            {
-                "numero": numero,
-                "numero_exibicao": f"CF {_display_fiscal_number(numero)}",
-                "origem": "CF",
-                "observacao": "Cupom faltante na sequencia",
-                "valor": None,
-            }
+    registros.extend(
+        _build_mva_cancelled_coupon_registros(
+            cfs_faltantes,
+            cancelados_ausentes,
         )
+    )
 
     total_caixa = round(sum(float(item.get("valor", 0.0)) for item in itens_cupom_base), 2)
     total_resumo = round(float(relatorio_nfce.get("total_nfce", 0.0)), 2)
+    cupons_cancelados = [
+        item for item in registros
+        if item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado"
+    ]
+    valor_cupons_cancelados = round(
+        sum(float(item.get("valor", 0.0) or 0.0) for item in cupons_cancelados),
+        2,
+    )
     if nfes_identificadas:
         valor_faltantes = round(
-            sum(float(item.get("valor", 0.0)) for item in davs_sem_cupom),
+            sum(float(item.get("valor", 0.0)) for item in davs_sem_cupom) + valor_cupons_cancelados,
             2,
         )
     else:
@@ -9689,10 +11111,16 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         subtitle += (
             f" NF-e identificadas automaticamente no Minhas Notas: {len(nfes_identificadas)}."
         )
+    if cupons_cancelados:
+        subtitle += f" Cupons cancelados identificados no Minhas Notas: {len(cupons_cancelados)}."
     elif erro_minhas_notas:
         subtitle += " Consulta ao Minhas Notas indisponivel nesta analise."
 
-    alert_rows = _build_mva_conferencia_observation_rows(registros)
+    registros_alerta = [
+        item for item in registros
+        if not (item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado")
+    ]
+    alert_rows = _build_mva_conferencia_observation_rows(registros_alerta)
     if erro_minhas_notas:
         alert_rows.append(("Minhas Notas", "Consulta indisponível nesta análise.", "-"))
 
@@ -9700,6 +11128,7 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
     alertas_report = _build_eh_alerts_report(
         relatorio_caixa.get("periodo"),
         alert_rows,
+        cancelados_rows=_build_cancelados_rows_from_pendencias(cupons_cancelados),
         allow_empty=False,
     )
     if alertas_report:
@@ -9710,6 +11139,10 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
             ("Pendências", str(len(alert_rows))),
             ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
         ]
+        alertas_report["summary_items"][1] = (
+            str(alertas_report["summary_items"][1][0]),
+            str(_count_visible_alert_rows(alertas_report)),
+        )
         alertas_report["correlacao_rows"] = []
         alertas_report["valor_total_vendas"] = total_caixa
         alertas_report["valor_pendente"] = valor_faltantes
@@ -9737,6 +11170,8 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
             sum(float(item.get("valor", 0.0)) for item in nfes_identificadas),
             2,
         ),
+        "cupons_cancelados_count": len(cupons_cancelados),
+        "cupons_cancelados_valor": valor_cupons_cancelados,
         "status": status,
         "secao_titulo": "DAVs/CF para conferência",
         "empty_message": "Nenhum DAV/CF faltante encontrado.",
@@ -9750,6 +11185,11 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         "relatorios_pagamento": relatorios_pagamento,
         "nfes_identificadas": nfes_identificadas,
         "erro_minhas_notas": erro_minhas_notas,
+        "avisos_usuario": (
+            ["Nao foi possivel consultar o status dos cupons da MVA no Minhas Notas nesta analise."]
+            if erro_minhas_notas
+            else []
+        ),
     }
 
 

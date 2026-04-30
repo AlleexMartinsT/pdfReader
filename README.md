@@ -58,6 +58,9 @@ Desktop application for reconciling sales reports from two business flows:
 - Auto-generated EH reports such as downloaded Caixa/Azulzinha files and saved Zweb HTML exports are now deleted automatically when the app closes, so the workspace does not accumulate `_auto` files between sessions.
 - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.
 - The main window now includes a cashier automation controller beside `Cancel`; while enabled, it runs the same-day morning flow at `13:30` and the same-day afternoon flow at `18:10`, and it still sends only the resulting `Fechamento de Caixa` reports straight to the Windows default printer.
+- The main window now uses an operations-dashboard layout with a grouped sidebar, status cards, a dedicated control strip, and a stacked content area for tables/graphs.
+- The cashier report dialog now uses a denser card-based layout with a header badge, scope/status chips, section cards, and scrollable tabs.
+- Read-only cashier/report tables now render through Qt model/view `QTableView` models, and the static report tabs are built lazily on first open to keep the UI more responsive.
 - The same automation can now be triggered from the UI with a 5-second test countdown, using the same direct-print flow as the scheduled run without an intermediate preview.
 - If the default printer is unavailable during an automatic cashier print, the app now keeps the ready HTML print job as pending, exposes per-company pending-print buttons in the UI, and retries again at `08:00` on the next day while automation remains enabled.
 - Automatic cashier printing now reuses the stable A4 `QTextDocument.print_` path, preserving the expected page size instead of shrinking the report during silent printing.
@@ -179,6 +182,9 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
   - O navegador da Caixa/Azulzinha agora abre em janela visivel durante a automacao, para que o usuario possa inspecionar o fluxo do portal quando precisar.
   - O fluxo agora so entra na etapa de token quando a interface real de token ou de entrega estiver visivel, evitando saltos falsos para fora da tela de login.
 - A janela principal agora tem um controlador de automacao do caixa ao lado de `Cancelar`; quando ligado, ele roda o fechamento da manha no mesmo dia as `13:30` e o da tarde no mesmo dia as `18:10`, e continua enviando apenas os relatorios de `Fechamento de Caixa` direto para a impressora padrao do Windows.
+- A janela principal agora usa um layout de hub operacional, com barra lateral agrupada, cards de status, faixa dedicada de controle e area central empilhada para tabelas/graficos.
+- O dialogo de `Caixa` agora usa um layout mais denso baseado em cards, com badge da empresa, chips de escopo/status, secoes em cards e abas rolaveis.
+- As tabelas somente leitura de `Caixa`/relatorios agora usam `QTableView` no modelo view/model do Qt, e as abas estaticas do relatorio passam a ser montadas sob demanda na primeira abertura para manter a interface mais responsiva.
 - O mesmo fluxo de automacao agora pode ser disparado pela interface com um teste de 5 segundos, usando a mesma impressao direta da agenda e sem preview intermediario.
 - Se a impressora padrao nao estiver disponivel durante a impressao automatica do caixa, o app agora guarda o HTML pronto como impressao pendente, mostra botoes pendentes por empresa na interface e tenta novamente no dia seguinte as `08:00` enquanto a automacao estiver ligada.
 - Se os arquivos-base da MVA ainda estiverem faltando em um desses horarios, o app agora deixa um botao pendente especifico de manha/tarde na interface e mesmo assim adianta o download dos pagamentos da Caixa/Azulzinha da MVA.

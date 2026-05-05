@@ -35,7 +35,7 @@ from global_vars import (
     GMAIL_OAUTH_CLIENT_ID, GMAIL_OAUTH_CLIENT_SECRET,
 ) 
 
-# ConfiguraÃ§Ã£o de logging mais leve (somente avisos e erros)
+# Configuração de logging mais leve (somente avisos e erros)
 progress_queue = queue.Queue()
 cancel_event = threading.Event()
 LAST_STATE_SPREADSHEET = {}
@@ -139,8 +139,8 @@ def corrigir_estrutura_texto(valor):
 
 
 # Compatibilidade com chamadas legadas.
-globals()["corrigirCodifica\u00e7\u00e3o"] = corrigir_texto
-globals()[corrigir_texto("corrigirCodifica????o")] = corrigir_texto
+globals()["corrigirCodificação"] = corrigir_texto
+globals()["corrigirCodifica\u00c3\u00a7\u00c3\u00a3o"] = corrigir_texto
 
 
 def _empty_caixa_report(caminho_pdf: str, pdf_info: dict | None = None) -> dict:
@@ -232,7 +232,7 @@ def _extract_sale_date(line: str) -> str | None:
         return None
 
     lowered = line.lower()
-    if " ate " in lowered or " atÃ© " in lowered:
+    if " ate " in lowered or " até " in lowered:
         return None
 
     return match.group().strip()
@@ -259,7 +259,7 @@ def process_cancel():
         except queue.Empty:
             break
     set_btn_cancel()
-    # ðŸ”¹ Reseta barra
+    # 🔹 Reseta barra
     progress_var = _UI_REFS.get("progress_var")
     progress_bar = _UI_REFS.get("progress_bar")
     progress_var_online = _UI_REFS.get("progress_var_online")
@@ -314,7 +314,7 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
     try:
         kind, payload = progress_queue.get_nowait()
     except queue.Empty:
-        # Agenda a prÃ³xima checagem em 50ms (menos carga na CPU/UI)
+        # Agenda a próxima checagem em 50ms (menos carga na CPU/UI)
         root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, label_files_var, path_var))
         return
 
@@ -330,12 +330,12 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
         path_var = payload.get("caminho")
 
         if not isinstance(results, dict):
-            messagebox.showerror("Erro", "Resultado inv?lido do processamento.")
+            messagebox.showerror("Erro", "Resultado inválido do processamento.")
             return
 
         if results.get("__cancelled__"):
             progress_var.set(0)
-            messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuÃ¡rio.")
+            messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
             return
         if results.get("__empty__"):
             progress_var.set(0)
@@ -364,10 +364,10 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
         list_results.append(results)
 
         # atualiza a interface (label e tree)
-        label_files_var.set(f"Arquivo carregado: {os.path.basename(path_var)} ({source})")
+        label_files_var.set(f"{os.path.basename(path_var)} ({source})")
         tree_update(tree)
         _scroll_tree_to_top(tree)
-        messagebox.showinfo("Conclu?do", f"Processamento finalizado ({source})!")
+        messagebox.showinfo("Concluído", f"Processamento finalizado ({source})!")
         for vendedor in results.keys():
             registrar_vendedor_db(vendedor)
 
@@ -376,7 +376,7 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
         messagebox.showerror("Erro", payload)
         return
 
-    # Sempre agenda a prÃ³xima checagem, exceto se houve erro (onde damos return acima)
+    # Sempre agenda a próxima checagem, exceto se houve erro (onde damos return acima)
     root.after(50, lambda: _poll_queue(root, tree, progress_var, progress_bar, label_files_var, path_var))
 
 def _project_base_dir() -> str:
@@ -398,7 +398,7 @@ def _project_base_dir() -> str:
 def resource_path(relative_path): 
     import sys
 
-    """Retorna o caminho absoluto do recurso, compatÃ­vel com PyInstaller."""
+    """Retorna o caminho absoluto do recurso, compatível com PyInstaller."""
     preferred_base = _project_base_dir()
     preferred_path = os.path.join(preferred_base, relative_path)
     if os.path.exists(preferred_path):
@@ -413,7 +413,7 @@ def load_mapping(path='mapping.json'):
   
     full_path = resource_path(path)
     if not os.path.exists(full_path):
-        raise FileNotFoundError(f"Arquivo de mapeamento nÃ£o encontrado: {full_path}")
+        raise FileNotFoundError(f"Arquivo de mapeamento não encontrado: {full_path}")
     with open(full_path, 'r', encoding='utf-8') as f:
         mp = json.load(f)
     return {k.strip().upper(): v.strip() for (k, v) in mp.items()}
@@ -429,7 +429,7 @@ def _ensure_mapping_loaded():
         CANON_BY_VALUE_UPPER = {v.upper(): v for v in mapping.values()}
 
 def save_mapping(): 
-    """Salva o mapeamento atualizado no arquivo do usuÃ¡rio."""
+    """Salva o mapeamento atualizado no arquivo do usuário."""
     appdata_dir = os.path.join(os.getenv("APPDATA"), "RelatorioClientes")
     os.makedirs(appdata_dir, exist_ok=True)
     user_json = os.path.join(appdata_dir, "mapping.json")
@@ -439,10 +439,10 @@ def save_mapping():
 def _normalize_key(s: str) -> str:
     if not s:
         return ""
-    s = s.replace('\u00A0', ' ')                # NBSP -> espaÃ§o
-    s = re.sub(r"^\s*\d+\s*", "", s)            # remove prefixo numÃ©rico "14 C O" -> "C O"
-    s = re.sub(r"\s+", " ", s)                  # espaÃ§os mÃºltiplos
-    s = s.replace("â€“", "-").replace("â€”", "-")   # normaliza hifens
+    s = s.replace('\u00A0', ' ')                # NBSP -> espaço
+    s = re.sub(r"^\s*\d+\s*", "", s)            # remove prefixo numérico "14 C O" -> "C O"
+    s = re.sub(r"\s+", " ", s)                  # espaços múltiplos
+    s = s.replace("–", "-").replace("—", "-")   # normaliza hifens
     return s.strip().upper()
 
 def parse_number(num_str: str) -> float:
@@ -456,7 +456,7 @@ def parse_number(num_str: str) -> float:
     if not s:
         return 0.0
 
-    s = s.replace("R$", "").replace(" ", "").replace("Â ", "")
+    s = s.replace("R$", "").replace(" ", "").replace(" ", "")
     last_comma = s.rfind(",")
     last_dot = s.rfind(".")
 
@@ -1160,10 +1160,10 @@ def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict
                     continue
 
                 if detected_date and detected_date != data_br:
-                    tipo = "PIX" if report_kind.startswith("pix") else "cart?es"
+                    tipo = "PIX" if report_kind.startswith("pix") else "cartões"
                     avisos.append(
-                        f'O arquivo "{path.name}" foi identificado como relat?rio de {tipo}, mas o conte?do ? de {detected_date} e n?o de {data_br}. '
-                        f'Ele foi ignorado.'
+                        f'O arquivo "{path.name}" foi identificado como relatório de {tipo}, mas o conteúdo é de {detected_date} e não de {data_br}. '
+                        "Ele foi ignorado."
                     )
                     continue
 
@@ -1452,7 +1452,7 @@ def _get_gmail_api_credentials(on_status=None):
     creds = flow.run_local_server(
         host="127.0.0.1",
         port=0,
-        authorization_prompt_message="Abra o link abaixo no navegador para autorizar o Gmail, se ele nao abrir sozinho:\n{url}",
+        authorization_prompt_message="Abra o link abaixo no navegador para autorizar o Gmail, se ele não abrir sozinho:\n{url}",
         success_message="Autorizacao do Gmail concluida. Pode voltar ao aplicativo.",
         open_browser=True,
     )
@@ -1772,7 +1772,7 @@ def _fetch_fiserv_token_from_gmail(
                         if not older_than_rejected_logged:
                             _emit_pix_status(
                                 on_status,
-                                "O codigo disponivel e mais antigo que o rejeitado; aguardando um e-mail mais novo.",
+                                "O código disponível é mais antigo que o rejeitado; aguardando um e-mail mais novo.",
                             )
                             older_than_rejected_logged = True
                         continue
@@ -1806,7 +1806,7 @@ def _fetch_fiserv_token_from_gmail(
             time.sleep(wait_seconds)
     except Exception as exc:
         last_error = exc
-        _emit_pix_status(on_status, f"Nao foi possivel ler o token no Gmail via OAuth: {exc}")
+        _emit_pix_status(on_status, f"Não foi possível ler o token no Gmail via OAuth: {exc}")
 
     import email
     import imaplib
@@ -1895,7 +1895,7 @@ def _fetch_fiserv_token_from_gmail(
                             if not ignored_rejected_logged:
                                 _emit_pix_status(
                                     on_status,
-                                    "O token retornado via IMAP ja foi descartado; aguardando um novo codigo.",
+                                    "O token retornado via IMAP já foi descartado; aguardando um novo código.",
                                 )
                                 ignored_rejected_logged = True
                             continue
@@ -1905,7 +1905,7 @@ def _fetch_fiserv_token_from_gmail(
                             if not older_than_rejected_logged:
                                 _emit_pix_status(
                                     on_status,
-                                    "O codigo encontrado via IMAP e mais antigo que o rejeitado; aguardando um e-mail mais novo.",
+                                    "O código encontrado via IMAP é mais antigo que o rejeitado; aguardando um e-mail mais novo.",
                                 )
                                 older_than_rejected_logged = True
                             continue
@@ -1948,7 +1948,7 @@ def _fetch_fiserv_token_from_gmail(
     if fallback_recent_token and not allow_recent_fallback:
         _emit_pix_status(
             on_status,
-            "Nenhum token novo chegou a tempo; codigos antigos nao serao reutilizados nesta tentativa.",
+            "Nenhum token novo chegou a tempo; códigos antigos não serão reutilizados nesta tentativa.",
         )
         fallback_recent_token = None
 
@@ -1968,9 +1968,8 @@ def _wait_for_downloaded_report(
     started_at: float,
     timeout: float = 90.0,
 ) -> str | None:
-    deadline = time.time() + timeout
-    suffixes = ("*.csv", "*.xlsx", "*.crdownload") if kind == "pix" else ("*.pdf", "*.xlsx", "*.crdownload")
-    while time.time() < deadline:
+    def _find_once() -> str | None:
+        suffixes = ("*.csv", "*.xlsx", "*.crdownload") if kind == "pix" else ("*.pdf", "*.xlsx", "*.crdownload")
         for pattern in suffixes:
             candidates = sorted(
                 Path(download_dir).glob(pattern),
@@ -2010,6 +2009,16 @@ def _wait_for_downloaded_report(
                         return _finalize_local_report_path(path)
                 except Exception:
                     continue
+        return None
+
+    found = _find_once()
+    if found:
+        return found
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = _find_once()
+        if found:
+            return found
         time.sleep(0.6)
     return None
 
@@ -2197,7 +2206,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
         return {
             "pix": None,
             "cartoes": None,
-            "avisos": [f"As credenciais da Azulzinha/Caixa da {company_label} nao foram encontradas no credenciais.txt ou passo-a-passo.txt."],
+            "avisos": [f"As credenciais da Azulzinha/Caixa da {company_label} não foram encontradas no credenciais.txt ou passo-a-passo.txt."],
         }
 
     navegador = _find_chromium_browser_path()
@@ -2205,7 +2214,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
         return {
             "pix": None,
             "cartoes": None,
-            "avisos": ["Nenhum navegador Chromium compativel foi encontrado para baixar os relatorios da Azulzinha/Caixa."],
+            "avisos": ["Nenhum navegador Chromium compatível foi encontrado para baixar os relatórios da Azulzinha/Caixa."],
         }
 
     download_dir = _active_report_dir()
@@ -2223,13 +2232,18 @@ def baixar_relatorios_caixa_eh_azulzinha(
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
         "--disable-component-update",
         "--disable-popup-blocking",
         "--disable-notifications",
+        "--disable-renderer-backgrounding",
         "--deny-permission-prompts",
         "--disable-save-password-bubble",
         "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication",
         "--window-size=1400,900",
+        "--window-position=-32000,0",
+        "--start-minimized",
         "--disable-gpu",
         "about:blank",
     ]
@@ -2244,7 +2258,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
         meta = _wait_for_devtools_ready(port)
         ws_url = str(meta.get("webSocketDebuggerUrl") or "").strip()
         if not ws_url:
-            raise RuntimeError("Nao foi possivel conectar ao Chromium para acessar a Azulzinha/Caixa.")
+            raise RuntimeError("Não foi possível conectar ao Chromium para acessar a Azulzinha/Caixa.")
 
         async with websockets.connect(ws_url, max_size=50_000_000) as conn:
             next_id = 0
@@ -2477,6 +2491,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 session_id: str,
                 kind: str,
                 event_start_index: int,
+                started_at: float,
                 timeout: float = 40.0,
             ) -> str | None:
                 seen_candidates: list[dict[str, object]] = []
@@ -2494,7 +2509,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 or any(token in suggested for token in ("csv", "xlsx", "pix"))
                                 or "pix" in url
                             )
-                        return suggested.endswith(".pdf") or "pdf" in suggested or "historico" in url
+                        return (
+                            suggested.endswith((".pdf", ".xlsx"))
+                            or any(token in suggested for token in ("pdf", "xlsx", "historico", "vendas"))
+                            or any(token in url for token in ("historico", "export", "download", "screenservices", "gerar", "arquivo"))
+                        )
                     if method == "Network.requestWillBeSent":
                         if str(message.get("sessionId") or "") != str(session_id):
                             return False
@@ -2509,7 +2528,10 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 or "gerar" in url
                                 or "arquivo" in url
                             )
-                        return "historico" in url and ("export" in url or "download" in url or "pdf" in url)
+                        return (
+                            "historico" in url
+                            or any(token in url for token in ("export", "download", "screenservices", "gerar", "arquivo"))
+                        )
                     if method != "Network.responseReceived":
                         return False
                     if str(message.get("sessionId") or "") != str(session_id):
@@ -2533,9 +2555,14 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         )
                     return (
                         "application/pdf" in mime_type
+                        or "application/json" in mime_type
+                        or "spreadsheet" in mime_type
+                        or "excel" in mime_type
                         or ".pdf" in url
+                        or ".xlsx" in content_disposition
                         or "pdf" in content_disposition
-                        or ("historico" in url and ("export" in url or "download" in url))
+                        or ("historico" in url)
+                        or ("export" in url or "download" in url or "screenservices" in url or "gerar" in url or "arquivo" in url)
                     )
 
                 deadline = time.time() + timeout
@@ -2609,6 +2636,20 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     return None
 
                 while time.time() < deadline:
+                    current_state = await get_portal_state_v2(session_id, timeout=5.0)
+                    if current_state == "portal_error":
+                        raise RuntimeError(
+                            f"A Caixa abriu a página de erro ao gerar o relatório de {'cartões' if kind == 'cartoes' else 'PIX'}."
+                        )
+                    quick_found = _wait_for_downloaded_report(
+                        browser_download_dir,
+                        data_br,
+                        kind,
+                        started_at,
+                        timeout=0.0,
+                    )
+                    if quick_found:
+                        return _persist_downloaded_report(quick_found, kind)
                     direct_saved = await try_browser_export_urls()
                     if direct_saved:
                         return direct_saved
@@ -2948,10 +2989,10 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 except Exception:
                     pass
                 if last_state == "missing-tab":
-                    raise RuntimeError(f"Nao foi possivel localizar a aba {tab_id} no portal Azulzinha/Caixa.")
+                    raise RuntimeError(f"Não foi possível localizar a aba {tab_id} no portal Azulzinha/Caixa.")
                 if last_state == "missing-button":
-                    raise RuntimeError(f"Nao foi possivel localizar o botao da aba {tab_id} no portal Azulzinha/Caixa.")
-                raise RuntimeError(f"Nao foi possivel abrir a aba {tab_id} no portal Azulzinha/Caixa.")
+                    raise RuntimeError(f"Não foi possível localizar o botão da aba {tab_id} no portal Azulzinha/Caixa.")
+                raise RuntimeError(f"Não foi possível abrir a aba {tab_id} no portal Azulzinha/Caixa.")
 
             async def wait_for_portal_settle(
                 session_id: str,
@@ -3113,7 +3154,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
 
             async def insert_text(session_id: str, selector: str, text: str) -> None:
                 if not await focus_selector(session_id, selector):
-                    raise RuntimeError(f"Nao foi possivel localizar o campo {selector} na Azulzinha/Caixa.")
+                    raise RuntimeError(f"Não foi possível localizar o campo {selector} na Azulzinha/Caixa.")
                 for char in str(text or ""):
                     await cdp("Input.insertText", {"text": char}, session_id=session_id)
                     await asyncio.sleep(0.04)
@@ -3272,7 +3313,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             debug_path.write_text(str(html_debug), encoding="utf-8")
                     except Exception:
                         pass
-                    raise RuntimeError("Nao foi possivel preencher a data no portal Azulzinha/Caixa.")
+                    raise RuntimeError("Não foi possível preencher a data no portal Azulzinha/Caixa.")
                 await eval_js(
                     session_id,
                     """
@@ -3441,7 +3482,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     await asyncio.sleep(0.5)
                 if found_filter:
                     raise RuntimeError(
-                        f"A Caixa nao concluiu a aplicacao do filtro de estabelecimentos na aba {tab_id}."
+                        f"A Caixa não concluiu a aplicação do filtro de estabelecimentos na aba {tab_id}."
                     )
                 return False
 
@@ -3929,7 +3970,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 if clicked_generate:
                                     await asyncio.sleep(1.0)
                                     return
-                                raise RuntimeError("Nao foi possivel confirmar a geracao do arquivo PIX na Azulzinha/Caixa.")
+                                raise RuntimeError("Não foi possível confirmar a geração do arquivo PIX na Azulzinha/Caixa.")
                             except Exception:
                                 pass
                             await asyncio.sleep(1.0)
@@ -4097,7 +4138,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             debug_path.write_text(str(html_debug), encoding="utf-8")
                     except Exception:
                         pass
-                    raise RuntimeError("Nao foi possivel acionar o botao de exportacao no portal Azulzinha/Caixa.")
+                    raise RuntimeError("Não foi possível acionar o botão de exportação no portal Azulzinha/Caixa.")
 
             async def ensure_login(session_id: str, auth_restart_count: int = 0) -> None:
                 _emit_pix_status(on_status, "Acessando Azulzinha/Caixa...")
@@ -4166,7 +4207,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     })()
                     """,
                     timeout=60.0,
-                    description="A Caixa nao exibiu a tela de login para informar CNPJ e senha",
+                    description="A Caixa não exibiu a tela de login para informar CNPJ e senha",
                 )
                 login_user_selector = str((login_selectors or {}).get("user") or "#b2-b1-b4-InputMask")
                 login_password_selector = str((login_selectors or {}).get("password") or "#b2-b1-Input_Password")
@@ -4285,7 +4326,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 ) or {}
                 if int(credential_fill_state.get("userLen") or 0) < len(cnpj_digits) or int(credential_fill_state.get("passwordLen") or 0) < len(password_text):
                     await capture_portal_html_debug_v2(session_id, "azulzinha_login_fill_debug.html")
-                    raise RuntimeError("Nao foi possivel preencher o login e a senha da Azulzinha/Caixa.")
+                    raise RuntimeError("Não foi possível preencher o login e a senha da Azulzinha/Caixa.")
                 await press_tab(session_id)
                 await wait_for_condition(
                     session_id,
@@ -4309,7 +4350,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     """,
                 )
                 if not clicou:
-                    raise RuntimeError("Nao foi possivel confirmar o login da Azulzinha/Caixa.")
+                    raise RuntimeError("Não foi possível confirmar o login da Azulzinha/Caixa.")
 
                 state = await wait_for_condition(
                     session_id,
@@ -4346,14 +4387,14 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     })()
                     """,
                     timeout=90.0,
-                    description="A Caixa nao concluiu a etapa inicial do login",
+                    description="A Caixa não concluiu a etapa inicial do login",
                 )
                 if state == "logged":
                     return
                 if state == "device":
                     _emit_pix_status(on_status, "Selecionando dispositivo da Caixa...")
                     if not await click_card_by_text(session_id, _azulzinha_device_aliases(company_label), timeout=30.0):
-                        raise RuntimeError(f"Nao foi possivel selecionar o dispositivo da {company_label} na Azulzinha/Caixa.")
+                        raise RuntimeError(f"Não foi possível selecionar o dispositivo da {company_label} na Azulzinha/Caixa.")
                     state = await wait_for_condition(
                         session_id,
                         """
@@ -4389,7 +4430,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         })()
                         """,
                         timeout=45.0,
-                        description="A Caixa nao avancou apos a selecao do dispositivo",
+                        description="A Caixa não avançou após a seleção do dispositivo",
                     )
                 if state == "logged":
                     return
@@ -4446,7 +4487,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             session_id,
                             [
                                 "Receber codigo por e-mail ou SMS",
-                                "Receber c??digo por e-mail ou SMS",
+                                "Receber código por e-mail ou SMS",
                                 "Receber cÃ³digo por e-mail ou SMS",
                                 "Reenviar codigo",
                                 "Reenviar token",
@@ -4557,8 +4598,8 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         session_id,
                         [
                             "Receber codigo por e-mail ou SMS",
-                            "Receber c??digo por e-mail ou SMS",
                             "Receber código por e-mail ou SMS",
+                            "Receber cÃ³digo por e-mail ou SMS",
                         ],
                         timeout=20.0,
                     ):
@@ -6336,7 +6377,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
 
                 await capture_portal_html_debug_v2(session_id, f"azulzinha_sales_area_debug_{kind}.html")
                 raise RuntimeError(
-                    f"A Caixa nao concluiu a autenticacao para abrir {context_label}. Ultimo estado observado: {last_state or 'desconhecido'}."
+                    f"A Caixa não concluiu a autenticação para abrir {context_label}. Último estado observado: {last_state or 'desconhecido'}."
                 )
 
             async def download_report(session_id: str, kind: str) -> str | None:
@@ -6466,20 +6507,36 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             writer.writerow(row)
                     return str(final_path)
 
-                async def export_current_selection() -> str | None:
+                async def export_current_selection(
+                    *,
+                    captured_timeout_override: float | None = None,
+                    download_timeout_override: float | None = None,
+                ) -> str | None:
                     await wait_for_export_ready(session_id, kind, tab_id=active_tab_id, timeout=export_ready_timeout)
                     await asyncio.sleep(1.0)
                     started_at = _download_start_time()
                     event_start_index = len(event_log)
-                    _emit_pix_status(on_status, f"Solicitando arquivo de {'cartoes' if kind == 'cartoes' else 'PIX'} para a Caixa...")
+                    _emit_pix_status(on_status, f"Solicitando arquivo de {'cartões' if kind == 'cartoes' else 'PIX'} para a Caixa...")
                     await click_export(session_id, "pix" if kind == "pix" else "cartoes", tab_id=active_tab_id)
-                    captured = await wait_for_captured_report(session_id, kind, event_start_index, timeout=captured_timeout)
+                    captured = await wait_for_captured_report(
+                        session_id,
+                        kind,
+                        event_start_index,
+                        started_at,
+                        timeout=captured_timeout_override if captured_timeout_override is not None else captured_timeout,
+                    )
                     if captured:
-                        _emit_pix_status(on_status, f"Relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} recebido e validado.")
+                        _emit_pix_status(on_status, f"Relatório de {'cartões' if kind == 'cartoes' else 'PIX'} recebido e validado.")
                         return captured
-                    _emit_pix_status(on_status, f"Aguardando o download final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                    _emit_pix_status(on_status, f"Aguardando o download final do relatório de {'cartões' if kind == 'cartoes' else 'PIX'}...")
                     return _persist_downloaded_report(
-                        _wait_for_downloaded_report(browser_download_dir, data_br, kind, started_at, timeout=download_timeout),
+                        _wait_for_downloaded_report(
+                            browser_download_dir,
+                            data_br,
+                            kind,
+                            started_at,
+                            timeout=download_timeout_override if download_timeout_override is not None else download_timeout,
+                        ),
                         kind,
                     )
 
@@ -6497,7 +6554,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 context_label=f"estabilizar a aba {active_tab_id}",
                             )
                         else:
-                            _emit_pix_status(on_status, "Baixando relatorio PIX da Caixa...")
+                            _emit_pix_status(on_status, "Baixando relatório PIX da Caixa...")
                             await activate_sales_tab(session_id, active_tab_id, timeout=35.0)
                             await wait_for_tab_content(session_id, active_tab_id, timeout=60.0)
                             await wait_for_portal_settle(
@@ -6508,9 +6565,9 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             )
                         await asyncio.sleep(1.0)
                         if use_today_tab:
-                            _emit_pix_status(on_status, "Usando a aba Hoje da Caixa para baixar o relatorio de cartoes do dia corrente...")
+                            _emit_pix_status(on_status, "Usando a aba Hoje da Caixa para baixar o relatório de cartões do dia corrente...")
                         else:
-                            _emit_pix_status(on_status, f"Aplicando filtro de data do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
+                            _emit_pix_status(on_status, f"Aplicando filtro de data do relatório de {'cartões' if kind == 'cartoes' else 'PIX'}...")
                             await set_date_inputs(session_id)
                             await wait_for_portal_settle(
                                 session_id,
@@ -6543,8 +6600,45 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 if applied_count <= 0:
                                     continue
                                 _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
-                                saved = await export_current_selection()
+                                per_establishment_captured_timeout = captured_timeout
+                                per_establishment_download_timeout = download_timeout
+                                if captured_paths:
+                                    per_establishment_captured_timeout = min(
+                                        captured_timeout,
+                                        12.0 if kind == "cartoes" else 15.0,
+                                    )
+                                    per_establishment_download_timeout = min(
+                                        download_timeout,
+                                        15.0 if kind == "cartoes" else 20.0,
+                                    )
+                                try:
+                                    saved = await export_current_selection(
+                                        captured_timeout_override=per_establishment_captured_timeout,
+                                        download_timeout_override=per_establishment_download_timeout,
+                                    )
+                                except Exception as exc:
+                                    _emit_pix_status(
+                                        on_status,
+                                        f"A Caixa não devolveu um arquivo válido para o estabelecimento {establishment_id}; seguindo com os demais. Motivo: {exc}",
+                                    )
+                                    if captured_paths:
+                                        _emit_pix_status(
+                                            on_status,
+                                            "A MVA já tinha um estabelecimento válido; ignorando os estabelecimentos restantes que falharam.",
+                                        )
+                                        break
+                                    continue
                                 if not saved:
+                                    _emit_pix_status(
+                                        on_status,
+                                        f"O estabelecimento {establishment_id} não gerou arquivo aproveitável na Caixa; seguindo com os demais.",
+                                    )
+                                    if captured_paths:
+                                        _emit_pix_status(
+                                            on_status,
+                                            "A MVA já tinha um estabelecimento válido; ignorando os estabelecimentos restantes que não geraram arquivo.",
+                                        )
+                                        break
                                     continue
                                 variant_path = _copy_establishment_variant(saved, establishment_id)
                                 if variant_path:
@@ -6553,7 +6647,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             if combined:
                                 return combined
                             raise RuntimeError(
-                                f"A Caixa nao entregou um arquivo valido do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'} para os estabelecimentos da MVA."
+                                f"A Caixa não entregou um arquivo válido do relatório de {'cartões' if kind == 'cartoes' else 'PIX'} para os estabelecimentos da MVA."
                             )
                         establishments_applied = await ensure_all_establishments_selected(
                             session_id,
@@ -6570,7 +6664,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         if saved:
                             return saved
                         raise RuntimeError(
-                            f"A Caixa nao entregou o arquivo final do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}."
+                            f"A Caixa não entregou o arquivo final do relatório de {'cartões' if kind == 'cartoes' else 'PIX'}."
                         )
                     except Exception as exc:
                         last_error = exc
@@ -6582,11 +6676,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             current_state = ""
                         if current_state == "portal_error" or "_error.html" in str(exc).lower():
                             retry_message = (
-                                f"A Caixa abriu a pagina de erro ao gerar o relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}; tentando novamente..."
+                                f"A Caixa abriu a página de erro ao gerar o relatório de {'cartões' if kind == 'cartoes' else 'PIX'}; tentando novamente..."
                             )
                         else:
                             retry_message = (
-                                f"A Caixa demorou para gerar o relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}; tentando novamente..."
+                                f"A Caixa demorou para gerar o relatório de {'cartões' if kind == 'cartoes' else 'PIX'}; tentando novamente..."
                             )
                         _emit_pix_status(
                             on_status,
@@ -6600,20 +6694,21 @@ def baixar_relatorios_caixa_eh_azulzinha(
             try:
                 target_id = (await cdp("Target.createTarget", {"url": "about:blank"})).get("targetId")
                 if not target_id:
-                    raise RuntimeError("Nao foi possivel abrir a aba da Azulzinha/Caixa.")
+                    raise RuntimeError("Não foi possível abrir a aba da Azulzinha/Caixa.")
                 try:
                     await cdp("Target.activateTarget", {"targetId": target_id}, timeout=5.0)
                 except Exception:
                     pass
                 session_id = (await cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True})).get("sessionId")
                 if not session_id:
-                    raise RuntimeError("Nao foi possivel anexar a aba da Azulzinha/Caixa.")
+                    raise RuntimeError("Não foi possível anexar a aba da Azulzinha/Caixa.")
                 await cdp("Page.enable", session_id=session_id)
                 await cdp("Runtime.enable", session_id=session_id)
                 try:
                     await cdp("Page.bringToFront", session_id=session_id, timeout=5.0)
                 except Exception:
                     pass
+                await _hide_chromium_window(cdp, target_id)
                 try:
                     await cdp("Network.enable", {}, session_id=session_id)
                 except Exception:
@@ -6635,11 +6730,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 if need_cartoes:
                     resultado["cartoes"] = await download_report(session_id, "cartoes")
                     if not resultado["cartoes"]:
-                        resultado["avisos"].append("Nao foi possivel baixar o relatorio de cartoes da Azulzinha/Caixa.")
+                        resultado["avisos"].append("Não foi possível baixar o relatório de cartões da Azulzinha/Caixa.")
                 if need_pix:
                     resultado["pix"] = await download_report(session_id, "pix")
                     if not resultado["pix"]:
-                        resultado["avisos"].append("Nao foi possivel baixar o relatorio PIX da Azulzinha/Caixa.")
+                        resultado["avisos"].append("Não foi possível baixar o relatório PIX da Azulzinha/Caixa.")
                 return resultado
             finally:
                 recv_task.cancel()
@@ -7675,8 +7770,8 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
     if not _is_mva_clipp_fechamento_text(texto):
         avisos = list(avisos_usuario or [])
         avisos.append(
-            "O PDF informado como Fechamento de Caixa da MVA nao corresponde ao layout esperado do fechamento Clipp. "
-            "Ele sera tratado apenas como relatorio local, e a busca automatica dos pagamentos na Azulzinha/Caixa nao sera acionada por este arquivo."
+            "O PDF informado como Fechamento de Caixa da MVA não corresponde ao layout esperado do fechamento Clipp. "
+            "Ele será tratado apenas como relatório local, e a busca automática dos pagamentos na Azulzinha/Caixa não será acionada por este arquivo."
         )
         return {
             "arquivo": os.path.basename(caminho_pdf),
@@ -7905,7 +8000,7 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
             except Exception as exc:
                 if str(exc).strip() == "__cancelled__":
                     raise
-                avisos.append(f"Nao foi possivel baixar automaticamente os relatorios da Caixa da {company}: {exc}")
+                avisos.append(f"Não foi possível baixar automaticamente os relatórios da Caixa da {company}: {exc}")
     if data_br:
         report, _relatorio_pix, _avisos = _integrate_local_payment_reports(
             report,
@@ -8001,7 +8096,7 @@ def _extract_mva_column_bounds(page) -> dict:
 
     for item in header_row:
         normalized = _normalize_caixa_client(item["text"])
-        if normalized in {"CODIGO", "CÃ“DIGO"}:
+        if normalized in {"CODIGO", "CÓDIGO"}:
             bounds["code_x1"] = item["x1"]
         elif normalized == "VENDEDOR":
             bounds["vendor_x0"] = item["x0"]
@@ -8884,7 +8979,7 @@ def gerar_relatorios_caixa_eh_zweb(
         except Exception as exc:
             if str(exc).strip() == "__cancelled__":
                 raise
-            avisos_usuario.append(f"Nao foi possivel baixar automaticamente os relatorios da Caixa: {exc}")
+            avisos_usuario.append(f"Não foi possível baixar automaticamente os relatórios da Caixa: {exc}")
 
     navegador = _find_chromium_browser_path()
     if not navegador:
@@ -9498,7 +9593,7 @@ def gerar_relatorios_caixa_eh_zweb(
     if last_error is not None:
         raise last_error
 
-    _emit_pix_status(on_status, "Salvando relatorios do Zweb na pasta atual...")
+    _emit_pix_status(on_status, "Salvando relatórios do Zweb na pasta atual...")
     caminho_html_pedidos = _save_zweb_html_report(data_br, "pedidos_importados", html_pedidos)
     caminho_html_fechamento = _save_zweb_html_report(data_br, "fechamento_caixa", html_fechamento)
 
@@ -9519,7 +9614,7 @@ def gerar_relatorios_caixa_eh_zweb(
     scope_label = " dentro do escopo horário do fechamento" if scope_windows else ""
 
     if local_card_pdf:
-        _emit_pix_status(on_status, "Lendo relatorio local de cartoes...")
+        _emit_pix_status(on_status, "Lendo relatório local de cartões...")
         try:
             relatorios_cartao = _build_card_reports_from_caixa(local_card_pdf, data_br)
             relatorios_validos = {}
@@ -10349,8 +10444,8 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 )
             )
             _add_alert(
-                "Relat?rio ausente",
-                f"{titulo_pagamento}: relat?rio local n?o encontrado na pasta atual de execucao.",
+                "Relatório ausente",
+                f"{titulo_pagamento}: relatório local não encontrado na pasta atual de execução.",
                 "-",
             )
             continue
@@ -10382,7 +10477,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         if usa_fallback_zweb:
             _add_alert(
                 "Origem alternativa",
-                f"{titulo_pagamento}: valor confirmado via Financeiro > MovimentaÃ§Ãµes do Zweb, sem relatÃ³rio da Caixa/Azulzinha.",
+                f"{titulo_pagamento}: valor confirmado via Financeiro > Movimentações do Zweb, sem relatório da Caixa/Azulzinha.",
                 f"R$ {format_number_br(total_pagamentos)}",
             )
         status_correlacao = "Finalizado" if abs(total_caixa_pagamento - total_pagamentos) < 0.01 else "Divergente"
@@ -10418,7 +10513,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 )
             alert_rows.append(
                 (
-                    "Transa??o Banc?ria sem CF/NF",
+                    "Transação Bancária sem CF/NF",
                     f"{titulo_pagamento}: {detail}",
                     _money_text(valor),
                 )
@@ -10436,7 +10531,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 item.get("numero_exibicao") or _display_fiscal_number(numero),
                 valor,
                 "Fechamento",
-                f"{titulo_pagamento} sem pagamento correspondente na m?quina",
+                f"{titulo_pagamento} sem pagamento correspondente na máquina",
             )
             if titulo_pagamento == "PIX":
                 pix_fechamento_only.append(
@@ -10456,7 +10551,7 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
                 )
             alert_rows.append(
                 (
-                    "CF sem Transa??o Banc?ria",
+                    "CF sem Transação Bancária",
                     f"{titulo_pagamento}: CF {item.get('numero_exibicao') or _display_fiscal_number(numero)}",
                     _money_text(valor),
                 )
@@ -10532,9 +10627,9 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
     if alertas_report:
         alertas_report["hidden_in_menu"] = True
         alertas_report["summary_items"] = [
-            ("Per?odo", str(relatorio_caixa.get("periodo") or "N?o identificado")),
-            ("Pend?ncias", str(_count_visible_alert_rows(alertas_report))),
-            ("Total Pend?ncias", f"R$ {format_number_br(valor_faltantes)}"),
+            ("Período", str(relatorio_caixa.get("periodo") or "Não identificado")),
+            ("Pendências", str(_count_visible_alert_rows(alertas_report))),
+            ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
         ]
         alertas_report["correlacao_rows"] = correlacao_rows
         alertas_report["valor_total_vendas"] = total_caixa
@@ -10559,8 +10654,18 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         status = "Faltante"
     if alertas_report:
         alertas_report["status"] = status
+    visible_alert_count = _count_visible_alert_rows(alertas_report)
 
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
+    escopo_relatorio = (
+        relatorio_nfce.get("escopo_relatorio")
+        or relatorio_caixa.get("escopo_relatorio")
+    )
+    escopo_horario_aplicado = list(
+        relatorio_nfce.get("escopo_horario_aplicado")
+        or relatorio_caixa.get("escopo_horario_aplicado")
+        or []
+    )
 
     return {
         "caixa_modelo": "EH",
@@ -10581,9 +10686,11 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         "canceladas_ignoradas_valor": valor_canceladas_pendentes,
         "canceladas_pendentes_count": len(pedidos_cancelados),
         "canceladas_pendentes_valor": valor_canceladas_pendentes,
+        "escopo_relatorio": escopo_relatorio,
+        "escopo_horario_aplicado": escopo_horario_aplicado,
         "avisos_usuario": list(relatorio_nfce.get("avisos_usuario") or []),
         "relatorios_pagamento": relatorios_pagamento,
-        "alertas_count": len(alert_rows),
+        "alertas_count": visible_alert_count,
         "registros_conferencia": sorted(
             registros,
             key=lambda item: (
@@ -10982,6 +11089,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
     status = "Confere" if not registros and not alert_rows else "Faltante"
     if alertas_report:
         alertas_report["status"] = status
+    visible_alert_count = _count_visible_alert_rows(alertas_report)
 
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
     cupons_cancelados = [
@@ -10993,6 +11101,15 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         subtitle = (
             (subtitle + " ") if subtitle else ""
         ) + f"Cupons cancelados identificados no Minhas Notas: {len(cupons_cancelados)}."
+    escopo_relatorio = (
+        relatorio_fechamento.get("escopo_relatorio")
+        or relatorio_caixa.get("escopo_relatorio")
+    )
+    escopo_horario_aplicado = list(
+        relatorio_fechamento.get("escopo_horario_aplicado")
+        or relatorio_caixa.get("escopo_horario_aplicado")
+        or []
+    )
     return {
         "fechamento_modelo": "MVA",
         "caixa_modelo": "MVA",
@@ -11016,6 +11133,8 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         ),
         "secao_titulo": "DAVs/CF para conferência",
         "empty_message": "Nenhum DAV/CF faltante encontrado.",
+        "escopo_relatorio": escopo_relatorio,
+        "escopo_horario_aplicado": escopo_horario_aplicado,
         "registros_conferencia": sorted(
             registros,
             key=lambda item: (
@@ -11024,7 +11143,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             ),
         ),
         "relatorios_pagamento": relatorios_pagamento,
-        "alertas_count": len(alert_rows),
+        "alertas_count": visible_alert_count,
         "avisos_usuario": list(relatorio_fechamento.get("avisos_usuario") or []) + avisos_minhas_notas,
     }
 
@@ -11115,6 +11234,15 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         subtitle += f" Cupons cancelados identificados no Minhas Notas: {len(cupons_cancelados)}."
     elif erro_minhas_notas:
         subtitle += " Consulta ao Minhas Notas indisponivel nesta analise."
+    escopo_relatorio = (
+        relatorio_nfce.get("escopo_relatorio")
+        or relatorio_caixa.get("escopo_relatorio")
+    )
+    escopo_horario_aplicado = list(
+        relatorio_nfce.get("escopo_horario_aplicado")
+        or relatorio_caixa.get("escopo_horario_aplicado")
+        or []
+    )
 
     registros_alerta = [
         item for item in registros
@@ -11149,6 +11277,7 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         alertas_report["texto_informativo"] = ""
         alertas_report["status"] = status
         relatorios_pagamento[alertas_report["categoria"]] = alertas_report
+    visible_alert_count = _count_visible_alert_rows(alertas_report)
 
     return {
         "fechamento_modelo": "MVA",
@@ -11175,6 +11304,8 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         "status": status,
         "secao_titulo": "DAVs/CF para conferência",
         "empty_message": "Nenhum DAV/CF faltante encontrado.",
+        "escopo_relatorio": escopo_relatorio,
+        "escopo_horario_aplicado": escopo_horario_aplicado,
         "registros_conferencia": sorted(
             registros,
             key=lambda item: (
@@ -11182,6 +11313,7 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
                 int(item["numero"]) if item.get("numero") else 0,
             ),
         ),
+        "alertas_count": visible_alert_count,
         "relatorios_pagamento": relatorios_pagamento,
         "nfes_identificadas": nfes_identificadas,
         "erro_minhas_notas": erro_minhas_notas,
@@ -11204,11 +11336,11 @@ def canonicalize_name(raw: str) -> str:
     _ensure_mapping_loaded()
     key = _normalize_key(raw)
 
-    # 1) se existe como abreviaÃ§Ã£o no mapping
+    # 1) se existe como abreviação no mapping
     if key in mapping:
         return mapping[key]
 
-    # 2) se jÃ¡ Ã© o nome completo
+    # 2) se já é o nome completo
     if key in CANON_BY_VALUE_UPPER:
         return CANON_BY_VALUE_UPPER[key]
 
@@ -11227,7 +11359,7 @@ def canonicalize_name(raw: str) -> str:
     # fallback
     return raw.strip().title()
 
-# --- FunÃ§Ãµes principais ---
+# --- Funções principais ---
 
 def criar_etiquetas_legacy():
     from reportlab.lib.pagesizes import A4
@@ -11236,7 +11368,7 @@ def criar_etiquetas_legacy():
 
     # precisa ter MVA e EH carregados
     if not results_by_source["MVA"] or not results_by_source["EH"]:
-        messagebox.showwarning("Aviso", "Ã‰ necessÃ¡rio carregar os dois PDFs (MVA e EH).")
+        messagebox.showwarning("Aviso", "É necessário carregar os dois PDFs (MVA e EH).")
         return
 
     caminho = filedialog.asksaveasfilename(
@@ -11290,13 +11422,13 @@ def criar_etiquetas_legacy():
         c.drawString(50, y, linha2)
         y -= 30
 
-        if y < 50:  # quebra pÃ¡gina
+        if y < 50:  # quebra página
             c.showPage()
             c.setFont("Helvetica", 11)
             y = altura - 50
 
     c.save()
-    messagebox.showinfo("Sucesso", f"âœ… Etiquetas geradas em:\n{caminho}")
+    messagebox.showinfo("Sucesso", f"✅ Etiquetas geradas em:\n{caminho}")
 
 def _rows_from_tree_for_labels(tree):
     rows = []
@@ -11429,7 +11561,7 @@ def extrair_planilha_online():
     valoresMVA = sheetMVA.get_all_values()
     valoresEH = sheetEH.get_all_values()
 
-    # pega cabeÃ§alho da linha 2
+    # pega cabeçalho da linha 2
     colsMVA = valoresMVA[1]
     colsEH = valoresEH[1]
 
@@ -11440,19 +11572,19 @@ def extrair_planilha_online():
     dfMVA = pd.DataFrame(valoresMVA[2:], columns=colsMVA)
     dfEH = pd.DataFrame(valoresEH[2:], columns=colsEH)
 
-    # ðŸ”Ž COMPARAÃ‡ÃƒO com os Ãºltimos dados exportados (mantÃ©m compatibilidade)
+    # 🔎 COMPARAÇÃO com os últimos dados exportados (mantém compatibilidade)
     if LAST_MVA is not None and LAST_EH is not None:
         try:
             if dfMVA.equals(LAST_MVA) and dfEH.equals(LAST_EH):
                 return None
         except Exception:
-            # se ocorrer qualquer erro de comparaÃ§Ã£o, continua (nÃ£o bloqueia)
+            # se ocorrer qualquer erro de comparação, continua (não bloqueia)
             pass
 
-    # Atualiza os globais com os novos dados (mantÃ©m comportamento anterior)
+    # Atualiza os globais com os novos dados (mantém comportamento anterior)
     LAST_MVA, LAST_EH = dfMVA.copy(), dfEH.copy()
 
-    # --- AgregaÃ§Ã£o por vendedor (soma MVA + EH) ---
+    # --- Agregação por vendedor (soma MVA + EH) ---
     agregados = {}
     canon_cache = {}
 
@@ -11476,7 +11608,7 @@ def extrair_planilha_online():
         atend_row = 0
         total_row = 0.0
 
-        # percorre o resto das colunas da linha somando valores numÃ©ricos
+        # percorre o resto das colunas da linha somando valores numéricos
         for v in row[1:]:
             if pd.isna(v) or str(v).strip() == "":
                 continue
@@ -11485,7 +11617,7 @@ def extrair_planilha_online():
                 total_row += num
                 atend_row += 1
             except Exception:
-                # ignora conteÃºdos nÃ£o numÃ©ricos
+                # ignora conteúdos não numéricos
                 continue
 
         agregados[vendedor]["atendidos"] += atend_row
@@ -11513,45 +11645,37 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
             try:
                 resultado = extrair_planilha_online()
                 if resultado is None:
-                    progress_bar.stop()
-                    progress_bar.config(mode="determinate")
-                    progress_var.set(0)
-                    set_btn_cancel()
-                    return messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado")
-                else:
-                    for item in tree_planilha.get_children():
-                        tree_planilha.delete(item)
-                    if btn_merge_spreadsheet:
-                        btn_merge_spreadsheet.configure(state="normal")
+                    progressQueuePlanilha.put(("no_changes", None))
+                    return
 
-                    # agora extrai tambÃ©m o DataFrame agregado
-                    dfMVA, dfEH, df_agg = resultado
+                # agora extrai também o DataFrame agregado
+                dfMVA, dfEH, df_agg = resultado
 
-                    total_rows = len(df_agg)
-                    resultados = []
+                total_rows = len(df_agg)
+                resultados = []
 
-                    # percorre o df_agg (jÃ¡ somado por vendedor)
-                    for i, row in enumerate(df_agg.itertuples(index=False, name=None), start=1):
-                        # ðŸ”¹ Verifica se foi cancelado
-                        if cancel_event.is_set():
-                            progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
-                            return
+                # percorre o df_agg (já somado por vendedor)
+                for i, row in enumerate(df_agg.itertuples(index=False, name=None), start=1):
+                    # 🔹 Verifica se foi cancelado
+                    if cancel_event.is_set():
+                        progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
+                        return
 
-                        vendedor = str(row[0]).strip()
-                        if not vendedor:
-                            continue
+                    vendedor = str(row[0]).strip()
+                    if not vendedor:
+                        continue
 
-                        atendidos = int(row[1]) if not pd.isna(row[1]) else 0
-                        total = float(row[2]) if not pd.isna(row[2]) else 0.0
+                    atendidos = int(row[1]) if not pd.isna(row[1]) else 0
+                    total = float(row[2]) if not pd.isna(row[2]) else 0.0
 
-                        if atendidos > 0 or total > 0:
-                            resultados.append((vendedor, atendidos, total))
+                    if atendidos > 0 or total > 0:
+                        resultados.append((vendedor, atendidos, total))
 
-                        # ðŸ”¹ Atualiza progresso gradualmente
-                        progresso = int(i * 100 / max(1, total_rows))
-                        progressQueuePlanilha.put(("progress", progresso))
+                    # 🔹 Atualiza progresso gradualmente
+                    progresso = int(i * 100 / max(1, total_rows))
+                    progressQueuePlanilha.put(("progress", progresso))
 
-                    progressQueuePlanilha.put(("done_planilha", resultados))
+                progressQueuePlanilha.put(("done_planilha", resultados))
 
             except Exception as e:
                 progressQueuePlanilha.put(("error", f"Erro ao carregar planilha: {e}"))
@@ -11575,14 +11699,25 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                         if action == "start_indeterminate":
                             progress_bar.config(mode="indeterminate")
                             progress_bar.start(10)
+                    elif kind == "no_changes":
+                        set_btn_cancel()
+                        progress_bar.stop()
+                        progress_bar.config(mode="determinate")
+                        progress_var.set(0)
+                        messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado.")
+                        return
                     elif kind == "done_planilha":
                         set_btn_cancel()
                         if isinstance(payload, dict) and payload.get("__cancelled__"):
                             progress_bar.stop()
                             progress_bar.config(mode="determinate")
                             progress_var.set(0)
-                            messagebox.showinfo("Cancelado", "âŒ Carregamento da planilha foi cancelado.")
+                            messagebox.showinfo("Cancelado", "Carregamento da planilha foi cancelado.")
                         else:
+                            for item in tree_planilha.get_children():
+                                tree_planilha.delete(item)
+                            if btn_merge_spreadsheet:
+                                btn_merge_spreadsheet.configure(state="normal")
                             for vendedor, atendidos, total in payload:
                                 tree_planilha.insert(
                                     "",
@@ -11593,7 +11728,7 @@ def carregar_planilha_async(tree_planilha, progress_var, progress_bar, root):
                                         f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
                                     )
                                 )
-                            messagebox.showinfo("Sucesso", "âœ… Planilha online carregada com sucesso!")
+                            messagebox.showinfo("Sucesso", "Planilha online carregada com sucesso.")
                         return
                     elif kind == "error":
                         set_btn_cancel()
@@ -11627,29 +11762,19 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
             try:
                 resultado = extrair_planilha_online()
                 if resultado is None:
-                    progress_bar.stop()
-                    progress_bar.config(mode="determinate")
-                    progress_var.set(0)
-                    set_btn_cancel()
-                    return messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado")
+                    progressQueuePlanilha.put(("no_changes", None))
+                    return
 
                 dfMVA, dfEH, _ = resultado  # ignoramos o df_agg por enquanto
 
-                # limpa tabelas antes de preencher
-                for tree in (tree_mva, tree_eh):
-                    for item in tree.get_children():
-                        tree.delete(item)
-
-                if btn_merge_spreadsheet:
-                    btn_merge_spreadsheet.configure(state="normal")
-
                 # Preenche as duas tabelas
-                def fill_tree(df, tree):
+                def collect_tree_rows(df):
                     total_rows = len(df)
+                    rows: list[tuple[str, int, str]] = []
                     for i, row in enumerate(df.itertuples(index=False, name=None), start=1):
                         if cancel_event.is_set():
                             progressQueuePlanilha.put(("done_planilha", {"__cancelled__": True}))
-                            return
+                            return None
                         vendedor = str(row[0]).strip()
                         if not vendedor:
                             continue
@@ -11662,16 +11787,34 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                             except Exception:
                                 pass
                         if atendidos > 0 or total > 0:
-                            tree.insert("", "end", values=(vendedor, atendidos, f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")))
+                            rows.append(
+                                (
+                                    vendedor,
+                                    atendidos,
+                                    f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                                )
+                            )
                         progresso = int(i * 50 / max(1, total_rows))  # 50% pra cada tabela
                         progressQueuePlanilha.put(("progress", progresso))
+                    return rows
 
-                fill_tree(dfMVA, tree_mva)
-                fill_tree(dfEH, tree_eh)
-                _scroll_tree_to_top(tree_mva)
-                _scroll_tree_to_top(tree_eh)
+                rows_mva = collect_tree_rows(dfMVA)
+                if rows_mva is None:
+                    return
+                rows_eh = collect_tree_rows(dfEH)
+                if rows_eh is None:
+                    return
 
-                progressQueuePlanilha.put(("done_planilha", "ok"))
+                progressQueuePlanilha.put(
+                    (
+                        "done_planilha",
+                        {
+                            "status": "ok",
+                            "rows_mva": rows_mva,
+                            "rows_eh": rows_eh,
+                        },
+                    )
+                )
 
             except Exception as e:
                 progressQueuePlanilha.put(("error", f"Erro ao carregar planilhas: {e}"))
@@ -11692,15 +11835,36 @@ def carregar_planilhas_duplas_async(tree_mva, tree_eh, progress_var, progress_ba
                         if payload.get("action") == "start_indeterminate":
                             progress_bar.config(mode="indeterminate")
                             progress_bar.start(10)
+                    elif kind == "no_changes":
+                        set_btn_cancel()
+                        progress_bar.stop()
+                        progress_bar.config(mode="determinate")
+                        progress_var.set(0)
+                        messagebox.showinfo("Aviso", "Nenhum dado novo foi adicionado.")
+                        return
                     elif kind == "done_planilha":
                         set_btn_cancel()
                         progress_bar.stop()
                         progress_bar.config(mode="determinate")
-                        progress_var.set(100 if payload == "ok" else 0)
                         if isinstance(payload, dict) and payload.get("__cancelled__"):
-                            messagebox.showinfo("Cancelado", "âŒ Carregamento da planilha foi cancelado.")
-                        else:
-                            messagebox.showinfo("Sucesso", "âœ… Planilhas online carregadas com sucesso!")
+                            progress_var.set(0)
+                            messagebox.showinfo("Cancelado", "Carregamento da planilha foi cancelado.")
+                            return
+                        if isinstance(payload, dict):
+                            for tree in (tree_mva, tree_eh):
+                                for item in tree.get_children():
+                                    tree.delete(item)
+                            if btn_merge_spreadsheet:
+                                btn_merge_spreadsheet.configure(state="normal")
+                            for values in payload.get("rows_mva", []):
+                                tree_mva.insert("", "end", values=values)
+                            for values in payload.get("rows_eh", []):
+                                tree_eh.insert("", "end", values=values)
+                            _scroll_tree_to_top(tree_mva)
+                            _scroll_tree_to_top(tree_eh)
+                            progress_var.set(100)
+                            messagebox.showinfo("Sucesso", "Planilhas online carregadas com sucesso.")
+                            return
                         return
                     elif kind == "error":
                         set_btn_cancel()
@@ -11744,7 +11908,7 @@ def tree_update(tree):
 
 def mesclar_resultados(list_results):
     mesclado = {}
-    cache_canon = {}  # ðŸ”¹ Cache para memoizaÃ§Ã£o de canonicalize_name
+    cache_canon = {}  # 🔹 Cache para memoização de canonicalize_name
 
     for res in list_results:
         for vend, dados in res.items():
@@ -11769,11 +11933,26 @@ def mesclar_resultados(list_results):
             tv_str = str(dados.get("total_vendas", ""))
             mesclado[canon]["total_vendas"] += parse_number(tv_str)
 
-    # ðŸ”¹ Recalcula clientes finais uma vez ao final
+    # 🔹 Recalcula clientes finais uma vez ao final
     for dados in mesclado.values():
         dados["total_clientes"] = dados["atendidos"] - dados["devolucoes"]
 
     return mesclado
+
+
+def _resolve_merge_planilha_sources(results_by_source, tree_mva, tree_eh) -> tuple[list[str], list[str], list[str]]:
+    imported_sources = [
+        source
+        for source in ("MVA", "EH")
+        if list((results_by_source or {}).get(source) or [])
+    ]
+    online_sources = [
+        source
+        for source, tree_view in (("MVA", tree_mva), ("EH", tree_eh))
+        if tree_view is not None and tree_view.get_children()
+    ]
+    selected_sources = [source for source in imported_sources if source in online_sources]
+    return imported_sources, online_sources, selected_sources
 
 
 def ordenar_coluna(tree, col, reverse):
@@ -11847,7 +12026,7 @@ def check_for_updates(root):
                 # Mostra dialogo na thread principal usando after()
                 def ask_user():
                     if messagebox.askyesno("Atualizacao Disponivel",
-                        f"Uma nova versao ({latest_version}) esta disponivel! Deseja baixar agora?"):
+                        f"Uma nova versão ({latest_version}) está disponível! Deseja baixar agora?"):
                         assets = data.get("assets", [])
                         zip_asset = None
                         for asset in assets:
@@ -11889,7 +12068,7 @@ def check_for_updates(root):
                                 return
 
                             messagebox.showinfo("Atualizado",
-                                "Nova versao baixada e extraida. O aplicativo sera reiniciado.")
+                                "Nova versão baixada e extraída. O aplicativo será reiniciado.")
                             try:
                                 subprocess.Popen([exe_path])
                             except Exception as e:
@@ -11918,17 +12097,17 @@ def limpar_tabelas(tree, tree_planilha, label_files_var, progress_var):
     for item in tree_planilha.get_children():
         tree_planilha.delete(item)
 
-    # reseta variÃ¡veis da UI
-    label_files_var.set("Nenhum arquivo carregado ainda")
+    # reseta variáveis da UI
+    label_files_var.set("Nenhum arquivo carregado")
     progress_var.set(0)
 
-    # ðŸ§¹ Limpa histÃ³rico da mesclagem
+    # 🧹 Limpa histórico da mesclagem
     LAST_EH = None      
     LAST_MVA = None
     LAST_HASH_MERGE = None
     LAST_STATE_SPREADSHEET = {}    
     
-    # tambÃ©m limpa lista de resultados
+    # também limpa lista de resultados
     from global_vars import list_results, listFiles
     btn_add_mais = _UI_REFS.get("btn_add_mais")
     btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
@@ -11960,13 +12139,13 @@ def _excel_export(tree):
     dados = [tree.item(item)["values"] for item in tree.get_children()]
 
     if not dados:
-        messagebox.showwarning("Aviso", "NÃ£o hÃ¡ dados para exportar.")
+        messagebox.showwarning("Aviso", "Não há dados para exportar.")
         return
 
     df = pd.DataFrame(dados, columns=cols)
 
-    # Converter colunas numÃ©ricas
-    colunas_numericas = ["Atendidos", "DevoluÃ§Ãµes", "Total Final", "Total Vendas"]
+    # Converter colunas numéricas
+    colunas_numericas = ["Atendidos", "Devoluções", "Total Final", "Total Vendas"]
     for col in colunas_numericas:
         if col in df.columns:
             df[col] = pd.to_numeric(
@@ -11979,7 +12158,7 @@ def _excel_export(tree):
     caminho = filedialog.asksaveasfilename(
         defaultextension=".xlsx",
         filetypes=[("Arquivo Excel", "*.xlsx")],
-        title="Salvar relatÃ³rio"
+        title="Salvar relatório"
     )
     
     if not caminho:
@@ -11987,7 +12166,7 @@ def _excel_export(tree):
     
     df.to_excel(caminho, index=False, engine="openpyxl")
     
-    messagebox.showinfo("Sucesso", f"âœ… RelatÃ³rio exportado para:\n{caminho}")
+    messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
 def _pdf_export(tree) -> bool:
 
@@ -11999,13 +12178,13 @@ def _pdf_export(tree) -> bool:
     dados = [tree.item(item)["values"] for item in tree.get_children()]
 
     if not dados:
-        messagebox.showwarning("Aviso", "NÃ£o hÃ¡ dados para exportar.")
+        messagebox.showwarning("Aviso", "Não há dados para exportar.")
         return
 
     caminho = filedialog.asksaveasfilename(
         defaultextension=".pdf",
         filetypes=[("Arquivo PDF", "*.pdf")],
-        title="Salvar relatÃ³rio PDF"
+        title="Salvar relatório PDF"
     )
     if not caminho:
         return False
@@ -12015,10 +12194,10 @@ def _pdf_export(tree) -> bool:
     largura, altura = A4
     y = altura - 50
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y, "RelatÃ³rio de Vendas")
+    c.drawString(50, y, "Relatório de Vendas")
     y -= 30
 
-    # CabeÃ§alho
+    # Cabeçalho
     c.setFont("Helvetica-Bold", 10)
     for i, col in enumerate(cols):
         c.drawString(50 + i * 120, y, col)
@@ -12035,14 +12214,14 @@ def _pdf_export(tree) -> bool:
             y = altura - 50
 
     c.save()
-    messagebox.showinfo("Sucesso", f"âœ… RelatÃ³rio exportado para:\n{caminho}")
+    messagebox.showinfo("Sucesso", f"✅ Relatório exportado para:\n{caminho}")
 
 def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var):
     """Limpa todas as tabelas (PDF + MVA + EH) e reseta os indicadores."""
     global LAST_EH, LAST_MVA, LAST_STATE_SPREADSHEET, LAST_HASH_MERGE
 
 
-    confirm = messagebox.askyesno("ConfirmaÃ§Ã£o", "Deseja realmente limpar todas as tabelas?")
+    confirm = messagebox.askyesno("Confirmação", "Deseja realmente limpar todas as tabelas?")
     if not confirm:
         return
 
@@ -12050,13 +12229,13 @@ def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var
         for item in t.get_children():
             t.delete(item)
             
-        # ðŸ§¹ Limpa histÃ³rico da mesclagem
+        # 🧹 Limpa histórico da mesclagem
     LAST_EH = None      
     LAST_MVA = None
     LAST_HASH_MERGE = None
     LAST_STATE_SPREADSHEET = {}    
     
-    # tambÃ©m limpa lista de resultados
+    # também limpa lista de resultados
     from global_vars import list_results, listFiles
     btn_add_mais = _UI_REFS.get("btn_add_mais")
     btn_merge_spreadsheet = _UI_REFS.get("btn_merge_spreadsheet")
@@ -12081,7 +12260,7 @@ def limpar_tabelas_duplas(tree, tree_mva, tree_eh, label_files_var, progress_var
 
     label_files_var.set("Nenhum arquivo selecionado")
     progress_var.set(0)
-    messagebox.showinfo("Limpeza concluÃ­da", "ðŸ§¹ Todas as tabelas foram limpas com sucesso.")
+    messagebox.showinfo("Limpeza concluída", "🧹 Todas as tabelas foram limpas com sucesso.")
 
 def _hash_tree_snapshot(trees):
     import hashlib
@@ -12113,25 +12292,59 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
     if btn_merge_spreadsheet:
         btn_merge_spreadsheet.configure(state="enabled")
 
-    # ðŸ”¹ Verifica se alguma tabela estÃ¡ vazia
+    # 🔹 Verifica se alguma tabela está vazia
     if not tree.get_children():
-        messagebox.showwarning("Aviso", "A tabela de PDFs estÃ¡ vazia. Importe pelo menos um PDF antes de mesclar.")
+        messagebox.showwarning("Aviso", "A tabela de PDFs está vazia. Importe pelo menos um PDF antes de mesclar.")
         return
     if not tree_mva.get_children() and not tree_eh.get_children():
-        messagebox.showwarning("Aviso", "As tabelas online estÃ£o vazias. Carregue as planilhas MVA e EH antes de mesclar.")
+        messagebox.showwarning("Aviso", "As tabelas online estão vazias. Carregue as planilhas MVA e EH antes de mesclar.")
         return
     try:
         from global_vars import results_by_source
     except Exception:
         results_by_source = {"MVA": [], "EH": []}
-    if not results_by_source.get("MVA") or not results_by_source.get("EH"):
-        messagebox.showwarning("Aviso", "Importe os dois PDFs (MVA e EH) antes de mesclar.")
+    imported_sources, online_sources, selected_sources = _resolve_merge_planilha_sources(
+        results_by_source,
+        tree_mva,
+        tree_eh,
+    )
+    if not imported_sources:
+        messagebox.showwarning("Aviso", "Importe pelo menos um PDF antes de mesclar.")
         return
+    if not selected_sources:
+        messagebox.showwarning(
+            "Aviso",
+            "Nenhuma planilha online correspondente aos PDFs importados foi carregada.",
+        )
+        return
+    if len(imported_sources) == 1:
+        only_source = imported_sources[0]
+        if not messagebox.askyesno(
+            "Mesclar Planilhas",
+            (
+                f"Apenas o PDF da {only_source} foi importado.\n\n"
+                f"A mesclagem será feita somente com a planilha online da {only_source}.\n\n"
+                "Se quiser mesclar MVA e EH, clique em Não e importe mais um arquivo."
+            ),
+        ):
+            return
+    elif len(selected_sources) == 1 and len(imported_sources) == 2:
+        only_source = selected_sources[0]
+        if not messagebox.askyesno(
+            "Mesclar Planilhas",
+            (
+                "Os PDFs de MVA e EH já foram importados.\n\n"
+                f"No momento, só a planilha online da {only_source} está carregada para mesclagem.\n\n"
+                f"Deseja continuar mesclando somente a {only_source}?\n"
+                "Se quiser mesclar MVA e EH, clique em Não e carregue a outra planilha."
+            ),
+        ):
+            return
 
     # Snapshot dos dados atuais (pra detectar duplicacoes)
     novo_hash = _hash_tree_snapshot((tree, tree_mva, tree_eh))
     if LAST_HASH_MERGE == novo_hash:
-        messagebox.showinfo("Aviso", "âš ï¸ Esses dados jÃ¡ foram mesclados. Nenhuma alteraÃ§Ã£o detectada.")
+        messagebox.showinfo("Aviso", "⚠️ Esses dados já foram mesclados. Nenhuma alteração detectada.")
         return
 
     LAST_HASH_MERGE = novo_hash
@@ -12140,7 +12353,7 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
     # ------------------ THREAD WORKER ------------------
     def worker():
         try:
-            # 1ï¸âƒ£ Extrai dados da tabela de PDFs
+            # 1️⃣ Extrai dados da tabela de PDFs
             dados_pdf = {}
             for item in tree.get_children():
                 vals = tree.item(item)["values"]
@@ -12156,7 +12369,7 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                     "total_vendas": total_vendas
                 }
 
-            # 2ï¸âƒ£ Extrai dados das planilhas MVA e EH
+            # 2️⃣ Extrai dados das planilhas MVA e EH
             def extrair_dados(tree_view):
                 dados = {}
                 for item in tree_view.get_children():
@@ -12171,20 +12384,20 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                         dados[vendedor]["total_vendas"] += total_vendas
                 return dados
 
-            dados_mva = extrair_dados(tree_mva)
-            dados_eh = extrair_dados(tree_eh)
-
-            # 3ï¸âƒ£ Soma os dois (MVA + EH)
             dados_planilha_total = {}
-            for vendedor in set(dados_mva.keys()) | set(dados_eh.keys()):
-                m = dados_mva.get(vendedor, {"atendidos": 0, "total_vendas": 0.0})
-                e = dados_eh.get(vendedor, {"atendidos": 0, "total_vendas": 0.0})
-                dados_planilha_total[vendedor] = {
-                    "atendidos": m["atendidos"] + e["atendidos"],
-                    "total_vendas": m["total_vendas"] + e["total_vendas"]
-                }
+            source_trees = {"MVA": tree_mva, "EH": tree_eh}
+            for source in selected_sources:
+                dados_source = extrair_dados(source_trees[source])
+                for vendedor, dados in dados_source.items():
+                    if vendedor not in dados_planilha_total:
+                        dados_planilha_total[vendedor] = {
+                            "atendidos": 0,
+                            "total_vendas": 0.0,
+                        }
+                    dados_planilha_total[vendedor]["atendidos"] += dados.get("atendidos", 0)
+                    dados_planilha_total[vendedor]["total_vendas"] += dados.get("total_vendas", 0.0)
 
-            # 4ï¸âƒ£ Aplica controle de duplicaÃ§Ã£o incremental (igual ao cÃ³digo original)
+            # 4️⃣ Aplica controle de duplicação incremental (igual ao código original)
             novos_planilha = {}
             for idx, (vendedor, dados) in enumerate(dados_planilha_total.items(), start=1):
                 ultimo = LAST_STATE_SPREADSHEET.get(vendedor, {"atendidos": 0, "total_vendas": 0.0})
@@ -12201,7 +12414,7 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                 progresso = int(idx * 40 / max(1, len(dados_planilha_total)))
                 merge_queue.put(("progress", progresso))
 
-            # 5ï¸âƒ£ Mescla tudo
+            # 5️⃣ Mescla tudo
             total_vendedores = len(set(dados_pdf.keys()) | set(novos_planilha.keys()))
             for idx, vendedor in enumerate(set(dados_pdf.keys()) | set(novos_planilha.keys()), start=1):
                 pdf_data = dados_pdf.get(vendedor, {"atendidos": 0, "devolucoes": 0, "total_clientes": 0, "total_vendas": 0})
@@ -12256,7 +12469,8 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
                         ))
                     _scroll_tree_to_top(tree)
                     progress_var.set(100)
-                    messagebox.showinfo("ConcluÃ­do", "âœ… Mesclagem das tabelas (PDF + MVA + EH) finalizada!")
+                    scope_label = " + ".join(selected_sources)
+                    messagebox.showinfo("Concluído", f"Mesclagem das tabelas (PDF + {scope_label}) finalizada!")
                     return
                 elif kind == "error":
                     messagebox.showerror("Erro", f"Erro na mesclagem: {payload}")
@@ -12269,7 +12483,7 @@ def mesclar_tabelas_duplas(tree, progress_var, progress_bar, root, label_files_v
 
 def analisar_SALES_PERIOD(caminho_pdf):
     """
-    Analisa as datas de vendas em um PDF e retorna o perÃ­odo de vendas.
+    Analisa as datas de vendas em um PDF e retorna o período de vendas.
     """
     
     from datetime import datetime

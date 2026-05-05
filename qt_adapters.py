@@ -86,13 +86,21 @@ class QtButtonAdapter:
 
 
 class QtTreeAdapter:
-    def __init__(self, table: QtWidgets.QTableWidget, columns: Iterable[str]) -> None:
+    def __init__(
+        self,
+        table: QtWidgets.QTableWidget,
+        columns: Iterable[str],
+        *,
+        hide_header_when_empty: bool = False,
+    ) -> None:
         self._table = table
         self._columns = list(columns)
+        self._hide_header_when_empty = hide_header_when_empty
         self._table.setColumnCount(len(self._columns))
         self._table.setHorizontalHeaderLabels(self._columns)
         self._next_id = 0
         self._table.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignCenter)
+        self._sync_header_visibility()
 
     def get_children(self) -> List[int]:
         ids = []
@@ -109,11 +117,13 @@ class QtTreeAdapter:
         row = self._find_row(item_id)
         if row is not None:
             self._table.removeRow(row)
+            self._sync_header_visibility()
 
     def insert(self, _parent: str, _index: str, values: Iterable[object]):
         item_id = self._next_id
         self._next_id += 1
         self._insert_row(self._table.rowCount(), values, item_id)
+        self._sync_header_visibility()
         return item_id
 
     def item(self, item_id: int) -> dict:
@@ -184,3 +194,8 @@ class QtTreeAdapter:
             if col == 0:
                 item.setData(QtCore.Qt.UserRole, item_id)
             self._table.setItem(row, col, item)
+
+    def _sync_header_visibility(self) -> None:
+        if not self._hide_header_when_empty:
+            return
+        self._table.horizontalHeader().setVisible(self._table.rowCount() > 0)

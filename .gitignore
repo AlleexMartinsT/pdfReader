@@ -5,6 +5,7 @@ gmail_oauth_client.json
 gmail_oauth_token.json
 body_email.txt
 azulzinha_browser/
+feedback_blacklist.json
 data/credenciaisAPI.json
 data/credenciaisDB.json
 data/caixa_pix_cache.json
@@ -33,6 +34,8 @@ __pycache__/
 debug_*.txt
 debug_*.html
 debug_*.json
+azulzinha_*.html
+azulzinha_*.json
 portal_*.html
 test_*.txt
 status_*.txt

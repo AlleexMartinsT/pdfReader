@@ -30,7 +30,7 @@ Desktop application for reconciling sales reports from two business flows:
   - The portal-state classifier now distinguishes the `/Login` sub-screens by visible content, so device and token pages are no longer mistaken for the CNPJ/password login form or for authenticated `Home`.
   - The automation no longer treats `/MinhasVendas` or `/Home` in the URL alone as proof that the sales area is ready; it now requires the visible sales UI.
   - Each Caixa/Azulzinha automation run now uses a fresh temporary browser profile to reduce failures caused by stale session state.
-  - The Caixa/Azulzinha browser now opens in a visible window during automation so the user can inspect the portal flow when needed.
+  - The Caixa/Azulzinha browser now runs off-screen and minimized during automation, keeping the portal flow hidden from the user.
 - Auto-downloaded EH PIX/card reports named with `_auto` are preserved after parsing so the user can open them, while leftover partial `.crdownload` files are cleaned.
 - Caixa/Azulzinha raw downloads now land in a temporary company-isolated folder and are only then persisted as `..._eh_auto` or `..._mva_auto`, preventing EH/MVA files with the same original name from colliding.
 - Local Caixa/Azulzinha auto reports are now company-bound during reuse, so EH never reuses `_mva_auto` files and MVA never reuses `_eh_auto` files from a previous automation run.
@@ -59,7 +59,33 @@ Desktop application for reconciling sales reports from two business flows:
 - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.
 - The main window now includes a cashier automation controller beside `Cancel`; while enabled, it runs the same-day morning flow at `13:30` and the same-day afternoon flow at `18:10`, and it still sends only the resulting `Fechamento de Caixa` reports straight to the Windows default printer.
 - The main window now uses an operations-dashboard layout with a grouped sidebar, status cards, a dedicated control strip, and a stacked content area for tables/graphs.
+- The dashboard headings, helper text, and status-card copy are now centered to keep the main flow visually guided.
+- The Qt UI now binds its visible widgets to the loaded `Lexend` application font at `QApplication` level, reducing fallback/system-font drift across cards, tabs, tables, and controls.
+- The main application UI now uses `Lexend` at a `10 pt` base size instead of the previous `12 pt`, making the dashboard denser while preserving the larger styled headings and badges.
+- The refreshed dashboard/report UI now uses subtle blue/orange gradients and soft card shadows, keeping more depth without adding flashy effects.
+- The dashboard color redesign is now based on the local Gemini visual reference, shifting the app to a slate / petrol-blue / bronze palette across background, cards, buttons, tables, tabs, and status states.
+- The `Importar` action now keeps the updated coral highlight without bold text, matching the weight of the other dashboard buttons more closely.
+- The `Importar` action now stays available through the first PDF import, then disables itself and drops the coral highlight only after both PDFs are loaded, matching the unavailable-state cue used by the other blocked dashboard actions until `Limpar` resets the workspace.
+- The `Workspace` status card now switches from the waiting gold tone to a green palette when its value changes to `Pronto`.
+- The `Workspace` status card now turns `Pronto` only when the main PDF table has data; loading the online spreadsheets alone no longer marks the workspace as ready.
+- Dashboard text labels such as `Hub operacional`, `Pendências`, `Workspace`, and status notes now render with transparent backgrounds so their text blocks blend into the cards instead of showing darker text rectangles.
+- The main dashboard no longer spends vertical space on the automation helper sentence above `Cancelar`, and the whole right-side work area now scrolls like a page when `Resumo principal` / `Planilhas online` need more height.
+- The `Planilhas online` dashboard card now renders without its extra small heading, leaving more vertical space for the spreadsheet tables themselves.
+- Online spreadsheet tables now use an even smaller data font, shorten `Clientes Atendidos` to `Clientes`, keep their column headers hidden until data is loaded, and prioritize the `Vendedor` column width over the numeric columns, reducing name truncation without growing the card.
+- Dashboard and report tables now lock the mouse-wheel scroll while hovered, so the outer page scroll only moves when the pointer is outside the table area.
+- Empty dashboard tables now show a centered document-style placeholder icon inspired by the Gemini reference, instead of looking like a flat blank area while no rows are loaded.
+- The dashboard and cashier-report tables now use taller table areas and wider balanced column layouts, so the grid sections no longer collapse down to almost only their titles.
+- Online spreadsheet success/cancel popups now use plain text without emojis.
+- The table-merge completion popup now also uses plain text without the previous checkmark emoji.
+- Shared popup dialogs now center their action buttons, and the shared `Yes/No` confirmations are shown as `Sim/Não`.
+- Shared popup dialogs and confirmation windows now use the `Lexend` popup font at `10 pt`, reducing the visual weight of modal prompts.
+- Visible UI text, chips, tabs, table headers, and printed table headings now keep normal weight instead of bold, following the lighter dashboard style.
+- Online spreadsheet reloads no longer touch Qt widgets from worker threads; repeated loads now keep the no-change/success warnings on the UI thread and avoid the previous cross-thread crash.
+- The import neon highlight now stays active until PDF data is really loaded, the Caixa CNPJ chooser uses compact centered buttons and spells out `Eletrônica Horizonte`, and the main dashboard no longer shows the `Resumo principal` heading while text-input/table surfaces use a softer background.
+- The feedback flow is now wider, no longer polls the database every 2 seconds, groups canonical aliases such as `01 A Martins` and `Alessandro Martins` into one seller by default, and includes a `Lista Negra` to opt sellers out of future automatic grouping.
+- The main loading bar now shares the same row with `Cancelar` and the automation power button, freeing one more line in the dashboard.
 - The cashier report dialog now uses a denser card-based layout with a header badge, scope/status chips, section cards, and scrollable tabs.
+- The cashier report dialog no longer crashes while building its redesigned header/meta chips; the shared soft-shadow helper is now available inside that dialog too.
 - Read-only cashier/report tables now render through Qt model/view `QTableView` models, and the static report tabs are built lazily on first open to keep the UI more responsive.
 - The same automation can now be triggered from the UI with a 5-second test countdown, using the same direct-print flow as the scheduled run without an intermediate preview.
 - If the default printer is unavailable during an automatic cashier print, the app now keeps the ready HTML print job as pending, exposes per-company pending-print buttons in the UI, and retries again at `08:00` on the next day while automation remains enabled.
@@ -88,6 +114,7 @@ Desktop application for reconciling sales reports from two business flows:
 - Keeps the `Dinheiro` row in value-correlation tables under the `Caixa` column, since it comes from the cashier closing instead of bank-payment exports.
 - Uses smaller A4/report-export titles and Lexend in printed/exported cashier reports when the bundled font is available.
 - Normalizes mojibake and broken PT-BR accents in dialogs, reports, and printed output using `ftfy` plus internal fallbacks.
+- The current UI text layer also cleans the remaining PT-BR accent issues in dialogs, automation prompts, scheduler labels, and Caixa/Azulzinha status messages.
 - Auto-updates from GitHub releases using the ZIP asset.
 
 ### Development
@@ -179,11 +206,62 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
   - Relatorios automaticos da EH com nome `_auto` agora ficam disponiveis depois do parse para o usuario abrir, e apenas sobras parciais como `.crdownload` sao limpas.
   - Os downloads brutos da Caixa/Azulzinha agora primeiro caem em uma pasta temporaria isolada por empresa e so depois sao salvos como `..._eh_auto` ou `..._mva_auto`, evitando colisao entre arquivos da EH e da MVA que venham com o mesmo nome original.
   - Os relatorios automaticos locais da Caixa/Azulzinha agora ficam presos a sua propria empresa no reaproveitamento, entao a EH nunca reutiliza arquivos `_mva_auto` e a MVA nunca reutiliza arquivos `_eh_auto` de uma execucao anterior.
-  - O navegador da Caixa/Azulzinha agora abre em janela visivel durante a automacao, para que o usuario possa inspecionar o fluxo do portal quando precisar.
+  - O navegador da Caixa/Azulzinha agora roda fora da tela e minimizado durante a automacao, mantendo o fluxo do portal oculto para o usuario.
   - O fluxo agora so entra na etapa de token quando a interface real de token ou de entrega estiver visivel, evitando saltos falsos para fora da tela de login.
 - A janela principal agora tem um controlador de automacao do caixa ao lado de `Cancelar`; quando ligado, ele roda o fechamento da manha no mesmo dia as `13:30` e o da tarde no mesmo dia as `18:10`, e continua enviando apenas os relatorios de `Fechamento de Caixa` direto para a impressora padrao do Windows.
 - A janela principal agora usa um layout de hub operacional, com barra lateral agrupada, cards de status, faixa dedicada de controle e area central empilhada para tabelas/graficos.
+- Os titulos, textos auxiliares e textos dos cards de status do dashboard agora ficam centralizados para deixar o fluxo principal mais guiado visualmente.
+- A UI Qt agora prende os widgets visiveis a fonte `Lexend` carregada no nivel do `QApplication`, reduzindo mistura com fonte de sistema em cards, abas, tabelas e controles.
+- A interface principal agora usa `Lexend` com tamanho base de `10 pt` em vez dos `12 pt` anteriores, deixando o dashboard mais denso sem mexer nos titulos e badges maiores estilizados.
+- O dashboard e os relatorios renovados agora usam gradientes suaves em azul/laranja e sombras leves nos cards, adicionando profundidade sem ficar chamativo.
+- O redesign de cores do dashboard agora foi alinhado à referência visual local do Gemini, com uma paleta ardósia / azul-petróleo / bronze aplicada ao fundo, cards, botões, tabelas, abas e estados.
+- A ação `Importar` agora mantém o destaque coral atualizado sem texto em negrito, ficando mais alinhada ao peso dos demais botões do dashboard.
+- A ação `Importar` agora continua disponível após o primeiro PDF e só se desabilita, perdendo o destaque coral, depois que os dois PDFs forem carregados, seguindo o mesmo sinal visual de indisponível usado pelos outros botões bloqueados até que `Limpar` libere o workspace novamente.
+- O card de status `Workspace` agora troca do dourado de espera para uma paleta verde quando o valor muda para `Pronto`.
+- O card de status `Workspace` agora só muda para `Pronto` quando a tabela principal de PDF tiver dados; carregar apenas as planilhas online não marca mais o workspace como pronto.
+- Os rótulos de texto do dashboard, como `Hub operacional`, `Pendências`, `Workspace` e notas de status, agora usam fundo transparente para não marcar um retângulo mais escuro atrás do texto.
+- O dashboard principal nao gasta mais altura com a frase auxiliar acima de `Cancelar`, e toda a area de trabalho da direita agora ganha rolagem vertical tipo pagina quando `Resumo principal` / `Planilhas online` precisarem de mais espaco.
+- O card das planilhas agora nao mostra mais o titulo pequeno `Planilhas online`, deixando mais altura util para as proprias tabelas.
+- As tabelas das planilhas online agora usam uma fonte de dados ainda menor, encurtam `Clientes Atendidos` para `Clientes`, deixam os cabecalhos ocultos ate haver dados carregados e priorizam a largura da coluna `Vendedor` sobre as colunas numericas, reduzindo cortes de nomes sem aumentar o card.
+- As tabelas do dashboard e dos relatorios agora prendem o scroll do mouse enquanto o cursor estiver sobre elas, entao a pagina externa so rola quando o mouse estiver fora da area da tabela.
+- As tabelas vazias do dashboard agora mostram um icone central de documento inspirado na referencia do Gemini, em vez de ficarem como uma area lisa e sem estado visual enquanto nao houver linhas carregadas.
+- As tabelas do dashboard e do dialogo de `Caixa` agora usam areas mais altas e colunas mais equilibradas, para que os grids nao desabem e fiquem mostrando quase so o titulo da secao.
+- Os popups de sucesso/cancelamento da planilha online agora usam texto simples, sem emojis.
+- O popup de conclusão da mesclagem de tabelas agora também usa texto simples, sem o antigo emoji de confirmação.
+- Os popups compartilhados agora centralizam os botoes de acao, e as confirmacoes compartilhadas de `Yes/No` passam a aparecer como `Sim/Não`.
+- Os popups compartilhados e janelas de confirmação agora usam a fonte `Lexend` em `10 pt`, reduzindo o peso visual dos modais.
+- O recarregamento da planilha online nao toca mais widgets Qt a partir de worker threads; os avisos de sucesso/sem mudancas agora voltam pela thread da interface e evitam o crash anterior de parent/thread.
+- O destaque neon do `Importar` agora continua ate haver PDFs carregados de verdade, o seletor de CNPJ do `Caixa` usa botoes compactos e centralizados com `Eletrônica Horizonte` por extenso, e o dashboard principal nao mostra mais o titulo `Resumo principal`, enquanto campos de texto e tabelas usam um fundo mais suave.
+- O fluxo de feedback agora ficou mais largo, nao consulta mais o banco a cada 2 segundos, agrupa aliases canonicos como `01 A Martins` e `Alessandro Martins` como um vendedor por padrao e inclui uma `Lista Negra` para tirar vendedores desse agrupamento automatico nas proximas vezes.
+- A barra principal de loading agora fica na mesma linha de `Cancelar` e do botao de energia da automacao, liberando mais uma faixa vertical no dashboard.
 - O dialogo de `Caixa` agora usa um layout mais denso baseado em cards, com badge da empresa, chips de escopo/status, secoes em cards e abas rolaveis.
+- O dialogo de `Caixa` nao cai mais ao montar os chips redesenhados do cabecalho; o helper compartilhado de sombra suave agora tambem esta disponivel dentro desse dialogo.
+- O fechamento final de `Caixa` agora preserva o escopo manual filtrado (`Tarde`, por exemplo) no relatorio exibido e impresso, em vez de voltar a mostrar `Diário` depois da comparacao final.
+- A escolha manual entre `Diário` e `Tarde` agora usa um dialogo proprio com botoes dedicados, com texto mais direto e sem listar as janelas detectadas no popup.
+- As colunas `Fechamento`, `Detalhe` e `Valor` das tabelas de conciliacao do `Caixa` agora usam larguras menores, deixando os grids mais compactos e legiveis.
+- O fluxo de `Feedback` agora oculta usuarios da lista negra na lista principal por padrao, permite abrir um mini-menu no topo direito para `Mostrar lista negra` e atualiza o botao `Lista Negra` com estado visual de adicionar/remover, recarregando a lista assim que o usuario entra ou sai da blacklist.
+- As mensagens de confirmacao da `Lista Negra` no feedback agora usam texto no singular (`Este vendedor...`) em vez de `Os nomes deste vendedor...`.
+- Os popups de confirmacao baseados em `Sim/Não` agora resolvem a escolha antes de o `QMessageBox` ser destruido, evitando o crash ao confirmar a mesclagem quando apenas uma origem foi importada.
+- O card `Modo atual` foi removido do painel principal do dashboard para simplificar a leitura e deixar apenas `Automação`, `Pendências` e `Workspace`.
+- O card `Pendências` agora deixa a linha de detalhe vazia quando o total está em `0`, exibindo observações abaixo do número apenas quando há algo pendente para informar.
+- Quando a tabela principal entra em modo de edição, as linhas horizontais e verticais do grid agora ganham um vermelho suave para sinalizar visualmente que a edição está ativa.
+- No modo de edição da tabela principal, o destaque da linha agora segue o mouse e o clique no mesmo comportamento visual, mantendo apenas uma linha iluminada por vez na posição onde o cursor parou.
+- Os cards de topo do dashboard (`Automação`, `Pendências` e `Workspace`) agora usam largura uniforme mais comprimida e deixam sobra lateral na linha, em vez de se esticarem até as bordas do painel.
+- O cabeçalho de arquivos carregados agora usa o texto curto `Nenhum arquivo carregado` e, quando há PDF importado, mostra apenas `nome-do-arquivo (MVA/EH)` sem os prefixos `Arquivo carregado:` ou `Arquivos carregados:`.
+- O resumo da automação agora usa blocos em múltiplas linhas para `Impressos enviados`, `Avisos` e `Falhas`, deixando os alertas mais legíveis no painel e no popup do teste.
+- Na automação da `EH`, se a Caixa/Azulzinha falhar e a comparação cair em `Financeiro > Movimentações do Zweb`, a impressão do fechamento deixa de ser liberada automaticamente; o Financeiro do Zweb não é tratado como fonte válida para essa comparação.
+- Na automação da `MVA`, se a consulta fiscal ao `Minhas Notas` ficar indisponível, a impressão automática também é bloqueada; sem essa validação, a conferência da MVA não é tratada como pronta para imprimir.
+- Quando a automação da `EH` é bloqueada antes da impressão por falha da Caixa/Azulzinha ou dependência de `Financeiro Zweb`, isso agora vira pendência real do turno (`manhã`/`tarde`) no painel, aumentando o card `Pendências` e liberando um botão de retomada da `EH`.
+- As tabelas do dialogo de `Fechamento de Caixa` agora tambem usam um alvo total de largura menor, sem esticar desnecessariamente os grids centrais quando ha poucas colunas.
+- As tabelas curtas de `CF sem Transacao Bancaria` e `Cupons Cancelados` no `Fechamento de Caixa` agora encolhem pela largura real das colunas, removendo a faixa vazia que sobrava a direita do `Valor`.
+- A automacao da Caixa/Azulzinha agora reconhece melhor exportacoes de `cartoes` em `JSON`/`XLSX` e tambem checa o download fisico durante a propria espera da exportacao, reduzindo os casos em que a MVA ficava parada varios minutos mesmo com o arquivo ja baixado.
+- Quando a MVA encontra mais de um estabelecimento no filtro da Caixa/Azulzinha, o fluxo agora aceita o primeiro que gerar arquivo válido e deixa de insistir nos estabelecimentos seguintes se eles passarem a falhar, evitando travamentos longos no fim do download.
+- As colunas de `Fechamento` e `Detalhe` foram reduzidas mais um nivel no dialogo de `Caixa`, para deixar as secoes bancarias ainda mais compactas.
+- A impressao/exportacao da aba bancaria do `Fechamento de Caixa` da `EH` agora preserva o sufixo de turno no titulo, exibindo `(M)` para manha e `(T)` para tarde quando o escopo foi filtrado.
+- O contador de `Pendências` no `Fechamento de Caixa` agora segue apenas as linhas visíveis da conciliação bancária, sem incluir alertas internos que não aparecem nas tabelas.
+- As tabelas bancárias do `Fechamento de Caixa` agora usam larguras ainda menores para `Pagamentos`, `Fechamento` e `Detalhe`, com alvos totais mais curtos para evitar grids esticados.
+- A mesclagem das planilhas online agora respeita as origens de PDF já importadas: se houver só `MVA` ou só `EH`, o app oferece continuar apenas com a correspondente ou cancelar para importar o outro arquivo; quando ambos existem, continua permitindo mesclar os dois.
+- Os textos visiveis da interface, chips, abas, cabecalhos de tabela e cabecalhos impressos agora usam peso normal em vez de negrito, acompanhando o visual mais leve do dashboard.
 - As tabelas somente leitura de `Caixa`/relatorios agora usam `QTableView` no modelo view/model do Qt, e as abas estaticas do relatorio passam a ser montadas sob demanda na primeira abertura para manter a interface mais responsiva.
 - O mesmo fluxo de automacao agora pode ser disparado pela interface com um teste de 5 segundos, usando a mesma impressao direta da agenda e sem preview intermediario.
 - Se a impressora padrao nao estiver disponivel durante a impressao automatica do caixa, o app agora guarda o HTML pronto como impressao pendente, mostra botoes pendentes por empresa na interface e tenta novamente no dia seguinte as `08:00` enquanto a automacao estiver ligada.
@@ -213,6 +291,6 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - Na EH, a única parte manual são os arquivos locais da maquininha na pasta atual de execução:
   - PIX: `CSV`, `XLSX` ou `PDF`
   - Cartões: `PDF` ou `XLSX`
-- `Caixa > MVA` aceita o relatÃ³rio antigo de Cupons ou o novo fechamento `clipp_exportado.htm.pdf`.
-- Quando o fechamento do Clipp Ã© usado, a MVA tambÃ©m carrega os relatÃ³rios locais de PIX/cartÃµes da Caixa na pasta atual de execução e monta a conciliaÃ§Ã£o bancÃ¡ria no mesmo padrÃ£o da EH.
-- A impressÃ£o A4 do caixa mantÃ©m tabelas centralizadas e quebra de linha para cÃ©lulas longas.
+- `Caixa > MVA` aceita o relatório antigo de Cupons ou o novo fechamento `clipp_exportado.htm.pdf`.
+- Quando o fechamento do Clipp é usado, a MVA também carrega os relatórios locais de PIX/cartões da Caixa na pasta atual de execução e monta a conciliação bancária no mesmo padrão da EH.
+- A impressão A4 do caixa mantém tabelas centralizadas e quebra de linha para células longas.

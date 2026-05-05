@@ -2,9 +2,9 @@ import os
 import re
 import queue
 import threading
-from tkinter import filedialog, messagebox
+from ui_dialogs import filedialog, messagebox
 
-# Importar o globo de funÃ§Ãµes legadas do utils
+# Importar o globo de funções legadas do utils
 from utils import *
 from utils import (
     _UI_REFS,
@@ -525,8 +525,8 @@ def analisar_pdf_resumo_nfce(caminho_pdf: str) -> dict:
 
 def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, btn_cancel, caminho, origem):
     """
-    Inicia processamento do PDF jÃ¡ com o caminho e a origem (MVA/EH) escolhidos.
-    NÃ£o pergunta nada ao usuÃ¡rio â€” a escolha jÃ¡ veio do tk.py.
+    Inicia processamento do PDF já com o caminho e a origem (MVA/EH) escolhidos.
+    Não pergunta nada ao usuário — a escolha já veio do tk.py.
     """
     global listFiles, list_results
 
@@ -535,7 +535,7 @@ def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, bt
 
     # evita duplicados
     if caminho in listFiles:
-        messagebox.showerror("Erro", "Arquivo jÃ¡ importado!")
+        messagebox.showerror("Erro", "Arquivo já importado!")
         return
 
     cancel_event.clear()
@@ -555,7 +555,7 @@ def source_pdf_async(tree, progress_var, progress_bar, root, label_files_var, bt
 
             progress_queue.put(("error", str(e)))
 
-    # habilita botÃ£o cancelar (na main thread via chamada)
+    # habilita botão cancelar (na main thread via chamada)
     btn_cancel.configure(state="normal")
 
     # inicia thread de processamento
@@ -583,17 +583,17 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
         return False
     
     if caminho in listFiles:
-        messagebox.showerror("Erro", "Arquivo jÃ¡ importado!")
+        messagebox.showerror("Erro", "Arquivo já importado!")
         return
     
     try:
         pdfplumber = _get_pdfplumber()
         with pdfplumber.open(caminho) as pdf:
             if pdf.metadata.get("encrypted", False):
-                messagebox.showerror("Erro", "Este PDF estÃ¡ protegido por senha.")
+                messagebox.showerror("Erro", "Este PDF está protegido por senha.")
                 return
     except Exception as e:
-        messagebox.showerror("Erro", f"NÃ£o foi possÃ­vel abrir o PDF: {e}")
+        messagebox.showerror("Erro", f"Não foi possível abrir o PDF: {e}")
         return
 
     # --- Determina origem automaticamente ---
@@ -609,7 +609,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
     else:
         origem = "MVA"
 
-    # Atualiza o label imediatamente com a origem atribuÃ­da
+    # Atualiza o label imediatamente com a origem atribuída
     label_files_var.set(
         f"Carregando: {os.path.basename(caminho)}({origem})"
     )
@@ -623,7 +623,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
                 on_progress=lambda kind, payload: local_queue.put((kind, payload)),
                 cancel_event=cancel_event
             )
-            # embala jÃ¡ com a origem
+            # embala já com a origem
             local_queue.put(("done_add", {"resultados": res, "origem": origem, "caminho": caminho}))
         except Exception as e:
             local_queue.put(("error", str(e)))
@@ -646,7 +646,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
 
                     if resultados.get("__cancelled__"):
                         progress_var.set(0)
-                        messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuÃ¡rio.")
+                        messagebox.showinfo("Cancelado", "Processamento cancelado pelo usuário.")
                     elif resultados.get("__empty__"):
                         messagebox.showwarning(
                             "Aviso",
@@ -656,9 +656,9 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
                         # Armazena os dados
                         listFiles.append(caminho)
                         list_results.append(resultados)
-                        results_by_source[origem].append((caminho, resultados))  # salva tambÃ©m o caminho para referÃªncia
+                        results_by_source[origem].append((caminho, resultados))  # salva também o caminho para referência
 
-                        # ðŸ”¹ Monta o texto do label com todos os arquivos e origens
+                        # 🔹 Monta o texto do label com todos os arquivos e origens
                         partes = []
                         for caminho_salvo in listFiles:
                             nome = os.path.basename(caminho_salvo)
@@ -679,7 +679,7 @@ def adicionar_pdf(tree, progress_var, progress_bar, root, label_files_var):
                             btn_tag.configure(state="normal", fg_color="#44cc64")
                         if btn_add_mais:
                             btn_add_mais.configure(state="disabled", fg_color="#EE9919", text_color_disabled="#D92525")
-                        messagebox.showinfo("ConcluÃ­do", f"PDF adicional processado e atribuÃ­do a {origem}!")
+                        messagebox.showinfo("Concluído", f"PDF adicional processado e atribuído a {origem}!")
                     return
 
                 elif kind == "error":
@@ -707,7 +707,7 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
     last_sale = None
     last_line_type = None
 
-    # se nÃ£o vier nada, cria versÃµes "neutras"
+    # se não vier nada, cria versões "neutras"
     if on_progress is None:
         on_progress = lambda *args, **kwargs: None
     if cancel_event is None:
@@ -834,13 +834,13 @@ def processar_pdf_sem_ui(caminho_pdf, on_progress=None, cancel_event: threading.
                     if linha.strip():
                         last_line_type = "other"
 
-                # Atualiza o progresso a cada pÃ¡gina
+                # Atualiza o progresso a cada página
                 progresso = int(i * 100 / max(1, total))
                 on_progress("progress", progresso)
             except Exception as e:
                 return {"__error__": str(e)}
 
-        # Garante que o progresso chegue a 100% apÃ³s o loop
+        # Garante que o progresso chegue a 100% após o loop
         fechar_vendedor()
     if not resultados:
         return {"__empty__": True}

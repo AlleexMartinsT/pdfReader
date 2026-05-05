@@ -1,7 +1,7 @@
 import os
 import json
-from tkinter import messagebox
 from utils import resource_path
+from ui_dialogs import messagebox
 
 _supabase = None
 

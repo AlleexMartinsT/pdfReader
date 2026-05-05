@@ -10,6 +10,7 @@ import tempfile
 import queue
 import threading
 import difflib
+import unicodedata
 from typing import List, Optional
 from pathlib import Path
 
@@ -54,6 +55,7 @@ from utils import (
     _active_report_dir,
     cleanup_generated_auto_reports,
     list_generated_auto_reports,
+    canonicalize_name,
 )
 from ui_dialogs import messagebox, filedialog, set_parent
 from qt_adapters import (
@@ -66,6 +68,236 @@ from qt_adapters import (
 
 
 _LEXEND_REPORTLAB_FONT_NAME: str | None = None
+
+
+def _center_message_box_buttons(box: QtWidgets.QMessageBox) -> None:
+    box.setFont(_popup_font(box))
+    button_box = box.findChild(QtWidgets.QDialogButtonBox)
+    if button_box is not None:
+        button_box.setCenterButtons(True)
+    for button in box.buttons():
+        button.setMinimumWidth(110)
+
+
+def _popup_font(reference: QtWidgets.QWidget | None = None) -> QtGui.QFont:
+    app = QtWidgets.QApplication.instance()
+    base = None
+    if reference is not None:
+        try:
+            base = reference.font()
+        except Exception:
+            base = None
+    if base is None and app is not None:
+        base = app.font()
+    font = QtGui.QFont(base or QtGui.QFont())
+    if font.pointSizeF() <= 0:
+        font.setPointSize(10)
+    else:
+        font.setPointSizeF(10.0)
+    return font
+
+
+def _build_empty_table_icon(size: int = 90) -> QtGui.QPixmap:
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+    stroke = QtGui.QColor("#F0F5F7")
+    accent = QtGui.QColor("#22D3E6")
+    secondary = QtGui.QColor("#A7B6C2")
+    pen_width = max(4, round(size * 0.055))
+
+    page_left = size * 0.26
+    page_top = size * 0.12
+    page_right = size * 0.72
+    page_bottom = size * 0.84
+    fold = size * 0.16
+    radius = size * 0.06
+
+    path = QtGui.QPainterPath()
+    path.moveTo(page_left + radius, page_top)
+    path.lineTo(page_right - fold, page_top)
+    path.lineTo(page_right, page_top + fold)
+    path.lineTo(page_right, page_bottom - radius)
+    path.quadTo(page_right, page_bottom, page_right - radius, page_bottom)
+    path.lineTo(page_left + radius, page_bottom)
+    path.quadTo(page_left, page_bottom, page_left, page_bottom - radius)
+    path.lineTo(page_left, page_top + radius)
+    path.quadTo(page_left, page_top, page_left + radius, page_top)
+
+    painter.setPen(QtGui.QPen(stroke, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+    painter.setBrush(QtCore.Qt.NoBrush)
+    painter.drawPath(path)
+    painter.drawLine(
+        QtCore.QPointF(page_right - fold, page_top),
+        QtCore.QPointF(page_right - fold, page_top + fold),
+    )
+    painter.drawLine(
+        QtCore.QPointF(page_right - fold, page_top + fold),
+        QtCore.QPointF(page_right, page_top + fold),
+    )
+
+    painter.setPen(QtGui.QPen(secondary, max(2, pen_width - 2), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    bullet_x = page_left + size * 0.08
+    line_start = bullet_x + size * 0.06
+    line_end = page_right - size * 0.08
+    for index in range(3):
+        y = page_top + size * (0.22 + index * 0.12)
+        painter.setBrush(secondary)
+        painter.drawEllipse(QtCore.QPointF(bullet_x, y), size * 0.012, size * 0.012)
+        painter.drawLine(QtCore.QPointF(line_start, y), QtCore.QPointF(line_end, y))
+
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(accent)
+    dot_radius = size * 0.08
+    painter.drawEllipse(
+        QtCore.QPointF(page_right - size * 0.01, page_bottom - size * 0.02),
+        dot_radius,
+        dot_radius,
+    )
+
+    painter.end()
+    return pixmap
+
+
+def _apply_soft_shadow(
+    widget: QtWidgets.QWidget,
+    *,
+    blur: float = 26.0,
+    offset_y: float = 8.0,
+    color: QtGui.QColor | None = None,
+) -> None:
+    effect = QtWidgets.QGraphicsDropShadowEffect(widget)
+    effect.setBlurRadius(blur)
+    effect.setOffset(0.0, offset_y)
+    effect.setColor(color or QtGui.QColor(6, 10, 16, 120))
+    widget.setGraphicsEffect(effect)
+
+
+class ScrollLockTableView(QtWidgets.QTableView):
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        super().wheelEvent(event)
+        event.accept()
+
+
+class ScrollLockTableWidget(QtWidgets.QTableWidget):
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        super().wheelEvent(event)
+        event.accept()
+
+
+class EmptyStateTableWidget(ScrollLockTableWidget):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._empty_state = QtWidgets.QWidget(self.viewport())
+        self._empty_state.setObjectName("tableEmptyState")
+        self._empty_state.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        layout = QtWidgets.QVBoxLayout(self._empty_state)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.setAlignment(QtCore.Qt.AlignCenter)
+
+        self._empty_icon = QtWidgets.QLabel()
+        self._empty_icon.setObjectName("tableEmptyStateIcon")
+        self._empty_icon.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self._empty_icon, 0, QtCore.Qt.AlignCenter)
+
+        self._empty_hint = QtWidgets.QLabel("")
+        self._empty_hint.setObjectName("tableEmptyStateHint")
+        self._empty_hint.setAlignment(QtCore.Qt.AlignCenter)
+        self._empty_hint.hide()
+        layout.addWidget(self._empty_hint, 0, QtCore.Qt.AlignCenter)
+
+        model = self.model()
+        model.rowsInserted.connect(self._sync_empty_state_visibility)
+        model.rowsRemoved.connect(self._sync_empty_state_visibility)
+        model.modelReset.connect(self._sync_empty_state_visibility)
+        self._sync_empty_state_visibility()
+
+    def set_empty_state(self, pixmap: QtGui.QPixmap, message: str = "") -> None:
+        self._empty_icon.setPixmap(pixmap)
+        message = corrigir_texto(str(message or "")).strip()
+        self._empty_hint.setText(message)
+        self._empty_hint.setVisible(bool(message))
+        self._sync_empty_state_geometry()
+        self._sync_empty_state_visibility()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._sync_empty_state_geometry()
+
+    def empty_state_visible(self) -> bool:
+        return self._empty_state.isVisible()
+
+    def _sync_empty_state_geometry(self) -> None:
+        self._empty_state.setGeometry(self.viewport().rect())
+        self._empty_state.raise_()
+
+    def _sync_empty_state_visibility(self, *_args) -> None:
+        self._sync_empty_state_geometry()
+        self._empty_state.setVisible(self.rowCount() == 0)
+
+
+def _feedback_blacklist_path() -> str:
+    return resource_path("feedback_blacklist.json")
+
+
+def _feedback_blacklist_key(name: str) -> str:
+    return re.sub(r"\s+", " ", corrigir_texto(name or "").strip()).casefold()
+
+
+def _load_feedback_blacklist() -> set[str]:
+    path = _feedback_blacklist_path()
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return set()
+    if isinstance(data, dict):
+        entries = data.get("vendors") or []
+    else:
+        entries = data or []
+    result = set()
+    for item in entries:
+        name = corrigir_texto(str(item or "").strip())
+        if name:
+            result.add(name)
+    return result
+
+
+def _save_feedback_blacklist(vendors: set[str]) -> None:
+    path = _feedback_blacklist_path()
+    payload = {"vendors": sorted(vendors, key=lambda item: item.casefold())}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+
+def _is_feedback_blacklisted(blacklist: set[str], name: str) -> bool:
+    key = _feedback_blacklist_key(name)
+    return any(_feedback_blacklist_key(item) == key for item in blacklist)
+
+
+def _feedback_display_name(raw_name: str, blacklist: set[str]) -> str:
+    clean_name = corrigir_texto(str(raw_name or "").strip())
+    if not clean_name:
+        return ""
+    if _is_feedback_blacklisted(blacklist, clean_name):
+        return clean_name
+    return corrigir_texto(canonicalize_name(clean_name))
+
+
+def _feedback_sort_key(entry: dict) -> tuple[dt.datetime, str]:
+    raw_ts = str(entry.get("created_at") or entry.get("created_at_ts") or "").strip()
+    for fmt in ("%d-%m-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(raw_ts[:19], fmt), raw_ts
+        except Exception:
+            continue
+    return dt.datetime.min, raw_ts
 
 
 def _get_reportlab_font_names() -> tuple[str, str]:
@@ -120,7 +352,7 @@ def _resolve_default_printer() -> QtPrintSupport.QPrinter:
     _configure_printer_for_a4(printer)
     if not printer.isValid():
         raise RuntimeError(
-            f"A impressora padrao '{printer_name}' nao esta disponivel para impressao."
+            f"A impressora padrão '{printer_name}' não está disponível para impressão."
         )
     return printer
 
@@ -157,7 +389,7 @@ def _render_html_document_to_printer(
     )
     page_rect = printer.pageRect(QtPrintSupport.QPrinter.Point)
     if page_rect.width() <= 0 or page_rect.height() <= 0:
-        raise RuntimeError("A impressora selecionada nao retornou uma area de pagina valida.")
+        raise RuntimeError("A impressora selecionada não retornou uma área de página válida.")
     document.setPageSize(page_rect.size())
     document.setHtml(html)
     document.print_(printer)
@@ -240,18 +472,27 @@ class ReadOnlyTableModel(QtCore.QAbstractTableModel):
 class SourceDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self.setWindowTitle("Origem do PDF")
         self.setModal(True)
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel("Este PDF pertence a qual empresa?"))
+        label = QtWidgets.QLabel("Este PDF pertence a qual empresa?")
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(label)
         self._choice = None
 
         btn_mva = QtWidgets.QPushButton("MVA")
         btn_eh = QtWidgets.QPushButton("HORIZONTE")
         btn_mva.clicked.connect(lambda: self._set_choice("MVA"))
         btn_eh.clicked.connect(lambda: self._set_choice("EH"))
-        layout.addWidget(btn_mva)
-        layout.addWidget(btn_eh)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch()
+        for btn in (btn_mva, btn_eh):
+            btn.setStyleSheet("text-align:center;")
+            btn.setMinimumWidth(120)
+            buttons.addWidget(btn)
+        buttons.addStretch()
+        layout.addLayout(buttons)
 
         self.setFixedSize(280, 140)
 
@@ -268,6 +509,7 @@ class SourceDialog(QtWidgets.QDialog):
 class InstructionDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, title: str, message: str) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self.setWindowTitle(corrigir_texto(title))
         self.setModal(True)
         self.resize(430, 170)
@@ -300,6 +542,7 @@ class InstructionDialog(QtWidgets.QDialog):
 class LoadingStatusDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, title: str, message: str) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self._cancelled = False
         self._closing_programmatically = False
         self._last_log_message = ""
@@ -368,6 +611,7 @@ class LoadingStatusDialog(QtWidgets.QDialog):
 class AutomationTimeDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, current_time: QtCore.QTime) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self.setWindowTitle("Horario da automacao")
         self.setModal(True)
         self.setFixedSize(320, 150)
@@ -395,6 +639,7 @@ class AutomationTimeDialog(QtWidgets.QDialog):
         btn_cancel = buttons.addButton("Cancelar", QtWidgets.QDialogButtonBox.RejectRole)
         btn_confirm.setStyleSheet("text-align:center;")
         btn_cancel.setStyleSheet("text-align:center;")
+        buttons.setCenterButtons(True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -408,10 +653,11 @@ class AutomationTimeDialog(QtWidgets.QDialog):
 class CaixaCnpjDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self.setWindowTitle("Caixa - CNPJ")
         self.setModal(True)
         self._choice = None
-        self.resize(300, 150)
+        self.resize(460, 160)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(12)
@@ -422,11 +668,18 @@ class CaixaCnpjDialog(QtWidgets.QDialog):
         layout.addWidget(label)
 
         btn_mva = QtWidgets.QPushButton("MVA")
-        btn_eh = QtWidgets.QPushButton("EH")
+        btn_eh = QtWidgets.QPushButton("Eletrônica Horizonte")
+        buttons_row = QtWidgets.QHBoxLayout()
+        buttons_row.setSpacing(12)
+        buttons_row.addStretch()
         for btn in (btn_mva, btn_eh):
             btn.setStyleSheet("text-align:center;")
             btn.setMinimumHeight(36)
-            layout.addWidget(btn)
+            btn.setMinimumWidth(150)
+            btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            buttons_row.addWidget(btn)
+        buttons_row.addStretch()
+        layout.addLayout(buttons_row)
 
         btn_mva.clicked.connect(lambda: self._set_choice("MVA"))
         btn_eh.clicked.connect(lambda: self._set_choice("EH"))
@@ -444,6 +697,7 @@ class CaixaCnpjDialog(QtWidgets.QDialog):
 class CaixaDateDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, title: str, message: str) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self.setWindowTitle(title)
         self.setModal(True)
         self.resize(300, 160)
@@ -479,18 +733,107 @@ class CaixaDateDialog(QtWidgets.QDialog):
         return self._date_edit.date().toString("dd/MM/yyyy")
 
 
+class CaixaScopeDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+        *,
+        company_label: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setFont(_popup_font(self))
+        self.setWindowTitle(f"Caixa {company_label}")
+        self.setModal(True)
+        self.resize(460, 220)
+        self._choice: str | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        label = QtWidgets.QLabel("O Fechamento de caixa foi concluído")
+        label.setWordWrap(True)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(label)
+
+        info = QtWidgets.QLabel("Qual relatório deve ser gerado?")
+        info.setWordWrap(True)
+        info.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(info)
+
+        buttons_row = QtWidgets.QHBoxLayout()
+        buttons_row.setSpacing(12)
+        buttons_row.addStretch()
+
+        btn_daily = QtWidgets.QPushButton("Diário")
+        btn_afternoon = QtWidgets.QPushButton("Tarde")
+        btn_cancel = QtWidgets.QPushButton("Cancelar")
+        for btn in (btn_daily, btn_afternoon, btn_cancel):
+            btn.setMinimumHeight(36)
+            btn.setMinimumWidth(116)
+            btn.setStyleSheet("text-align:center;")
+            buttons_row.addWidget(btn)
+
+        buttons_row.addStretch()
+        layout.addLayout(buttons_row)
+
+        btn_daily.clicked.connect(lambda: self._set_choice("daily"))
+        btn_afternoon.clicked.connect(lambda: self._set_choice("afternoon"))
+        btn_cancel.clicked.connect(self.reject)
+
+    def _set_choice(self, value: str) -> None:
+        self._choice = value
+        self.accept()
+
+    def choice(self) -> str | None:
+        if self.exec() == QtWidgets.QDialog.Accepted:
+            return self._choice
+        return None
+
+
 class FeedbackDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget, tree_adapter: QtTreeAdapter) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self._tree = tree_adapter
+        self._show_blacklist_only = False
         self._last_vendedores: List[str] = []
+        self._vendor_aliases: dict[str, list[str]] = {}
         self.setWindowTitle("Feedback dos Vendedores")
-        self.setFixedSize(250, 450)
+        self.setFixedSize(390, 500)
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
 
-        title = QtWidgets.QLabel("Selecione o Vendedor")
-        title.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(title)
+        title_bar = QtWidgets.QWidget()
+        title_bar_layout = QtWidgets.QGridLayout(title_bar)
+        title_bar_layout.setContentsMargins(0, 0, 0, 0)
+        title_bar_layout.setHorizontalSpacing(6)
+        title_bar_layout.setVerticalSpacing(0)
+
+        self._blacklist_menu_button = QtWidgets.QToolButton()
+        self._blacklist_menu_button.setText("▾")
+        self._blacklist_menu_button.setToolTip("Opções da lista negra")
+        self._blacklist_menu_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self._blacklist_menu_button.setStyleSheet("text-align:center; padding:2px 10px;")
+
+        left_spacer = QtWidgets.QWidget()
+        left_spacer.setFixedWidth(34)
+        self._blacklist_menu_button.setFixedWidth(34)
+
+        self._title = QtWidgets.QLabel("")
+        self._title.setAlignment(QtCore.Qt.AlignCenter)
+
+        self._blacklist_menu = QtWidgets.QMenu(self)
+        self._toggle_blacklist_action = self._blacklist_menu.addAction("")
+        self._toggle_blacklist_action.triggered.connect(self._toggle_blacklist_view)
+        self._blacklist_menu_button.setMenu(self._blacklist_menu)
+
+        title_bar_layout.addWidget(left_spacer, 0, 0)
+        title_bar_layout.addWidget(self._title, 0, 1)
+        title_bar_layout.addWidget(self._blacklist_menu_button, 0, 2, QtCore.Qt.AlignRight)
+        title_bar_layout.setColumnStretch(1, 1)
+        layout.addWidget(title_bar)
 
         self._scroll = QtWidgets.QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -501,23 +844,62 @@ class FeedbackDialog(QtWidgets.QDialog):
         layout.addWidget(self._scroll)
 
         self._bottom = QtWidgets.QWidget()
-        bottom_layout = QtWidgets.QVBoxLayout(self._bottom)
-        self._btn_export_all = None
+        bottom_layout = QtWidgets.QHBoxLayout(self._bottom)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(10)
+        bottom_layout.addStretch()
+        self._btn_export_all = QtWidgets.QPushButton("Exportar PDF")
+        self._btn_export_all.setStyleSheet("text-align:center;")
+        self._btn_export_all.clicked.connect(self._export_all)
+        self._btn_export_all.setVisible(False)
+        bottom_layout.addWidget(self._btn_export_all)
         btn_fechar = QtWidgets.QPushButton("Fechar")
         btn_fechar.setStyleSheet("text-align:center;")
         btn_fechar.clicked.connect(self.close)
         bottom_layout.addWidget(btn_fechar)
+        bottom_layout.addStretch()
         layout.addWidget(self._bottom)
+        self._refresh_blacklist_view_menu()
+        self._refresh()
 
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self._refresh)
-        self._timer.start(2000)
+    def _refresh_blacklist_view_menu(self) -> None:
+        if self._show_blacklist_only:
+            self._title.setText("Usuários da Lista Negra")
+            self._toggle_blacklist_action.setText("Mostrar lista principal")
+            self._blacklist_menu_button.setToolTip("Mostrar lista principal")
+        else:
+            self._title.setText("Selecione o Vendedor")
+            self._toggle_blacklist_action.setText("Mostrar lista negra")
+            self._blacklist_menu_button.setToolTip("Mostrar lista negra")
+
+    def _toggle_blacklist_view(self) -> None:
+        self._show_blacklist_only = not self._show_blacklist_only
+        self._last_vendedores = []
+        self._refresh_blacklist_view_menu()
         self._refresh()
 
     def _refresh(self) -> None:
         vendedores_tree = [self._tree.item(i)["values"][0] for i in self._tree.get_children()]
         vendedores_db = listar_vendedores_db()
-        vendedores = sorted(set(vendedores_tree + vendedores_db))
+        blacklist = _load_feedback_blacklist()
+        alias_map: dict[str, set[str]] = {}
+        for raw_name in set(vendedores_tree + vendedores_db):
+            clean_name = corrigir_texto(str(raw_name or "").strip())
+            if not clean_name:
+                continue
+            display_name = corrigir_texto(canonicalize_name(clean_name)).strip() or clean_name
+            alias_map.setdefault(display_name, set()).add(clean_name)
+
+        self._vendor_aliases = {
+            display_name: sorted(aliases, key=lambda item: item.casefold())
+            for display_name, aliases in alias_map.items()
+            if (
+                any(_is_feedback_blacklisted(blacklist, alias) for alias in aliases)
+                if self._show_blacklist_only
+                else not any(_is_feedback_blacklisted(blacklist, alias) for alias in aliases)
+            )
+        }
+        vendedores = sorted(self._vendor_aliases.keys(), key=lambda item: item.casefold())
 
         if vendedores == self._last_vendedores:
             return
@@ -529,7 +911,11 @@ class FeedbackDialog(QtWidgets.QDialog):
                 item.widget().deleteLater()
 
         if not vendedores:
-            self._buttons_layout.addWidget(QtWidgets.QLabel("Nenhum vendedor carregado."))
+            empty_label = QtWidgets.QLabel(
+                "Nenhum usuário na lista negra." if self._show_blacklist_only else "Nenhum vendedor carregado."
+            )
+            empty_label.setAlignment(QtCore.Qt.AlignCenter)
+            self._buttons_layout.addWidget(empty_label)
         else:
             for vendedor in vendedores:
                 btn = QtWidgets.QPushButton(vendedor)
@@ -537,42 +923,70 @@ class FeedbackDialog(QtWidgets.QDialog):
                 btn.clicked.connect(lambda _checked=False, v=vendedor: self._open_obs(v))
                 self._buttons_layout.addWidget(btn)
 
-        if self._btn_export_all:
-            self._btn_export_all.deleteLater()
-            self._btn_export_all = None
+        self._btn_export_all.setVisible(bool(vendedores))
 
-        if vendedores:
-            self._btn_export_all = QtWidgets.QPushButton("Exportar PDF")
-            self._btn_export_all.setStyleSheet("text-align:center;")
-            self._btn_export_all.clicked.connect(lambda: self._export_all(vendedores))
-            self._bottom.layout().insertWidget(0, self._btn_export_all)
-
-    def _export_all(self, vendedores: List[str]) -> None:
+    def _export_all(self) -> None:
         feedbacks_all = []
-        for v in vendedores:
-            feedbacks_all.extend(carregar_feedbacks_db(v))
+        seen_ids: set[object] = set()
+        for vendedor, aliases in self._vendor_aliases.items():
+            for alias in aliases:
+                for fb in carregar_feedbacks_db(alias):
+                    feedback_id = fb.get("id") or (
+                        fb.get("vendedor"),
+                        fb.get("created_at"),
+                        fb.get("feedback"),
+                    )
+                    if feedback_id in seen_ids:
+                        continue
+                    seen_ids.add(feedback_id)
+                    fb_copy = dict(fb)
+                    fb_copy["vendedor"] = vendedor
+                    feedbacks_all.append(fb_copy)
         if not feedbacks_all:
             messagebox.showwarning("Aviso", "Nenhum feedback encontrado para exportar.")
             return
         exportar_feedbacks_pdf("Todos os Vendedores", feedbacks_all)
 
     def _open_obs(self, vendedor: str) -> None:
-        dlg = ObservacoesDialog(self, vendedor)
+        dlg = ObservacoesDialog(
+            self,
+            vendedor,
+            aliases=self._vendor_aliases.get(vendedor) or [vendedor],
+        )
         dlg.exec()
+        self._refresh()
 
 
 class ObservacoesDialog(QtWidgets.QDialog):
-    def __init__(self, parent: QtWidgets.QWidget, vendedor: str) -> None:
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+        vendedor: str,
+        *,
+        aliases: list[str] | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.setFont(_popup_font(self))
         self._vendedor = vendedor
+        self._aliases = sorted(
+            {
+                corrigir_texto(str(alias or "").strip())
+                for alias in (aliases or [vendedor])
+                if str(alias or "").strip()
+            },
+            key=lambda item: item.casefold(),
+        )
+        self._history_feedbacks: list[dict] = []
         self.setWindowTitle(f"Observações - {vendedor}")
-        self.setFixedSize(650, 420)
+        self.setFixedSize(760, 440)
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
 
         title = QtWidgets.QLabel(f"Feedback para {vendedor}")
         font = title.font()
-        font.setBold(True)
-        font.setPointSize(12)
+        font.setBold(False)
+        font.setPointSize(10)
         title.setFont(font)
         title.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(title)
@@ -588,34 +1002,77 @@ class ObservacoesDialog(QtWidgets.QDialog):
         layout.addWidget(self._new_text)
 
         btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch()
         btn_salvar = QtWidgets.QPushButton("Salvar")
         btn_export = QtWidgets.QPushButton("Exportar PDF")
+        self._btn_blacklist = QtWidgets.QPushButton("")
         btn_fechar = QtWidgets.QPushButton("Fechar")
         btn_editar = QtWidgets.QPushButton("Editar")
-        for btn in (btn_salvar, btn_export, btn_fechar, btn_editar):
+        for btn in (btn_salvar, btn_export, self._btn_blacklist, btn_fechar, btn_editar):
             btn.setStyleSheet("text-align:center;")
 
         btn_salvar.clicked.connect(self._save_feedback)
         btn_export.clicked.connect(self._export_pdf)
+        self._btn_blacklist.clicked.connect(self._toggle_blacklist)
         btn_fechar.clicked.connect(self.close)
         btn_editar.clicked.connect(self._edit_feedback)
 
         btn_row.addWidget(btn_salvar)
         btn_row.addWidget(btn_export)
+        btn_row.addWidget(self._btn_blacklist)
         btn_row.addWidget(btn_fechar)
         btn_row.addWidget(btn_editar)
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
         self._confirm_edit = QtWidgets.QPushButton("Confirmar Edição")
         self._confirm_edit.setStyleSheet("text-align:center;")
         self._confirm_edit.clicked.connect(self._confirm_edit_feedback)
         self._confirm_edit.setVisible(False)
-        layout.addWidget(self._confirm_edit)
+        layout.addWidget(self._confirm_edit, alignment=QtCore.Qt.AlignCenter)
 
         self._refresh_history()
+        self._refresh_blacklist_button()
+
+    def _feedback_parent(self) -> "FeedbackDialog | None":
+        parent = self.parent()
+        return parent if isinstance(parent, FeedbackDialog) else None
+
+    def _all_aliases_blacklisted(self) -> bool:
+        blacklist = _load_feedback_blacklist()
+        aliases = self._aliases or [self._vendedor]
+        return bool(aliases) and all(_is_feedback_blacklisted(blacklist, alias) for alias in aliases)
+
+    def _refresh_blacklist_button(self) -> None:
+        all_blacklisted = self._all_aliases_blacklisted()
+        if all_blacklisted:
+            self._btn_blacklist.setText("Remover da Lista Negra")
+            self._btn_blacklist.setToolTip("Este usuário já está na lista negra.")
+            self._btn_blacklist.setStyleSheet(
+                "text-align:center; background-color:#7C3140; color:#F6FAFC; border:1px solid #D2778E;"
+            )
+        else:
+            self._btn_blacklist.setText("Adicionar à Lista Negra")
+            self._btn_blacklist.setToolTip("Mover este usuário para a lista negra.")
+            self._btn_blacklist.setStyleSheet("text-align:center;")
 
     def _refresh_history(self) -> None:
-        historico = carregar_feedbacks_db(self._vendedor)
+        historico: list[dict] = []
+        seen_ids: set[object] = set()
+        for alias in self._aliases:
+            for fb in carregar_feedbacks_db(alias):
+                feedback_id = fb.get("id") or (
+                    fb.get("vendedor"),
+                    fb.get("created_at"),
+                    fb.get("feedback"),
+                )
+                if feedback_id in seen_ids:
+                    continue
+                seen_ids.add(feedback_id)
+                historico.append(dict(fb))
+        historico.sort(key=_feedback_sort_key)
+        self._history_feedbacks = historico
         self._history.setPlainText("")
         if historico:
             lines = []
@@ -625,6 +1082,7 @@ class ObservacoesDialog(QtWidgets.QDialog):
             self._history.setPlainText("\n".join(lines))
         else:
             self._history.setPlainText("Nenhum feedback registrado ainda.\n")
+        self._refresh_blacklist_button()
 
     def _save_feedback(self) -> None:
         texto = self._new_text.toPlainText().strip()
@@ -639,37 +1097,40 @@ class ObservacoesDialog(QtWidgets.QDialog):
             messagebox.showerror("Erro", "Falha ao salvar feedback.")
 
     def _export_pdf(self) -> None:
-        feedbacks = carregar_feedbacks_db(self._vendedor)
+        feedbacks = [dict(fb, vendedor=self._vendedor) for fb in self._history_feedbacks]
         if not feedbacks:
             messagebox.showwarning("Aviso", "Nenhum feedback para exportar.")
             return
         exportar_feedbacks_pdf(self._vendedor, feedbacks)
 
     def _edit_feedback(self) -> None:
-        historico = carregar_feedbacks_db(self._vendedor)
+        historico = list(self._history_feedbacks)
         if not historico:
             messagebox.showwarning("Aviso", "Nenhum feedback encontrado para exportar.")
             return
 
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Editor")
-        dlg.setFixedSize(300, 200)
+        dlg.setFixedSize(360, 200)
         layout = QtWidgets.QVBoxLayout(dlg)
         label = QtWidgets.QLabel("O que deseja fazer?")
         label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(label)
+        buttons_row = QtWidgets.QHBoxLayout()
+        buttons_row.setSpacing(10)
+        buttons_row.addStretch()
         btn_editar = QtWidgets.QPushButton("Editar último")
         btn_excluir = QtWidgets.QPushButton("Excluir último")
         btn_cancelar = QtWidgets.QPushButton("Cancelar")
         for btn in (btn_editar, btn_excluir, btn_cancelar):
             btn.setStyleSheet("text-align:center;")
-        layout.addWidget(btn_editar)
-        layout.addWidget(btn_excluir)
-        layout.addWidget(btn_cancelar)
+            buttons_row.addWidget(btn)
+        buttons_row.addStretch()
+        layout.addLayout(buttons_row)
 
         def acao_editar() -> None:
             dlg.accept()
-            historico_local = carregar_feedbacks_db(self._vendedor)
+            historico_local = list(self._history_feedbacks)
             if historico_local:
                 ultimo = historico_local[-1]["feedback"]
                 self._new_text.setPlainText(ultimo)
@@ -677,7 +1138,10 @@ class ObservacoesDialog(QtWidgets.QDialog):
 
         def acao_excluir() -> None:
             dlg.accept()
-            if excluir_ultimo_feedback(self._vendedor):
+            if not self._history_feedbacks:
+                return
+            ultimo_vendedor = str(self._history_feedbacks[-1].get("vendedor") or self._vendedor).strip() or self._vendedor
+            if excluir_ultimo_feedback(ultimo_vendedor):
                 messagebox.showinfo("Sucesso", "Último feedback excluído.")
                 self._refresh_history()
 
@@ -688,11 +1152,40 @@ class ObservacoesDialog(QtWidgets.QDialog):
 
     def _confirm_edit_feedback(self) -> None:
         novo = self._new_text.toPlainText().strip()
-        if atualizar_ultimo_feedback(self._vendedor, novo):
+        if not self._history_feedbacks:
+            messagebox.showwarning("Aviso", "Nenhum feedback encontrado para editar.")
+            return
+        ultimo_vendedor = str(self._history_feedbacks[-1].get("vendedor") or self._vendedor).strip() or self._vendedor
+        if atualizar_ultimo_feedback(ultimo_vendedor, novo):
             messagebox.showinfo("Sucesso", "Feedback atualizado com sucesso!")
             self._new_text.clear()
             self._refresh_history()
             self._confirm_edit.setVisible(False)
+
+    def _toggle_blacklist(self) -> None:
+        blacklist = _load_feedback_blacklist()
+        aliases = self._aliases or [self._vendedor]
+        all_blacklisted = all(_is_feedback_blacklisted(blacklist, alias) for alias in aliases)
+        if all_blacklisted:
+            updated = {
+                item for item in blacklist
+                if all(_feedback_blacklist_key(item) != _feedback_blacklist_key(alias) for alias in aliases)
+            }
+            _save_feedback_blacklist(updated)
+            messagebox.showinfo("Lista Negra", "Este vendedor foi removido da lista negra.")
+        else:
+            updated = set(blacklist)
+            for alias in aliases:
+                if alias:
+                    updated.add(alias)
+            _save_feedback_blacklist(updated)
+            messagebox.showinfo("Lista Negra", "Este vendedor foi adicionado à lista negra.")
+        parent = self._feedback_parent()
+        if parent is not None:
+            parent._last_vendedores = []
+            parent._refresh()
+        self._refresh_blacklist_button()
+        self.accept()
 
 
 class CaixaReportDialog(QtWidgets.QDialog):
@@ -747,6 +1240,16 @@ class CaixaReportDialog(QtWidgets.QDialog):
         btn_close.setObjectName("secondaryActionButton")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close, alignment=QtCore.Qt.AlignHCenter)
+
+    def _apply_soft_shadow(
+        self,
+        widget: QtWidgets.QWidget,
+        *,
+        blur: float = 26.0,
+        offset_y: float = 8.0,
+        color: QtGui.QColor | None = None,
+    ) -> None:
+        _apply_soft_shadow(widget, blur=blur, offset_y=offset_y, color=color)
 
     def _build_davs_tab_title(self, relatorio: dict) -> str:
         if relatorio.get("caixa_modelo") == "EH":
@@ -810,6 +1313,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         for label_text, value_text in meta_items:
             meta_row.addWidget(self._build_meta_chip(label_text, value_text))
         layout.addLayout(meta_row)
+        self._apply_soft_shadow(frame, blur=22.0, offset_y=7.0, color=QtGui.QColor(10, 16, 24, 110))
         return frame
 
     def _build_meta_chip(self, label_text: str, value_text: str) -> QtWidgets.QFrame:
@@ -826,6 +1330,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
         value.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(label)
         layout.addWidget(value)
+        self._apply_soft_shadow(frame, blur=14.0, offset_y=4.0, color=QtGui.QColor(8, 14, 20, 80))
         return frame
 
     def _add_lazy_static_tab(self, title: str, builder) -> None:
@@ -1012,6 +1517,16 @@ class CaixaReportDialog(QtWidgets.QDialog):
         report["valor_pendente"] = valor_pendente
         report["status"] = status
         report["caixa_modelo"] = fechamento.get("caixa_modelo") or report.get("caixa_modelo") or "EH"
+        report["escopo_relatorio"] = (
+            fechamento.get("escopo_relatorio")
+            or report.get("escopo_relatorio")
+            or ""
+        )
+        report["escopo_horario_aplicado"] = list(
+            fechamento.get("escopo_horario_aplicado")
+            or report.get("escopo_horario_aplicado")
+            or []
+        )
         report["texto_informativo"] = ""
         hidden_pending_count = int(report.get("hidden_pending_count", 0) or 0)
         pendencias_count = sum(
@@ -1082,28 +1597,28 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Correlação de Valores",
                 ("Pagamento", "Caixa", "Pagamentos", "Status"),
                 correlation_rows,
-                [220, 110, 110, 110],
+                [180, 92, 76, 92],
                 "Nenhuma correlação de valores disponível.",
             ),
             (
                 "CF sem Transação Bancária - PIX",
                 ("CF", "Valor"),
                 pix_rows,
-                [340, 140],
+                [180, 100],
                 "Nenhum CF PIX sem transação bancária encontrado.",
             ),
             (
                 "CF sem Transação Bancária - Cartão",
                 ("CF", "Valor"),
                 cartao_rows,
-                [340, 140],
+                [180, 100],
                 "Nenhum CF de cartão sem transação bancária encontrado.",
             ),
             (
                 "Transações Bancárias sem CF/NF",
                 ("Origem", "Detalhe", "Valor"),
                 bank_rows,
-                [110, 400, 120],
+                [76, 220, 100],
                 "Nenhuma transação bancária sem CF/NF encontrada.",
             ),
         ]
@@ -1113,7 +1628,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Cupons Cancelados",
                 ("CF", "Valor"),
                 cancelados_rows,
-                [340, 140],
+                [180, 100],
                 "Nenhum cupom cancelado pendente encontrado.",
             ),
         )
@@ -1171,28 +1686,28 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Correlação de Valores",
                 ("Pagamento", "Caixa", "Pagamentos", "Status"),
                 correlation_rows,
-                [220, 110, 110, 110],
+                [180, 92, 76, 92],
                 "Nenhuma correlação de valores disponível.",
             ),
             (
                 "CF sem Transação Bancária - PIX",
                 (fechamento_label, "Valor"),
                 pix_rows,
-                [340, 140],
+                [170, 100],
                 "Nenhum CF PIX sem transação bancária encontrado.",
             ),
             (
                 "CF sem Transação Bancária - Cartão",
                 (fechamento_label, "Valor"),
                 cartao_rows,
-                [340, 140],
+                [170, 100],
                 "Nenhum CF de cartão sem transação bancária encontrado.",
             ),
             (
                 "Transações Bancárias sem CF/NF",
                 ("Origem", "Detalhe", "Valor"),
                 bank_rows,
-                [110, 400, 120],
+                [76, 220, 100],
                 "Nenhuma transação bancária sem CF/NF encontrada.",
             ),
         ]
@@ -1202,7 +1717,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Cupons Cancelados",
                 (fechamento_label, "Valor"),
                 cancelados_rows,
-                [340, 140],
+                [170, 100],
                 "Nenhum cupom cancelado pendente encontrado.",
             ),
         )
@@ -1348,7 +1863,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             f"Total faltante: R$ {format_number_br(fechamento.get('valor_faltantes', 0.0))}"
         )
         total_font = total_label.font()
-        total_font.setBold(True)
+        total_font.setBold(False)
         total_label.setFont(total_font)
         total_label.setAlignment(QtCore.Qt.AlignCenter)
         total_color = "#59C734" if fechamento.get("status") == "Confere" else "#FF4D4F"
@@ -1498,7 +2013,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
             highlight_status_column=highlight_status,
             parent=self,
         )
-        table = QtWidgets.QTableView()
+        table = ScrollLockTableView()
         table.setModel(model)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -1511,11 +2026,11 @@ class CaixaReportDialog(QtWidgets.QDialog):
         table.setWordWrap(True)
         table.setSortingEnabled(False)
         self._configure_resizable_table(table, widths)
+        self._set_report_table_height(table, len(table_rows))
 
         if not rows:
             table.setSpan(0, 0, 1, len(headers))
 
-        self._fit_table_width(table)
         wrap = QtWidgets.QWidget()
         wrap_layout = QtWidgets.QHBoxLayout(wrap)
         wrap_layout.setContentsMargins(0, 0, 0, 0)
@@ -1542,6 +2057,10 @@ class CaixaReportDialog(QtWidgets.QDialog):
         label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(label)
         layout.addWidget(content)
+        shadow_color = QtGui.QColor(12, 18, 28, 92)
+        if tone == "warning":
+            shadow_color = QtGui.QColor(44, 26, 16, 96)
+        self._apply_soft_shadow(frame, blur=18.0, offset_y=5.0, color=shadow_color)
         return frame
 
     def _build_bank_reconciliation_tab(self, relatorio_pagamento: dict) -> QtWidgets.QWidget:
@@ -1578,35 +2097,35 @@ class CaixaReportDialog(QtWidgets.QDialog):
                     "PIX - CF sem Transação Bancária",
                     ("Fechamento EH", "Valor EH"),
                     list(relatorio_pagamento.get("pix_fechamento_rows") or []),
-                    [250, 110],
+                    [160, 92],
                     "Nenhum CF PIX sem transação bancária encontrado.",
                 ),
                 (
                     "PIX - Transação Bancária sem CF/NF",
                     ("Máquina", "Valor Banco"),
                     list(relatorio_pagamento.get("pix_maquina_rows") or []),
-                    [250, 110],
+                    [160, 92],
                     "Nenhuma transação PIX sem CF/NF encontrada.",
                 ),
                 (
                     "Cartões - CF sem Transação Bancária",
                     ("Fechamento EH", "Valor EH"),
                     list(relatorio_pagamento.get("cartao_fechamento_rows") or []),
-                    [250, 110],
+                    [160, 92],
                     "Nenhum CF de cartão sem transação bancária encontrado.",
                 ),
                 (
                     "Cartões - Transação Bancária sem CF/NF",
                     ("Máquina", "Valor Banco"),
                     list(relatorio_pagamento.get("cartao_maquina_rows") or []),
-                    [250, 110],
+                    [160, 92],
                     "Nenhuma transação de cartão sem CF/NF encontrada.",
                 ),
                 (
                     "Observações",
                     ("Tipo", "Detalhe", "Valor"),
                     list(relatorio_pagamento.get("observacao_rows") or []),
-                    [170, 360, 110],
+                    [120, 210, 92],
                     "Nenhuma observação adicional encontrada.",
                 ),
             ]
@@ -1728,7 +2247,7 @@ class CaixaReportDialog(QtWidgets.QDialog):
 
             if label_text in highlighted_labels:
                 value_font = value.font()
-                value_font.setBold(True)
+                value_font.setBold(False)
                 value_font.setPointSize(value_font.pointSize())
                 value.setFont(value_font)
 
@@ -1761,15 +2280,36 @@ class CaixaReportDialog(QtWidgets.QDialog):
         button.clicked.connect(callback)
         return button
 
+    def _build_empty_table_icon(self, size: int = 90) -> QtGui.QPixmap:
+        return _build_empty_table_icon(size)
+
     def _configure_resizable_table(self, table: QtWidgets.QTableView, widths: list[int]) -> None:
         header = table.horizontalHeader()
         header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
         table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         table.setMinimumSize(0, 0)
-        for index, width in enumerate(widths):
+        effective_widths = [max(68, int(width or 0)) for width in list(widths or [])]
+        for index, width in enumerate(effective_widths):
             table.setColumnWidth(index, width)
+        reserve_width = table.verticalScrollBar().sizeHint().width()
+        compact_width = header.length() + reserve_width + table.frameWidth() * 2 + 6
+        table.setFixedWidth(max(compact_width, 280))
+        header.setMinimumSectionSize(68)
         table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+
+    def _set_report_table_height(self, table: QtWidgets.QTableView, row_count: int) -> None:
+        table.resizeRowsToContents()
+        header_height = max(28, table.horizontalHeader().height())
+        default_row_height = max(30, table.verticalHeader().defaultSectionSize())
+        visible_rows = max(3, min(max(row_count, 1), 5))
+        body_height = 0
+        for index in range(min(row_count, visible_rows)):
+            body_height += max(default_row_height, table.rowHeight(index))
+        if row_count < visible_rows:
+            body_height += default_row_height * (visible_rows - row_count)
+        fixed_height = max(156, header_height + body_height + table.frameWidth() * 2 + 8)
+        table.setFixedHeight(fixed_height)
 
     def _fit_table_width(self, table: QtWidgets.QTableView) -> None:
         width = table.horizontalHeader().length() + table.frameWidth() * 2 + 2
@@ -1827,10 +2367,10 @@ class CaixaReportDialog(QtWidgets.QDialog):
             f"body{{font-family:'{font_family}',Arial,Helvetica,sans-serif;font-size:7.4pt;color:#000;margin:0;padding:0;}}",
             ".page{width:100%;max-width:none;margin:0 auto;padding:0;text-align:center;}",
             "h1{font-size:9pt;text-align:center;margin:0 0 4px 0;white-space:nowrap;overflow-wrap:normal;word-break:normal;}",
-            "h2{font-size:7pt;text-align:center;margin:3px 0 2px 0;font-weight:600;}",
+            "h2{font-size:7pt;text-align:center;margin:3px 0 2px 0;font-weight:400;}",
             "table{width:100%;border-collapse:collapse;table-layout:fixed;margin:0 0 6px 0;}",
             ".section-table th:last-child,.section-table td:last-child{white-space:nowrap;overflow-wrap:normal;word-break:keep-all;}",
-            "th{background:#000;color:#fff;font-weight:bold;}",
+            "th{background:#000;color:#fff;font-weight:400;}",
             "th,td{border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:middle;word-wrap:break-word;overflow-wrap:anywhere;font-size:6.6pt;}",
             "td{background:#fff;color:#000;}",
             "</style></head><body><div class='page'>",
@@ -2180,10 +2720,10 @@ class CaixaReportDialog(QtWidgets.QDialog):
             f"body{{font-family:'{font_family}',Arial,Helvetica,sans-serif;font-size:7.4pt;color:#000;margin:0;padding:0;}}",
             ".page{width:100%;max-width:none;margin:0 auto;padding:0;text-align:center;}",
             "h1{font-size:9pt;text-align:center;margin:0 0 4px 0;white-space:nowrap;overflow-wrap:normal;word-break:normal;}",
-            "h2{font-size:7pt;text-align:center;margin:3px 0 2px 0;font-weight:600;}",
+            "h2{font-size:7pt;text-align:center;margin:3px 0 2px 0;font-weight:400;}",
             "table{width:100%;border-collapse:collapse;table-layout:fixed;margin:0 0 6px 0;}",
             ".section-table th:last-child,.section-table td:last-child{white-space:nowrap;overflow-wrap:normal;word-break:keep-all;}",
-            "th{background:#000;color:#fff;font-weight:bold;}",
+            "th{background:#000;color:#fff;font-weight:400;}",
             "th,td{border:1px solid #777;padding:2px 3px;text-align:center;vertical-align:middle;word-wrap:break-word;overflow-wrap:anywhere;font-size:6.6pt;}",
             "td{background:#fff;color:#000;}",
             "</style></head><body><div class='page'>",
@@ -2529,6 +3069,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Relatório de Vendedor")
         self.setMinimumSize(1050, 800)
         self.resize(1200, 860)
+        self._ui_font_family = "Lexend"
         self._setup_icon()
         self._load_app_font()
         self._sort_state = {}
@@ -2548,6 +3089,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._automation_test_run_at: dt.datetime | None = None
         self._automation_test_scope = "morning"
         self._automation_last_status = "Automacao por turno pronta. Usa o dia atual às 13:30 e 18:10."
+        self._eh_pending_runs: dict[str, dict] = {"morning": {}, "afternoon": {}}
         self._mva_pending_runs: dict[str, dict] = {"morning": {}, "afternoon": {}}
         self._pending_print_jobs: dict[str, list[dict[str, str]]] = {"EH": [], "MVA": []}
 
@@ -2572,6 +3114,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_feedback = QtWidgets.QPushButton("Feedback")
         self.btn_automation_test = QtWidgets.QPushButton("Teste automacao (5s)")
         self.btn_eh_pending_print = QtWidgets.QPushButton("EH impressao pendente")
+        self.btn_eh_pending_morning = QtWidgets.QPushButton("EH manhÃ£ pendente")
+        self.btn_eh_pending_afternoon = QtWidgets.QPushButton("EH tarde pendente")
         self.btn_mva_pending_print = QtWidgets.QPushButton("MVA impressao pendente")
         self.btn_mva_pending_morning = QtWidgets.QPushButton("MVA manhã pendente")
         self.btn_mva_pending_afternoon = QtWidgets.QPushButton("MVA tarde pendente")
@@ -2588,6 +3132,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_feedback,
             self.btn_automation_test,
             self.btn_eh_pending_print,
+            self.btn_eh_pending_morning,
+            self.btn_eh_pending_afternoon,
             self.btn_mva_pending_print,
             self.btn_mva_pending_morning,
             self.btn_mva_pending_afternoon,
@@ -2597,6 +3143,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_eh_pending_print.setVisible(False)
         self.btn_eh_pending_print.setEnabled(False)
+        self.btn_eh_pending_morning.setVisible(False)
+        self.btn_eh_pending_afternoon.setVisible(False)
+        self.btn_eh_pending_morning.setEnabled(False)
+        self.btn_eh_pending_afternoon.setEnabled(False)
         self.btn_mva_pending_print.setVisible(False)
         self.btn_mva_pending_print.setEnabled(False)
         self.btn_mva_pending_morning.setVisible(False)
@@ -2613,9 +3163,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         app_title = QtWidgets.QLabel("Relatórios")
         app_title.setObjectName("appTitleLabel")
+        app_title.setAlignment(QtCore.Qt.AlignCenter)
         app_subtitle = QtWidgets.QLabel("Fluxo diário de caixa e vendedores")
         app_subtitle.setObjectName("appSubtitleLabel")
         app_subtitle.setWordWrap(True)
+        app_subtitle.setAlignment(QtCore.Qt.AlignCenter)
         sidebar_layout.addWidget(app_title)
         sidebar_layout.addWidget(app_subtitle)
         sidebar_layout.addWidget(
@@ -2648,6 +3200,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 (
                     self.btn_automation_test,
                     self.btn_eh_pending_print,
+                    self.btn_eh_pending_morning,
+                    self.btn_eh_pending_afternoon,
                     self.btn_mva_pending_print,
                     self.btn_mva_pending_morning,
                     self.btn_mva_pending_afternoon,
@@ -2655,10 +3209,22 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
         sidebar_layout.addStretch(1)
+        self._apply_soft_shadow(sidebar, blur=34.0, offset_y=10.0, color=QtGui.QColor(7, 12, 20, 140))
 
         main_layout.addWidget(sidebar, 0)
 
-        right_panel = QtWidgets.QVBoxLayout()
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setObjectName("mainScrollArea")
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        right_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        right_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        right_page = QtWidgets.QWidget()
+        right_page.setObjectName("mainScrollPage")
+        right_panel = QtWidgets.QVBoxLayout(right_page)
+        right_panel.setContentsMargins(0, 0, 4, 0)
         right_panel.setSpacing(14)
 
         header_frame = QtWidgets.QFrame()
@@ -2668,27 +3234,29 @@ class MainWindow(QtWidgets.QMainWindow):
         header_layout.setSpacing(6)
         header_title = QtWidgets.QLabel("Hub operacional")
         header_title.setObjectName("heroTitleLabel")
-        header_title.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        self.label_files = QtWidgets.QLabel("Nenhum arquivo carregado ainda")
+        header_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.label_files = QtWidgets.QLabel("Nenhum arquivo carregado")
         self.label_files.setObjectName("heroSubtitleLabel")
-        self.label_files.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.label_files.setAlignment(QtCore.Qt.AlignCenter)
         self.label_files.setWordWrap(True)
         header_layout.addWidget(header_title)
         header_layout.addWidget(self.label_files)
+        self._apply_soft_shadow(header_frame, blur=30.0, offset_y=8.0, color=QtGui.QColor(10, 16, 28, 130))
         right_panel.addWidget(header_frame)
 
         status_row = QtWidgets.QHBoxLayout()
         status_row.setSpacing(12)
+        status_row.addStretch(1)
         self._status_cards: dict[str, dict[str, QtWidgets.QLabel]] = {}
         for key, title in (
             ("automation", "Automação"),
             ("pending", "Pendências"),
             ("workspace", "Workspace"),
-            ("view", "Modo atual"),
         ):
-            frame, value_label, note_label = self._create_status_card(title)
-            self._status_cards[key] = {"value": value_label, "note": note_label}
-            status_row.addWidget(frame, 1)
+            frame, value_label, note_label = self._create_status_card(title, key)
+            self._status_cards[key] = {"frame": frame, "value": value_label, "note": note_label}
+            status_row.addWidget(frame, 0)
+        status_row.addStretch(1)
         right_panel.addLayout(status_row)
 
         controls_frame = QtWidgets.QFrame()
@@ -2696,19 +3264,6 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_layout = QtWidgets.QVBoxLayout(controls_frame)
         controls_layout.setContentsMargins(16, 14, 16, 14)
         controls_layout.setSpacing(10)
-
-        self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setMinimumHeight(20)
-        self.progress_var = QtVar(self.progress_bar.setValue, 0)
-        self.progress_bar_adapter = QtProgressBarAdapter(self.progress_bar)
-        controls_layout.addWidget(self.progress_bar)
-
-        self.progress_bar_online = QtWidgets.QProgressBar()
-        self.progress_bar_online.setMinimumHeight(14)
-        self.progress_var_online = QtVar(self.progress_bar_online.setValue, 0)
-        self.progress_bar_online_adapter = QtProgressBarAdapter(self.progress_bar_online)
-        self.progress_bar_online.setVisible(False)
-        controls_layout.addWidget(self.progress_bar_online)
 
         self.btn_cancel = QtWidgets.QPushButton("Cancelar")
         self.btn_cancel.setSizePolicy(btn_policy)
@@ -2719,32 +3274,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_automation_power.setObjectName("powerActionButton")
         self.btn_automation_power.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
 
-        cancel_row = QtWidgets.QHBoxLayout()
-        controls_caption = QtWidgets.QLabel("Acompanhe carregamentos e controle a automação daqui.")
-        controls_caption.setObjectName("sectionHintLabel")
-        cancel_row.addWidget(controls_caption, 1)
-        cancel_row.addWidget(self.btn_cancel)
-        cancel_row.addWidget(self.btn_automation_power)
-        controls_layout.addLayout(cancel_row)
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setMinimumHeight(20)
+        self.progress_var = QtVar(self.progress_bar.setValue, 0)
+        self.progress_bar_adapter = QtProgressBarAdapter(self.progress_bar)
+        progress_row = QtWidgets.QHBoxLayout()
+        progress_row.setSpacing(10)
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.btn_cancel, 0)
+        progress_row.addWidget(self.btn_automation_power, 0)
+        controls_layout.addLayout(progress_row)
+
+        self.progress_bar_online = QtWidgets.QProgressBar()
+        self.progress_bar_online.setMinimumHeight(14)
+        self.progress_var_online = QtVar(self.progress_bar_online.setValue, 0)
+        self.progress_bar_online_adapter = QtProgressBarAdapter(self.progress_bar_online)
+        self.progress_bar_online.setVisible(False)
+        controls_layout.addWidget(self.progress_bar_online)
+        self._apply_soft_shadow(controls_frame, blur=24.0, offset_y=8.0, color=QtGui.QColor(8, 14, 22, 115))
         right_panel.addWidget(controls_frame)
 
         self.cols_main = ("Vendedor", "Atendidos", "Devoluções", "Total Final", "Total Vendas")
-        self.cols_online = ("Vendedor", "Clientes Atendidos", "Valor Total")
-        self.table_main = QtWidgets.QTableWidget()
+        self.cols_online = ("Vendedor", "Clientes", "Valor Total")
+        self.table_main = EmptyStateTableWidget()
+        self.table_main.setProperty("editModeActive", False)
         self.table_main.setSortingEnabled(False)
-        self.table_main.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.table_main.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table_main.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table_main.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self.table_main.setMouseTracking(True)
         self.table_main.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignCenter)
         self.table_main.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.table_main.setMinimumHeight(430)
+        self.table_main.set_empty_state(_build_empty_table_icon(96))
 
         self.tree_main = QtTreeAdapter(self.table_main, self.cols_main)
+        self.table_main.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        for index in range(1, len(self.cols_main)):
+            self.table_main.horizontalHeader().setSectionResizeMode(index, QtWidgets.QHeaderView.ResizeToContents)
+        self.table_main.horizontalHeader().setMinimumSectionSize(84)
+        self.table_main.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         self.table_main.horizontalHeader().sectionClicked.connect(
             lambda idx: self._sort_table(self.tree_main, self.cols_main, idx)
         )
         self.table_main.itemChanged.connect(self._on_table_item_changed)
+        self.table_main.cellEntered.connect(self._sync_table_hover_selection)
+        self.table_main.cellPressed.connect(lambda row, column: self._sync_table_hover_selection(row, column, force=True))
 
         self.online_container = QtWidgets.QWidget()
         self.online_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.online_container.setMinimumHeight(600)
         online_frame = QtWidgets.QHBoxLayout(self.online_container)
 
         self._setup_planilha_section(
@@ -2764,16 +3343,19 @@ class MainWindow(QtWidgets.QMainWindow):
         dashboard_layout = QtWidgets.QVBoxLayout(dashboard_page)
         dashboard_layout.setContentsMargins(0, 0, 0, 0)
         dashboard_layout.setSpacing(14)
-        dashboard_layout.addWidget(self._create_content_card("Resumo principal", self.table_main), 2)
-        dashboard_layout.addWidget(self._create_content_card("Planilhas online", self.online_container), 1)
+        dashboard_layout.addWidget(self._create_content_card("", self.table_main))
+        dashboard_layout.addWidget(self._create_content_card("", self.online_container))
+        dashboard_layout.addStretch(1)
 
         self.graphs_view = self._build_graphs_view()
         self.content_stack = QtWidgets.QStackedWidget()
         self.content_stack.addWidget(dashboard_page)
         self.content_stack.addWidget(self._create_content_card("Gráficos", self.graphs_view))
-        right_panel.addWidget(self.content_stack, 1)
+        self.content_stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        right_panel.addWidget(self.content_stack)
+        right_panel.addStretch(1)
 
-        self.label_files_var = QtVar(self._set_loaded_files_text, "Nenhum arquivo carregado ainda")
+        self.label_files_var = QtVar(self._set_loaded_files_text, "Nenhum arquivo carregado")
         self.root_adapter = QtRootAdapter(self)
         self._bind_actions()
         self._setup_import_neon()
@@ -2797,7 +3379,8 @@ class MainWindow(QtWidgets.QMainWindow):
         set_parent(self)
         check_for_updates(self.root_adapter)
 
-        main_layout.addLayout(right_panel, 1)
+        right_scroll.setWidget(right_page)
+        main_layout.addWidget(right_scroll, 1)
 
     def _build_sidebar_section(
         self,
@@ -2811,17 +3394,24 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(8)
         label = QtWidgets.QLabel(corrigir_texto(title))
         label.setObjectName("sidebarSectionTitle")
+        label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(label)
         for button in buttons:
             layout.addWidget(button)
+        self._apply_soft_shadow(frame, blur=18.0, offset_y=5.0, color=QtGui.QColor(10, 14, 24, 90))
         return frame
 
     def _create_status_card(
         self,
         title: str,
+        card_type: str = "default",
     ) -> tuple[QtWidgets.QFrame, QtWidgets.QLabel, QtWidgets.QLabel]:
         frame = QtWidgets.QFrame()
         frame.setObjectName("statusCard")
+        frame.setProperty("cardType", card_type)
+        frame.setProperty("cardState", "default")
+        frame.setFixedWidth(184)
+        frame.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         layout = QtWidgets.QVBoxLayout(frame)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(4)
@@ -2832,12 +3422,13 @@ class MainWindow(QtWidgets.QMainWindow):
         note = QtWidgets.QLabel("")
         note.setObjectName("statusCardNote")
         note.setWordWrap(True)
-        label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        note.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        value.setAlignment(QtCore.Qt.AlignCenter)
+        note.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(label)
         layout.addWidget(value)
         layout.addWidget(note)
+        self._apply_soft_shadow(frame, blur=20.0, offset_y=6.0, color=QtGui.QColor(9, 14, 22, 88))
         return frame, value, note
 
     def _create_content_card(self, title: str, widget: QtWidgets.QWidget) -> QtWidgets.QFrame:
@@ -2846,29 +3437,54 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(frame)
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(10)
-        label = QtWidgets.QLabel(corrigir_texto(title))
-        label.setObjectName("contentCardTitle")
-        layout.addWidget(label)
+        if str(title or "").strip():
+            label = QtWidgets.QLabel(corrigir_texto(title))
+            label.setObjectName("contentCardTitle")
+            layout.addWidget(label)
         layout.addWidget(widget, 1)
+        self._apply_soft_shadow(frame, blur=24.0, offset_y=7.0, color=QtGui.QColor(8, 14, 22, 100))
         return frame
 
+    def _apply_soft_shadow(
+        self,
+        widget: QtWidgets.QWidget,
+        *,
+        blur: float = 26.0,
+        offset_y: float = 8.0,
+        color: QtGui.QColor | None = None,
+    ) -> None:
+        _apply_soft_shadow(widget, blur=blur, offset_y=offset_y, color=color)
+
     def _set_loaded_files_text(self, value: object) -> None:
-        text = corrigir_texto(str(value or "Nenhum arquivo carregado ainda"))
+        text = corrigir_texto(str(value or "Nenhum arquivo carregado"))
         self.label_files.setText(text)
         self._refresh_dashboard_status_cards()
 
     def _set_status_card(self, key: str, value: str, note: str) -> None:
         card = self._status_cards.get(key) or {}
+        frame = card.get("frame")
         value_label = card.get("value")
         note_label = card.get("note")
         if value_label:
             value_label.setText(corrigir_texto(value))
         if note_label:
             note_label.setText(corrigir_texto(note))
+        if frame is not None:
+            next_state = "default"
+            if key == "workspace":
+                next_state = "ready" if corrigir_texto(value).strip().casefold() == "pronto" else "waiting"
+            if frame.property("cardState") != next_state:
+                frame.setProperty("cardState", next_state)
+                style = frame.style()
+                if style is not None:
+                    style.unpolish(frame)
+                    style.polish(frame)
+                frame.update()
 
     def _refresh_dashboard_status_cards(self) -> None:
         if not hasattr(self, "_status_cards"):
             return
+        self._refresh_import_button_state()
         next_run = self._automation_next_run
         next_scope = self._automation_next_scope or "morning"
         if self._automation_enabled and next_run is not None:
@@ -2883,30 +3499,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status_card("automation", value, note)
 
         pending_prints = len(self._pending_print_jobs_for_company("EH")) + len(self._pending_print_jobs_for_company("MVA"))
+        pending_eh_scopes = int(bool(self._eh_pending_runs.get("morning"))) + int(bool(self._eh_pending_runs.get("afternoon")))
         pending_mva_scopes = int(bool(self._mva_pending_runs.get("morning"))) + int(bool(self._mva_pending_runs.get("afternoon")))
+        pending_total = pending_prints + pending_eh_scopes + pending_mva_scopes
         self._set_status_card(
             "pending",
-            str(pending_prints + pending_mva_scopes),
-            f"Impressões: {pending_prints} | MVA aguardando: {pending_mva_scopes}",
+            str(pending_total),
+            "" if pending_total == 0 else f"Impressões: {pending_prints} | EH aguardando: {pending_eh_scopes} | MVA aguardando: {pending_mva_scopes}",
         )
 
-        file_text = corrigir_texto(self.label_files.text() or "Nenhum arquivo carregado ainda")
+        file_text = corrigir_texto(self.label_files.text() or "Nenhum arquivo carregado")
         file_summary = file_text if len(file_text) <= 70 else f"{file_text[:67]}..."
         self._set_status_card(
             "workspace",
-            "Pronto" if not self._are_tables_empty() else "Aguardando",
+            "Pronto" if self._has_table_data() else "Aguardando",
             file_summary,
         )
-
-        current_mode = "Gráficos" if self._showing_graphs else "Tabelas"
-        note_parts = []
-        if self._edit_mode:
-            note_parts.append("edição ativa")
-        if self._table_dirty:
-            note_parts.append("há alterações")
-        if not note_parts:
-            note_parts.append("somente leitura")
-        self._set_status_card("view", current_mode, " | ".join(note_parts))
 
     def _setup_icon(self) -> None:
         icon_path = resource_path("icone.ico")
@@ -2914,53 +3522,115 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(QtGui.QIcon(icon_path))
 
     def _load_app_font(self) -> None:
+        def _apply_ui_font(font: QtGui.QFont) -> None:
+            font.setPointSize(10)
+            font.setStyleStrategy(QtGui.QFont.PreferAntialias)
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.setFont(font)
+            self.setFont(font)
+
         font_path = resource_path(os.path.join("data", "Lexend-Regular.ttf"))
         if not os.path.exists(font_path):
+            self._ui_font_family = QtWidgets.QApplication.font().family() or "Sans Serif"
+            _apply_ui_font(QtGui.QFont(self._ui_font_family))
             return
         font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
         if font_id == -1:
+            self._ui_font_family = QtWidgets.QApplication.font().family() or "Sans Serif"
+            _apply_ui_font(QtGui.QFont(self._ui_font_family))
             return
         families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
         if families:
-            self.setFont(QtGui.QFont(families[0]))
+            self._ui_font_family = families[0]
+            app_font = QtGui.QFont(families[0])
+            _apply_ui_font(app_font)
 
     def _setup_styles(self) -> None:
+        font_family = corrigir_texto(
+            getattr(self, "_ui_font_family", "") or QtWidgets.QApplication.font().family() or "Lexend"
+        )
+        bg_main = "#1F232C"
+        text_main = "#F2F4F5"
+        text_soft = "#D1D5D9"
+        text_muted = "#A5AAB0"
+        border_main = "#46505D"
+        border_soft = "#37414D"
+        slate_a = "#2B313B"
+        slate_b = "#242934"
+        slate_c = "#2A313A"
+        blue_a = "#24384A"
+        blue_b = "#223041"
+        teal_a = "#24D4E6"
+        teal_b = "#1395A7"
+        bronze_a = "#B8913E"
+        bronze_b = "#7C6731"
+        rust_a = "#E06A6A"
+        rust_b = "#7C424B"
         self.setStyleSheet(
-            "QWidget{background-color:#101418;color:#EEF2F4;font-family:'Lexend';}"
-            "QFrame#sidebarPanel,QFrame#heroCard,QFrame#controlsCard,QFrame#contentCard,QFrame#contentSubCard,QFrame#statusCard,QFrame#sidebarSection,QFrame#summaryCard,QFrame#reportSectionCard,QFrame#dialogHeaderCard,QFrame#metaChip,QFrame#inlineTotalCard{background-color:#182028;border:1px solid #26303A;border-radius:14px;}"
-            "QFrame#reportSectionCard[tone=\"warning\"]{border:1px solid #5A3624;}"
-            "QLabel#appTitleLabel{font-size:20px;font-weight:700;color:#F7FAFC;}"
-            "QLabel#appSubtitleLabel{font-size:11px;color:#AAB6C2;}"
-            "QLabel#sidebarSectionTitle,QLabel#contentCardTitle,QLabel#sectionTitleLabel{font-size:11px;font-weight:700;color:#D8E0E7;letter-spacing:0.5px;}"
-            "QLabel#heroTitleLabel,QLabel#dialogTitleLabel{font-size:22px;font-weight:700;color:#F7FAFC;}"
-            "QLabel#heroSubtitleLabel,QLabel#sectionHintLabel,QLabel#statusCardNote,QLabel#metaChipLabel{font-size:11px;color:#9FB0BF;}"
-            "QLabel#statusCardTitle{font-size:11px;font-weight:600;color:#9FB0BF;letter-spacing:0.4px;}"
-            "QLabel#statusCardValue,QLabel#metaChipValue{font-size:18px;font-weight:700;color:#F4F7F9;}"
-            "QLabel#reportBadge{background-color:#F59E0B;color:#101418;border-radius:12px;font-weight:700;padding:6px 10px;}"
-            "QLabel#statusChipSuccess{background-color:#163B2B;color:#73D39C;border:1px solid #24543E;border-radius:12px;padding:6px 12px;font-weight:700;}"
-            "QLabel#statusChipWarning{background-color:#3A2319;color:#F6A46F;border:1px solid #5A3624;border-radius:12px;padding:6px 12px;font-weight:700;}"
-            "QPushButton{background-color:#22303C;border:1px solid #2D3B48;border-radius:10px;padding:8px 12px;text-align:center;color:#EEF2F4;}"
-            "QPushButton:hover{background-color:#2B3B48;border-color:#3D4D5B;}"
-            "QPushButton:pressed{background-color:#314453;}"
-            "QPushButton:disabled{color:#71808F;background-color:#182028;border-color:#22303C;}"
-            "QPushButton#primaryActionButton,QPushButton#btn_import{background-color:#E28C27;color:#101418;border-color:#F0A43B;font-weight:700;}"
-            "QPushButton#primaryActionButton:hover,QPushButton#btn_import:hover{background-color:#F0A43B;}"
-            "QPushButton#secondaryActionButton,QPushButton#powerActionButton{background-color:#182028;border-color:#30404E;}"
-            "QTableWidget,QTableView{background-color:#11181F;alternate-background-color:#172029;gridline-color:#26303A;border:1px solid #2B3641;border-radius:10px;selection-background-color:#28445B;selection-color:#F5F7F9;}"
+            f"QWidget{{background-color:{bg_main};color:{text_main};font-family:'{font_family}';font-weight:400;}}"
+            "QLabel,QCheckBox,QRadioButton{background:transparent;}"
+            f"QPushButton,QLabel,QTableWidget,QTableView,QHeaderView::section,QTabBar::tab,QMenu,QComboBox,QToolTip,QProgressBar{{font-family:'{font_family}';}}"
+            f"QFrame#sidebarPanel{{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #202938,stop:0.45 {blue_a},stop:1 #1E2430);border:1px solid #3B4F66;border-radius:22px;}}"
+            f"QFrame#heroCard{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2A3340,stop:0.55 #24303D,stop:1 #28313B);border:1px solid #4D5865;border-bottom:4px solid {teal_a};border-radius:22px;}}"
+            f"QFrame#controlsCard,QFrame#contentCard,QFrame#summaryCard,QFrame#dialogHeaderCard,QFrame#inlineTotalCard{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2B313B,stop:0.65 {slate_c},stop:1 {slate_b});border:1px solid {border_main};border-radius:18px;}}"
+            f"QFrame#contentSubCard{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2A313B,stop:1 #242A34);border:1px solid {border_main};border-radius:18px;}}"
+            f"QFrame#contentSubCard[accent=\"cyan\"]{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #29313B,stop:1 #222A34);border:2px solid {teal_a};border-radius:18px;}}"
+            f"QFrame#statusCard{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2B313B,stop:1 #242A34);border:1px solid {border_main};border-radius:18px;}}"
+            f"QFrame#statusCard[cardType=\"automation\"]{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #25323F,stop:1 #222B36);border:2px solid {teal_a};border-radius:18px;}}"
+            f"QFrame#statusCard[cardType=\"workspace\"][cardState=\"waiting\"]{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #8D6E2B,stop:1 #A8832F);border:1px solid #D1B46D;border-radius:18px;}}"
+            f"QFrame#statusCard[cardType=\"workspace\"][cardState=\"ready\"]{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2F6C44,stop:1 #4AA164);border:1px solid #7FD39B;border-radius:18px;}}"
+            f"QFrame#statusCard[cardType=\"workspace\"][cardState=\"waiting\"] QLabel#statusCardTitle{{color:#F4E2AF;}}"
+            f"QFrame#statusCard[cardType=\"workspace\"][cardState=\"waiting\"] QLabel#statusCardValue{{color:#FFD36A;}}"
+            f"QFrame#statusCard[cardType=\"workspace\"][cardState=\"waiting\"] QLabel#statusCardNote{{color:#F6E5B2;}}"
+            "QFrame#statusCard[cardType=\"workspace\"][cardState=\"ready\"] QLabel#statusCardTitle{color:#D8F4E1;}"
+            "QFrame#statusCard[cardType=\"workspace\"][cardState=\"ready\"] QLabel#statusCardValue{color:#F3FFF7;}"
+            "QFrame#statusCard[cardType=\"workspace\"][cardState=\"ready\"] QLabel#statusCardNote{color:#D8F6E2;}"
+            f"QFrame#sidebarSection{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2A303A,stop:1 #242A34);border:1px solid {border_soft};border-radius:18px;}}"
+            f"QFrame#reportSectionCard{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #26303D,stop:0.68 {slate_c},stop:1 {slate_b});border:1px solid {border_main};border-radius:16px;}}"
+            f"QFrame#reportSectionCard[tone=\"warning\"]{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {rust_b},stop:0.42 {slate_c},stop:1 {slate_b});border:1px solid {rust_a};}}"
+            f"QFrame#metaChip{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #253441,stop:1 #222B36);border:1px solid #5B6A74;border-radius:12px;}}"
+            f"QLabel#appTitleLabel{{font-size:20px;font-weight:400;color:{text_main};}}"
+            f"QLabel#appSubtitleLabel{{font-size:11px;color:{text_soft};}}"
+            f"QLabel#sidebarSectionTitle,QLabel#contentCardTitle,QLabel#sectionTitleLabel{{font-size:11px;font-weight:400;color:#E5E8EA;letter-spacing:0.5px;}}"
+            f"QLabel#heroTitleLabel,QLabel#dialogTitleLabel{{font-size:22px;font-weight:400;color:#FAFBFB;}}"
+            f"QLabel#heroSubtitleLabel,QLabel#sectionHintLabel,QLabel#statusCardNote,QLabel#metaChipLabel{{font-size:11px;color:{text_muted};}}"
+            f"QLabel#statusCardTitle{{font-size:11px;font-weight:400;color:{text_muted};letter-spacing:0.4px;}}"
+            f"QLabel#statusCardValue,QLabel#metaChipValue{{font-size:18px;font-weight:400;color:{text_main};}}"
+            f"QLabel#reportBadge{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {bronze_a},stop:1 {bronze_b});color:#1F232A;border:1px solid #D1B46D;border-radius:12px;font-weight:400;padding:6px 10px;}}"
+            f"QLabel#statusChipSuccess{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {teal_b},stop:1 {teal_a});color:#F4FCFD;border:1px solid #6CB6BE;border-radius:12px;padding:6px 12px;font-weight:400;}}"
+            f"QLabel#statusChipWarning{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {rust_a},stop:1 #D35656);color:#FFF7F4;border:1px solid #E49595;border-radius:12px;padding:6px 12px;font-weight:400;}}"
+            f"QPushButton{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2A313C,stop:1 #212833);border:1px solid #404A56;border-radius:14px;padding:8px 12px;text-align:center;color:{text_main};}}"
+            f"QPushButton:hover{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #313A46,stop:1 #26303B);border-color:#6A7684;}}"
+            f"QPushButton:pressed{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #284754,stop:1 #25343F);}}"
+            f"QPushButton:disabled{{color:#7F868C;background:{slate_a};border-color:{border_soft};}}"
+            f"QPushButton#primaryActionButton{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {bronze_a},stop:1 {bronze_b});color:#1D2229;border:1px solid #D1B46D;font-weight:400;}}"
+            f"QPushButton#btn_import{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #F07B7E,stop:1 #D85F68);color:#2A1014;border:1px solid #F1A1A5;font-weight:400;}}"
+            f"QPushButton#btn_import:disabled{{color:#7F868C;background:{slate_a};border:1px solid {border_soft};font-weight:400;}}"
+            f"QPushButton#primaryActionButton:hover{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #C89A4E,stop:1 #8F7337);}}"
+            f"QPushButton#btn_import:hover{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #F58B8D,stop:1 #DF6A72);}}"
+            f"QPushButton#secondaryActionButton,QPushButton#powerActionButton{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2B313B,stop:1 #232A34);border-color:#505A67;}}"
+            f"QTableWidget,QTableView{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {slate_c},stop:1 {slate_b});alternate-background-color:#2B3138;gridline-color:{border_soft};border:1px solid {border_main};border-radius:10px;selection-background-color:{teal_b};selection-color:#F7FCFC;}}"
+            "QTableWidget[editModeActive=\"true\"]{gridline-color:#8F575D;border:1px solid #9A5D64;}"
+            "QTableWidget[editModeActive=\"true\"]::item:hover,QTableWidget[editModeActive=\"true\"]::item:selected{background-color:#5A4148;color:#F7FCFC;}"
+            f"QTextEdit,QPlainTextEdit,QLineEdit,QDateEdit,QComboBox,QAbstractSpinBox{{background:{slate_c};color:{text_main};border:1px solid {border_main};border-radius:10px;padding:6px 8px;selection-background-color:{teal_b};selection-color:#F7FCFC;}}"
             "QTableWidget::item{text-align:center;}"
-            "QHeaderView::section{background-color:#1F2B35;color:#F0B15A;font-weight:700;text-align:center;border:none;border-right:1px solid #2A3641;padding:8px;}"
+            f"QHeaderView::section{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #35485D,stop:0.55 #304457,stop:1 #3E5267);color:{teal_a};font-weight:400;text-align:center;border:none;border-right:1px solid {border_main};padding:8px;}}"
             "QScrollArea{border:none;background:transparent;}"
-            "QProgressBar{background:#11181F;color:#EEF2F4;border:1px solid #26303A;border-radius:9px;text-align:center;}"
-            "QProgressBar::chunk{background-color:#E28C27;border-radius:8px;}"
-            "QTabWidget::pane{border:1px solid #26303A;border-radius:14px;top:-1px;background:#121920;}"
-            "QTabBar::tab{background:#182028;color:#AAB6C2;padding:10px 14px;border-top-left-radius:10px;border-top-right-radius:10px;margin-right:4px;}"
-            "QTabBar::tab:selected{background:#22303C;color:#F6F8FA;}"
+            "QWidget#tableEmptyState{background:transparent;}"
+            f"QLabel#tableEmptyStateHint{{color:{text_muted};font-size:9px;font-weight:400;background:transparent;}}"
+            f"QProgressBar{{background:#20252C;color:{text_main};border:1px solid {border_soft};border-radius:14px;text-align:center;padding:2px;}}"
+            f"QProgressBar::chunk{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {teal_b},stop:1 {teal_a});border-radius:12px;}}"
+            f"QTabWidget::pane{{border:1px solid {border_soft};border-radius:14px;top:-1px;background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {slate_a},stop:1 {slate_b});}}"
+            f"QTabBar::tab{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #313740,stop:1 {slate_b});color:{text_soft};padding:10px 14px;border-top-left-radius:10px;border-top-right-radius:10px;margin-right:4px;font-weight:400;}}"
+            f"QTabBar::tab:selected{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #334A60,stop:1 #2A3A4A);color:{teal_a};}}"
             "QToolButton{background:transparent;}"
         )
 
     def _setup_planilha_section(self, parent_layout, title, export_fn, is_left: bool) -> None:
         frame = QtWidgets.QFrame()
         frame.setObjectName("contentSubCard")
+        frame.setProperty("accent", "cyan")
         frame_layout = QtWidgets.QVBoxLayout(frame)
         header = QtWidgets.QHBoxLayout()
 
@@ -2981,13 +3651,32 @@ class MainWindow(QtWidgets.QMainWindow):
         frame_layout.addLayout(header)
 
         cols = self.cols_online
-        table = QtWidgets.QTableWidget()
-        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        table = EmptyStateTableWidget()
+        table.setColumnCount(len(cols))
+        table.setHorizontalHeaderLabels(list(cols))
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        table.setMinimumHeight(400)
+        table.setWordWrap(False)
+        table.setTextElideMode(QtCore.Qt.ElideRight)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        table.horizontalHeader().setMinimumSectionSize(80)
+        online_font = QtGui.QFont(self._ui_font_family or self.font().family() or "Lexend")
+        online_font.setPointSize(max(8, self.font().pointSize() - 2))
+        table.setFont(online_font)
+        header_font = QtGui.QFont(online_font)
+        header_font.setPointSize(max(8, online_font.pointSize()))
+        header_font.setWeight(QtGui.QFont.Normal)
+        table.horizontalHeader().setFont(header_font)
+        table.set_empty_state(_build_empty_table_icon(84))
         frame_layout.addWidget(table)
 
-        adapter = QtTreeAdapter(table, cols)
+        adapter = QtTreeAdapter(table, cols, hide_header_when_empty=True)
         table.horizontalHeader().sectionClicked.connect(
             lambda idx: self._sort_table(adapter, cols, idx)
         )
@@ -2999,6 +3688,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tree_eh = adapter
             self.table_eh = table
 
+        self._apply_soft_shadow(frame, blur=18.0, offset_y=5.0, color=QtGui.QColor(10, 16, 24, 90))
         parent_layout.addWidget(frame)
 
     def _export_planilha_mva(self) -> None:
@@ -3025,6 +3715,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_eh_pending_print.clicked.connect(
             lambda: self._run_pending_print_jobs_for_company("EH", notify_user=True)
         )
+        self.btn_eh_pending_morning.clicked.connect(lambda: self._run_pending_eh_scope("morning"))
+        self.btn_eh_pending_afternoon.clicked.connect(lambda: self._run_pending_eh_scope("afternoon"))
         self.btn_mva_pending_print.clicked.connect(
             lambda: self._run_pending_print_jobs_for_company("MVA", notify_user=True)
         )
@@ -3304,7 +3996,7 @@ class MainWindow(QtWidgets.QMainWindow):
             remaining = self._format_countdown(int((next_run - dt.datetime.now()).total_seconds())) if next_run else "--:--:--"
             tooltip = (
                 f"Automacao ativa para manhã {self._automation_time_text('morning')} e tarde {self._automation_time_text('afternoon')}.\n"
-                f"Proxima execucao: {self._scope_label_text(next_scope)} em {next_run.strftime('%d/%m/%Y %H:%M:%S') if next_run else '--'} (em {remaining}).\n"
+                f"Próxima execução: {self._scope_label_text(next_scope)} em {next_run.strftime('%d/%m/%Y %H:%M:%S') if next_run else '--'} (em {remaining}).\n"
                 "Clique para pausar."
             )
             self.btn_automation_power.setIcon(stop_icon)
@@ -3346,6 +4038,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
 
+        pending_eh_morning = bool(self._eh_pending_runs.get("morning"))
+        pending_eh_afternoon = bool(self._eh_pending_runs.get("afternoon"))
+        self.btn_eh_pending_morning.setVisible(pending_eh_morning)
+        self.btn_eh_pending_morning.setEnabled(pending_eh_morning and not self._automation_running)
+        self.btn_eh_pending_afternoon.setVisible(pending_eh_afternoon)
+        self.btn_eh_pending_afternoon.setEnabled(pending_eh_afternoon and not self._automation_running)
+
         self.btn_mva_pending_print.setText(self._format_pending_print_button_text("MVA"))
         self.btn_mva_pending_print.setVisible(pending_mva_print > 0)
         self.btn_mva_pending_print.setEnabled(pending_mva_print > 0 and not self._automation_running)
@@ -3367,10 +4066,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _choose_automation_scope_for_test(self) -> str | None:
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Teste da automacao")
-        box.setText("Qual fechamento automatico deseja simular?")
+        box.setText("Qual fechamento automático deseja simular?")
         btn_morning = box.addButton("Manhã", QtWidgets.QMessageBox.AcceptRole)
         btn_afternoon = box.addButton("Tarde", QtWidgets.QMessageBox.ActionRole)
         btn_cancel = box.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
+        _center_message_box_buttons(box)
         box.exec()
         clicked = box.clickedButton()
         if clicked == btn_morning:
@@ -3558,7 +4258,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if result.get("cancelled") or dialog.was_cancelled():
             return None, None, None, "__cancelled__"
         if result.get("error"):
-            return None, None, None, str(result.get("error")).strip() or "Falha ao gerar os relatorios da EH no Zweb."
+            return None, None, None, str(result.get("error")).strip() or "Falha ao gerar os relatórios da EH no Zweb."
         return result.get("relatorio"), result.get("relatorio_fechamento"), result.get("relatorio_pix"), None
 
     def _load_mva_reports_with_loading(
@@ -3666,25 +4366,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
         return found
 
-    def _choose_daily_or_afternoon_scope(self, company_label: str) -> str | None:
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle(f"Caixa {company_label}")
-        box.setText("O fechamento do dia inteiro foi detectado.")
-        box.setInformativeText("Deseja gerar o relatório diário ou só da parte da tarde?")
-        btn_daily = box.addButton("Diário", QtWidgets.QMessageBox.AcceptRole)
-        btn_afternoon = box.addButton("Só tarde", QtWidgets.QMessageBox.ActionRole)
-        box.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == btn_daily:
-            return "daily"
-        if clicked == btn_afternoon:
-            return "afternoon"
-        return None
+    def _choose_daily_or_afternoon_scope(self, company_label: str, relatorio_fechamento: dict | None) -> str | None:
+        return CaixaScopeDialog(
+            self,
+            company_label=company_label,
+        ).choice()
+
     def _resolve_manual_closing_scope(self, relatorio_fechamento: dict | None, company_label: str) -> str | None:
         info = describe_closing_scope(relatorio_fechamento)
         if info.get("has_full_day"):
-            return self._choose_daily_or_afternoon_scope(company_label)
+            return self._choose_daily_or_afternoon_scope(company_label, relatorio_fechamento)
         if info.get("has_morning_only"):
             return "morning"
         return "daily"
@@ -3716,6 +4407,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_mva_pending_scope(self, scope_mode: str) -> None:
         self._mva_pending_runs[scope_mode] = {}
 
+    def _mark_eh_pending_scope(self, scope_mode: str, data_br: str, message: str) -> None:
+        self._eh_pending_runs[scope_mode] = {
+            "data_br": data_br,
+            "message": message,
+            "scope_mode": scope_mode,
+        }
+
+    def _clear_eh_pending_scope(self, scope_mode: str) -> None:
+        self._eh_pending_runs[scope_mode] = {}
+
     def _prefetch_mva_payments(self, data_br: str) -> list[str]:
         avisos: list[str] = []
         try:
@@ -3727,7 +4428,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             avisos.extend(list(baixados.get("avisos") or []))
         except Exception as exc:
-            avisos.append(f"Nao foi possivel adiantar os pagamentos da Azulzinha da MVA: {exc}")
+            avisos.append(f"Não foi possível adiantar os pagamentos da Azulzinha da MVA: {exc}")
         return avisos
 
     def _generate_mva_reports_for_automation(
@@ -3756,7 +4457,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 data_br,
                 f"Arquivos da MVA ainda ausentes para a {self._scope_label_text(scope_mode)}: {', '.join(missing)}.",
             )
-            return None, None, avisos, f"Arquivos da MVA nao encontrados automaticamente: {', '.join(missing)}."
+            return None, None, avisos, f"Arquivos da MVA não encontrados automaticamente: {', '.join(missing)}."
 
         relatorio_davs, relatorio_orcamentos, relatorio_cupons, mva_msg = self._load_mva_reports_with_loading(
             path_davs,
@@ -3779,7 +4480,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
             if relatorio_davs.get("periodo") != relatorio_orcamentos.get("periodo"):
                 return None, None, [], (
-                    "A Exportacao de dados e o relatorio de Orcamento da MVA precisam ser do mesmo periodo."
+                    "A Exportação de dados e o relatório de Orçamento da MVA precisam ser do mesmo período."
                 )
 
         relatorio = combinar_relatorios_caixa_mva([relatorio_davs, relatorio_orcamentos])
@@ -3802,7 +4503,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
             return None, None, [], "Nenhum cupom foi encontrado no Fechamento de Caixa da MVA."
         if scope_mode == "afternoon" and not describe_closing_scope(relatorio_cupons).get("has_full_day"):
-            aviso = "O fechamento completo da MVA ainda nao esta disponivel para separar a tarde."
+            aviso = "O fechamento completo da MVA ainda não está disponível para separar a tarde."
             self._mark_mva_pending_scope(scope_mode, data_br, aviso)
             return None, None, [], aviso
 
@@ -3828,6 +4529,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 + list((fechamento or {}).get("avisos_usuario") or [])
             )
         )
+        blocking_warnings = [aviso for aviso in avisos_usuario if self._warning_blocks_mva_automation_print(aviso)]
+        if blocking_warnings or self._mva_report_has_minhas_notas_alert(fechamento):
+            motivo = corrigir_texto(blocking_warnings[0]) if blocking_warnings else (
+                "A validação fiscal dos cupons da MVA no Minhas Notas ficou indisponível nesta análise."
+            )
+            return (
+                None,
+                None,
+                [],
+                (
+                    "A impressão automática da MVA foi bloqueada porque a validação no Minhas Notas "
+                    "não foi concluída corretamente.\n"
+                    f"Motivo: {motivo}\n"
+                    "Sem o Minhas Notas, a conferência fiscal da MVA não será considerada válida para impressão."
+                ),
+            )
         return relatorio, fechamento, avisos_usuario, None
 
     def _generate_eh_reports_for_automation(
@@ -3867,7 +4584,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if relatorio_nfce.get("quantidade_nfce", 0) <= 0:
                 return None, None, None, [], "Nenhuma NFC-e foi encontrada no Fechamento de caixa do Zweb."
             if scope_mode == "afternoon" and not describe_closing_scope(relatorio_nfce).get("has_full_day"):
-                return None, None, None, [], "O fechamento completo da EH ainda nao esta disponivel para separar a tarde."
+                return None, None, None, [], "O fechamento completo da EH ainda não está disponível para separar a tarde."
 
             periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
                 relatorio,
@@ -3891,9 +4608,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     + list((relatorio_pix or {}).get("avisos_usuario") or [])
                 )
             )
+            blocking_warnings = [aviso for aviso in avisos_usuario if self._warning_blocks_eh_automation_print(aviso)]
+            if blocking_warnings or self._eh_report_uses_financeiro_zweb(fechamento):
+                motivo = corrigir_texto(blocking_warnings[0]) if blocking_warnings else (
+                    "A comparação caiu em Financeiro > Movimentações do Zweb."
+                )
+                self._mark_eh_pending_scope(scope_mode, data_br, motivo)
+                return (
+                    None,
+                    None,
+                    None,
+                    [],
+                    (
+                        "A impressão automática da EH foi bloqueada porque os pagamentos da Caixa/Azulzinha "
+                        "não foram validados corretamente.\n"
+                        f"Motivo: {motivo}\n"
+                        "O Financeiro do Zweb não será considerado válido para essa comparação."
+                    ),
+                )
         else:
             avisos_usuario.append(
-                "O Fechamento de caixa do Zweb nao ficou disponivel; a EH sera impressa sem a aba de fechamento."
+                "O Fechamento de caixa do Zweb não ficou disponível; a EH será impressa sem a aba de fechamento."
             )
 
         periodo_pix = (relatorio_nfce or {}).get("periodo") or relatorio.get("periodo")
@@ -3913,9 +4648,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "quantidade_autorizados": 0,
                 "total_autorizado": 0.0,
                 "itens_autorizados": [],
-                "mensagem": "O periodo do caixa nao foi identificado; nao foi possivel consultar os pagamentos digitais do Zweb.",
+                "mensagem": "O período do caixa não foi identificado; não foi possível consultar os pagamentos digitais do Zweb.",
             }
 
+        self._clear_eh_pending_scope(scope_mode)
         return relatorio, fechamento, relatorio_pix, avisos_usuario, None
 
     def _collect_automation_print_jobs(
@@ -3946,6 +4682,112 @@ class MainWindow(QtWidgets.QMainWindow):
             return jobs
         finally:
             dialog.deleteLater()
+
+    def _format_automation_section(self, title: str, lines: list[str]) -> str:
+        cleaned_lines = [
+            corrigir_texto(corrigir_estrutura_texto(str(line or "").strip()))
+            for line in lines
+            if str(line or "").strip()
+        ]
+        if not cleaned_lines:
+            return ""
+        return f"{corrigir_texto(title)}\n" + "\n".join(f"- {line}" for line in cleaned_lines)
+
+    def _format_automation_summary(
+        self,
+        *,
+        printed_titles: list[str] | None = None,
+        warnings: list[str] | None = None,
+        errors: list[str] | None = None,
+        empty_message: str = "Nenhum relatório foi processado.",
+    ) -> str:
+        sections: list[str] = []
+        printed_titles = [
+            corrigir_texto(str(title or "").strip())
+            for title in (printed_titles or [])
+            if str(title or "").strip()
+        ]
+        warnings = [
+            corrigir_texto(str(item or "").strip())
+            for item in (warnings or [])
+            if str(item or "").strip()
+        ]
+        errors = [
+            corrigir_texto(str(item or "").strip())
+            for item in (errors or [])
+            if str(item or "").strip()
+        ]
+        if printed_titles:
+            sections.append(
+                self._format_automation_section(
+                    f"Impressos enviados: {len(printed_titles)}",
+                    printed_titles,
+                )
+            )
+        if warnings:
+            sections.append(self._format_automation_section("Avisos", warnings))
+        if errors:
+            sections.append(self._format_automation_section("Falhas", errors))
+        sections = [section for section in sections if section]
+        if not sections:
+            return corrigir_texto(empty_message)
+        return "\n\n".join(sections)
+
+    def _warning_blocks_eh_automation_print(self, warning: str) -> bool:
+        text = corrigir_texto(corrigir_estrutura_texto(str(warning or "").strip())).casefold()
+        text = "".join(
+            char
+            for char in unicodedata.normalize("NFD", text)
+            if unicodedata.category(char) != "Mn"
+        )
+        text = text.replace("?", "")
+        return (
+            "baixar automaticamente" in text
+            and "caixa" in text
+            and ("relatorios" in text or "relat" in text)
+        )
+
+    def _warning_blocks_mva_automation_print(self, warning: str) -> bool:
+        text = corrigir_texto(corrigir_estrutura_texto(str(warning or "").strip())).casefold()
+        text = "".join(
+            char
+            for char in unicodedata.normalize("NFD", text)
+            if unicodedata.category(char) != "Mn"
+        )
+        text = text.replace("?", "")
+        return (
+            "minhas notas" in text
+            and (
+                "nao foi possivel consultar" in text
+                or "consulta indispon" in text
+            )
+        )
+
+    def _eh_report_uses_financeiro_zweb(self, fechamento: dict | None) -> bool:
+        if not isinstance(fechamento, dict):
+            return False
+        for report in (fechamento.get("relatorios_pagamento") or {}).values():
+            for row in (report.get("correlacao_rows") or []):
+                if any("financeiro zweb" in corrigir_texto(str(cell or "")).casefold() for cell in row):
+                    return True
+        return False
+
+    def _mva_report_has_minhas_notas_alert(self, fechamento: dict | None) -> bool:
+        if not isinstance(fechamento, dict):
+            return False
+        for report in (fechamento.get("relatorios_pagamento") or {}).values():
+            for row in (report.get("alert_rows") or []):
+                normalized_row = [
+                    "".join(
+                        char
+                        for char in unicodedata.normalize("NFD", corrigir_texto(corrigir_estrutura_texto(str(cell or "").strip())).casefold())
+                        if unicodedata.category(char) != "Mn"
+                    ).replace("?", "")
+                    for cell in row
+                ]
+                if any("minhas notas" in cell for cell in normalized_row):
+                    return True
+        return False
 
     def _print_automation_jobs(
         self,
@@ -3990,7 +4832,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_pending_print_jobs_for_company(
                 company,
                 notify_user=False,
-                trigger_label="retry automatico das 08:00",
+                trigger_label="retry automático das 08:00",
             )
         return True
 
@@ -4037,25 +4879,25 @@ class MainWindow(QtWidgets.QMainWindow):
         printed_titles = [str(job.get("title") or "").strip() for job in printed_jobs if str(job.get("title") or "").strip()]
         resumo_partes: list[str] = []
         if printed_titles:
-            resumo_partes.append(
-                f"Impressos enviados: {len(printed_titles)} ({'; '.join(printed_titles)})."
-            )
+            resumo_partes.append(self._format_automation_section(f"Impressos enviados: {len(printed_titles)}", printed_titles))
         if failed_jobs:
             retry_text = self._format_pending_print_retry_text(
                 self._pending_print_jobs_for_company(company_key)
             )
             resumo_partes.append(
-                f"Falha de impressao na {company_key}. Nova tentativa prevista para {retry_text}; "
-                "o botao pendente continua disponivel."
+                corrigir_texto(
+                    f"Falha de impressão na {company_key}. Nova tentativa prevista para {retry_text}; "
+                    "o botão pendente continua disponível."
+                )
             )
         elif printed_titles:
-            resumo_partes.append(f"Nenhuma impressao pendente da {company_key} restou na fila local.")
+            resumo_partes.append(corrigir_texto(f"Nenhuma impressão pendente da {company_key} restou na fila local."))
         if error_message:
-            resumo_partes.append(f"Erro: {error_message}")
+            resumo_partes.append(self._format_automation_section("Erro", [error_message]))
         if not resumo_partes:
-            resumo_partes.append(f"Nenhuma impressao pendente da {company_key} foi processada.")
+            resumo_partes.append(corrigir_texto(f"Nenhuma impressão pendente da {company_key} foi processada."))
 
-        self._automation_last_status = " ".join(resumo_partes)
+        self._automation_last_status = "\n\n".join(item for item in resumo_partes if item)
         self._refresh_automation_controls_ui()
 
         if notify_user:
@@ -4143,20 +4985,23 @@ class MainWindow(QtWidgets.QMainWindow):
         resumo_partes: list[str] = []
         if printed_titles:
             resumo_partes.append(
-                f"Impressos enviados: {len(printed_titles)} ({'; '.join(printed_titles)})."
+                self._format_automation_section(
+                    f"Impressos enviados: {len(printed_titles)}",
+                    printed_titles,
+                )
             )
         if warnings:
-            resumo_partes.append("Avisos: " + " | ".join(warnings))
+            resumo_partes.append(self._format_automation_section("Avisos", warnings))
         if errors:
-            resumo_partes.append("Falhas: " + " | ".join(errors))
+            resumo_partes.append(self._format_automation_section("Falhas", errors))
         if not resumo_partes:
-            resumo_partes.append("Nenhum relatorio foi processado.")
+            resumo_partes.append("Nenhum relatório foi processado.")
 
-        self._automation_last_status = " ".join(resumo_partes)
+        self._automation_last_status = "\n\n".join(item for item in resumo_partes if item)
         self._refresh_automation_controls_ui()
 
         if notify_user:
-            title = "Teste da automacao"
+            title = "Teste da automação"
             message = f"Escopo: {self._scope_label_text(scope_mode)}\nData alvo: {data_br}\n\n{self._automation_last_status}"
             if errors:
                 messagebox.showwarning(title, message)
@@ -4183,6 +5028,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if avisos_usuario:
             messagebox.showwarning("Aviso", "\n\n".join(avisos_usuario))
         CaixaReportDialog(self, relatorio_mva, fechamento_mva).exec()
+
+    def _run_pending_eh_scope(self, scope_mode: str) -> None:
+        payload = dict(self._eh_pending_runs.get(scope_mode) or {})
+        if not payload:
+            return
+        data_br = str(payload.get("data_br") or self._automation_target_date_br()).strip()
+        relatorio_eh, fechamento_eh, relatorio_pix_eh, avisos_usuario, eh_error = self._generate_eh_reports_for_automation(
+            data_br,
+            scope_mode=scope_mode,
+        )
+        self._refresh_automation_controls_ui()
+        if eh_error:
+            messagebox.showwarning(
+                f"EH {self._scope_label_text(scope_mode)}",
+                f"{payload.get('message') or eh_error}\n\n{eh_error}",
+            )
+            return
+        if avisos_usuario:
+            messagebox.showwarning("Aviso", "\n\n".join(avisos_usuario))
+        CaixaReportDialog(self, relatorio_eh, fechamento_eh, relatorio_pix_eh).exec()
 
     def _handle_caixa_report(self) -> None:
         cnpj = CaixaCnpjDialog(self).choice()
@@ -4310,7 +5175,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     messagebox.showwarning("Arquivo inválido", resumo_msg)
                     return
                 if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
-                    messagebox.showwarning("Aviso", "Nenhum cupom foi encontrado no relatorio informado.")
+                    messagebox.showwarning("Aviso", "Nenhum cupom foi encontrado no relatório informado.")
                     return
                 periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
                     relatorio,
@@ -4677,8 +5542,12 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_pdf = QtWidgets.QPushButton("PDF")
         btn_excel.setStyleSheet("text-align:center;")
         btn_pdf.setStyleSheet("text-align:center;")
-        layout.addWidget(btn_excel)
-        layout.addWidget(btn_pdf)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(btn_excel)
+        buttons.addWidget(btn_pdf)
+        buttons.addStretch()
+        layout.addLayout(buttons)
 
         btn_excel.clicked.connect(lambda: self._export_excel(dlg))
         btn_pdf.clicked.connect(lambda: self._export_pdf(dlg))
@@ -4721,11 +5590,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._edit_mode = True
             self._table_dirty = False
+            self.table_main.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
             self.table_main.setEditTriggers(
                 QtWidgets.QAbstractItemView.DoubleClicked
                 | QtWidgets.QAbstractItemView.SelectedClicked
                 | QtWidgets.QAbstractItemView.EditKeyPressed
             )
+            self._set_table_edit_visual_state(True)
             self.btn_edit_table.setText("Salvar Tabela")
             self._refresh_dashboard_status_cards()
             return
@@ -4736,6 +5607,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._edit_mode = False
         self._table_dirty = False
         self.table_main.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table_main.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self._set_table_edit_visual_state(False)
         self.btn_edit_table.setText("Editar tabela")
         self._refresh_dashboard_status_cards()
 
@@ -4805,7 +5678,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return 0 < value < 100 or self.btn_cancel.isEnabled()
 
     def _update_import_neon(self) -> None:
-        if self._are_tables_empty():
+        if self._should_highlight_import_button():
             self._neon_on = True
             self._neon_hue = (self._neon_hue + 4) % 360
             color_a = QtGui.QColor.fromHsv(self._neon_hue, 180, 200)
@@ -4827,6 +5700,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_select_pdf.setStyleSheet("")
             self.btn_select_pdf.update()
 
+    def _refresh_import_button_state(self) -> None:
+        import_available = self._can_import_more_pdfs()
+        if self.btn_select_pdf.isEnabled() != import_available:
+            self.btn_select_pdf.setEnabled(import_available)
+        if import_available:
+            if self._loaded_pdf_count() == 0:
+                self.btn_select_pdf.setToolTip("Importar PDF")
+            else:
+                self.btn_select_pdf.setToolTip("Adicionar segundo PDF")
+            return
+        if self._neon_on:
+            self._neon_on = False
+            self.btn_select_pdf.setStyleSheet("")
+            self.btn_select_pdf.update()
+        self.btn_select_pdf.setToolTip(
+            "Importar indisponível depois que os dois PDFs já foram carregados. Use Limpar para liberar novamente."
+        )
+
+    def _should_highlight_import_button(self) -> bool:
+        return self.btn_select_pdf.isEnabled() and self._loaded_pdf_count() == 0 and not self.tree_main.get_children()
+
+    def _loaded_pdf_count(self) -> int:
+        try:
+            from global_vars import listFiles
+        except Exception:
+            return 0
+        return len(listFiles or [])
+
+    def _can_import_more_pdfs(self) -> bool:
+        return self._loaded_pdf_count() < 2
+
     def _are_tables_empty(self) -> bool:
         return (
             not self.tree_main.get_children()
@@ -4837,10 +5741,47 @@ class MainWindow(QtWidgets.QMainWindow):
     def _has_table_data(self) -> bool:
         return bool(self.tree_main.get_children())
 
+    def _set_table_edit_visual_state(self, active: bool) -> None:
+        if not hasattr(self, "table_main"):
+            return
+        next_state = bool(active)
+        if self.table_main.property("editModeActive") == next_state:
+            return
+        self.table_main.setProperty("editModeActive", next_state)
+        style = self.table_main.style()
+        if style is not None:
+            style.unpolish(self.table_main)
+            style.polish(self.table_main)
+        self.table_main.viewport().update()
+        self.table_main.repaint()
+
+    def _sync_table_hover_selection(self, row: int, column: int, force: bool = False) -> None:
+        if not hasattr(self, "table_main"):
+            return
+        if row < 0 or column < 0 or not self._edit_mode:
+            return
+        if not force and self.table_main.state() == QtWidgets.QAbstractItemView.EditingState:
+            return
+        flags = (
+            QtCore.QItemSelectionModel.ClearAndSelect
+            | QtCore.QItemSelectionModel.Rows
+        )
+        if self.table_main.currentRow() == row and self.table_main.selectionModel().hasSelection():
+            selected_rows = self.table_main.selectionModel().selectedRows()
+            if len(selected_rows) == 1 and selected_rows[0].row() == row:
+                return
+        blocker = QtCore.QSignalBlocker(self.table_main)
+        try:
+            self.table_main.setCurrentCell(row, column, flags)
+        finally:
+            del blocker
+
     def _reset_edit_state(self) -> None:
         self._edit_mode = False
         self._table_dirty = False
         self.table_main.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table_main.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self._set_table_edit_visual_state(False)
         self.btn_edit_table.setText("Editar tabela")
         self._refresh_dashboard_status_cards()
 
@@ -4857,6 +5798,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_save = dlg.addButton("Salvar", QtWidgets.QMessageBox.AcceptRole)
         btn_discard = dlg.addButton("Descartar", QtWidgets.QMessageBox.DestructiveRole)
         btn_cancel = dlg.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
+        _center_message_box_buttons(dlg)
         dlg.exec()
         clicked = dlg.clickedButton()
         if clicked == btn_save:
@@ -4876,20 +5818,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
 
         dlg = QtWidgets.QMessageBox(self)
-        dlg.setWindowTitle("Relatorios automaticos")
+        dlg.setWindowTitle("Relatórios automáticos")
         dlg.setText(
-            "Foram encontrados relatorios automaticos da Azulzinha/Zweb no workspace.\n"
-            "Deseja manter esses arquivos apos fechar o aplicativo?"
+            "Foram encontrados relatórios automáticos da Azulzinha/Zweb no workspace.\n"
+            "Deseja manter esses arquivos após fechar o aplicativo?"
         )
         dlg.setInformativeText(
             f"Arquivos encontrados: {len(auto_reports)}.\n"
-            "Escolha 'Manter' para preservar os relatorios ou 'Excluir' para limpa-los ao fechar."
+            "Escolha 'Manter' para preservar os relatórios ou 'Excluir' para limpá-los ao fechar."
         )
         dlg.setIcon(QtWidgets.QMessageBox.Question)
         btn_keep = dlg.addButton("Manter", QtWidgets.QMessageBox.AcceptRole)
         btn_delete = dlg.addButton("Excluir", QtWidgets.QMessageBox.DestructiveRole)
         btn_cancel = dlg.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
         dlg.setDefaultButton(btn_keep)
+        _center_message_box_buttons(dlg)
         dlg.exec()
 
         clicked = dlg.clickedButton()
@@ -4914,6 +5857,7 @@ class MainWindow(QtWidgets.QMainWindow):
             btn_save = dlg.addButton("Salvar", QtWidgets.QMessageBox.AcceptRole)
             btn_discard = dlg.addButton("Descartar", QtWidgets.QMessageBox.DestructiveRole)
             btn_cancel = dlg.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
+            _center_message_box_buttons(dlg)
             dlg.exec()
             clicked = dlg.clickedButton()
             if clicked == btn_save:
@@ -4921,6 +5865,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._edit_mode = False
                     self._table_dirty = False
                     self.table_main.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+                    self.table_main.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+                    self._set_table_edit_visual_state(False)
                     self._set_online_tables_editable(False)
                     self.btn_edit_table.setText("Editar tabela")
                     if not self._confirm_generated_auto_reports_cleanup():

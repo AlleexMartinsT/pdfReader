@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable, Tuple, Optional
 
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 
 try:
     from ftfy import fix_text as _ftfy_fix_text
@@ -78,6 +78,56 @@ def _ensure_app() -> QtWidgets.QApplication:
     return app
 
 
+def _popup_font() -> QtGui.QFont:
+    app = _ensure_app()
+    base_font = QtGui.QFont(app.font())
+    if base_font.pointSizeF() <= 0:
+        base_font.setPointSize(10)
+    else:
+        base_font.setPointSizeF(10.0)
+    return base_font
+
+
+def _center_message_box_buttons(box: QtWidgets.QMessageBox) -> None:
+    button_box = box.findChild(QtWidgets.QDialogButtonBox)
+    if button_box is not None:
+        button_box.setCenterButtons(True)
+    for button in box.buttons():
+        try:
+            button.setMinimumWidth(110)
+        except Exception:
+            pass
+
+
+def _exec_message_box(
+    *,
+    title: str,
+    message: str,
+    icon: QtWidgets.QMessageBox.Icon,
+    buttons: Iterable[tuple[str, QtWidgets.QMessageBox.ButtonRole]],
+    informative_text: str | None = None,
+) -> Optional[str]:
+    _ensure_app()
+    box = QtWidgets.QMessageBox(_PARENT)
+    box.setFont(_popup_font())
+    box.setWindowTitle(_normalize_text(title))
+    box.setText(_normalize_text(message))
+    if informative_text:
+        box.setInformativeText(_normalize_text(informative_text))
+    box.setIcon(icon)
+    for text, role in buttons:
+        box.addButton(_normalize_text(text), role)
+    _center_message_box_buttons(box)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is None:
+        return None
+    try:
+        return _normalize_text(clicked.text())
+    except RuntimeError:
+        return None
+
+
 def _to_filter(filetypes: Optional[Iterable[Tuple[str, str]]]) -> str:
     if not filetypes:
         return "All Files (*)"
@@ -89,26 +139,42 @@ def _to_filter(filetypes: Optional[Iterable[Tuple[str, str]]]) -> str:
 
 class _MessageBox:
     def showinfo(self, title: str, message: str) -> None:
-        _ensure_app()
-        QtWidgets.QMessageBox.information(_PARENT, _normalize_text(title), _normalize_text(message))
+        _exec_message_box(
+            title=title,
+            message=message,
+            icon=QtWidgets.QMessageBox.Information,
+            buttons=[("OK", QtWidgets.QMessageBox.AcceptRole)],
+        )
 
     def showwarning(self, title: str, message: str) -> None:
-        _ensure_app()
-        QtWidgets.QMessageBox.warning(_PARENT, _normalize_text(title), _normalize_text(message))
+        _exec_message_box(
+            title=title,
+            message=message,
+            icon=QtWidgets.QMessageBox.Warning,
+            buttons=[("OK", QtWidgets.QMessageBox.AcceptRole)],
+        )
 
     def showerror(self, title: str, message: str) -> None:
-        _ensure_app()
-        QtWidgets.QMessageBox.critical(_PARENT, _normalize_text(title), _normalize_text(message))
+        _exec_message_box(
+            title=title,
+            message=message,
+            icon=QtWidgets.QMessageBox.Critical,
+            buttons=[("OK", QtWidgets.QMessageBox.AcceptRole)],
+        )
 
     def askyesno(self, title: str, message: str) -> bool:
-        _ensure_app()
-        reply = QtWidgets.QMessageBox.question(
-            _PARENT,
-            _normalize_text(title),
-            _normalize_text(message),
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        clicked = _exec_message_box(
+            title=title,
+            message=message,
+            icon=QtWidgets.QMessageBox.Question,
+            buttons=[
+                ("Sim", QtWidgets.QMessageBox.YesRole),
+                ("Não", QtWidgets.QMessageBox.NoRole),
+            ],
         )
-        return reply == QtWidgets.QMessageBox.Yes
+        if clicked is None:
+            return False
+        return clicked == "Sim"
 
 
 class _FileDialog:

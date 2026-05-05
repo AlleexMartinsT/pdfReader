@@ -2,16 +2,16 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 class ItemCaixa(BaseModel):
-    pedido: str = Field(description="NÃºmero do pedido importado ou documento")
+    pedido: str = Field(description="Número do pedido importado ou documento")
     cliente: str = Field(description="Nome limpo do cliente")
-    documento: str = Field(description="Tipo de documento classificado. Ex: Nota Fiscal EletrÃ´nica")
-    valor: float = Field(description="Valor monetÃ¡rio aferido")
+    documento: str = Field(description="Tipo de documento classificado. Ex: Nota Fiscal Eletrônica")
+    valor: float = Field(description="Valor monetário aferido")
 
 class ItemExcluido(BaseModel):
     pedido: str
     cliente: str
     documento: str
-    motivo: str = Field(description="Motivo fÃ­sico pelo qual o item foi deduzido do caixa")
+    motivo: str = Field(description="Motivo físico pelo qual o item foi deduzido do caixa")
     valor: float
 
 class RelatorioCaixa(BaseModel):

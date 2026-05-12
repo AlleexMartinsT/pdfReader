@@ -54,7 +54,7 @@ Desktop application for reconciling sales reports from two business flows:
   - When token validation lands on the authenticated dashboard, the flow now opens `Relatorio de vendas` from the live Azulzinha menu instead of relying only on a direct sales URL.
   - If Azulzinha shows the red portal popup such as `Ops, um erro aconteceu, tente novamente mais tarde` while confirming the token, the automation now treats it as a real portal error and restarts authentication instead of hanging on the token screen.
 - EH bank reconciliation now excludes Azulzinha/Caixa payments that are matched to filtered NF-e entries, so the `Pagamentos` column reflects only the NFC-e universe.
-- EH cancelled coupons now count toward `Pendências`, `Total Pendências`, and `Faltante` status even when they stay without a dedicated visible evidence row.
+- EH cancelled coupons now remain visible for audit without counting toward `Pendências`, `Total Pendências`, or `Faltante` status.
 - Auto-generated EH reports such as downloaded Caixa/Azulzinha files and saved Zweb HTML exports are now deleted automatically when the app closes, so the workspace does not accumulate `_auto` files between sessions.
 - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.
 - The main window now includes a cashier automation controller beside `Cancel`; while enabled, it runs the same-day morning flow at `13:30` and the same-day afternoon flow at `18:10`, and it still sends only the resulting `Fechamento de Caixa` reports straight to the Windows default printer.
@@ -69,6 +69,7 @@ Desktop application for reconciling sales reports from two business flows:
 - The `Workspace` status card now switches from the waiting gold tone to a green palette when its value changes to `Pronto`.
 - The `Workspace` status card now turns `Pronto` only when the main PDF table has data; loading the online spreadsheets alone no longer marks the workspace as ready.
 - Dashboard text labels such as `Hub operacional`, `Pendências`, `Workspace`, and status notes now render with transparent backgrounds so their text blocks blend into the cards instead of showing darker text rectangles.
+- The `Pendências` dashboard card now shows only `EH`, `MVA`, or `EH | MVA` as its detail text, without print counters or `awaiting` labels.
 - The main dashboard no longer spends vertical space on the automation helper sentence above `Cancelar`, and the whole right-side work area now scrolls like a page when `Resumo principal` / `Planilhas online` need more height.
 - The `Planilhas online` dashboard card now renders without its extra small heading, leaving more vertical space for the spreadsheet tables themselves.
 - Online spreadsheet tables now use an even smaller data font, shorten `Clientes Atendidos` to `Clientes`, keep their column headers hidden until data is loaded, and prioritize the `Vendedor` column width over the numeric columns, reducing name truncation without growing the card.
@@ -93,13 +94,41 @@ Desktop application for reconciling sales reports from two business flows:
 - If MVA source files are still missing at one of those slots, the app now leaves a dedicated pending morning/afternoon button in the UI and still prefetches the MVA Caixa/Azulzinha payment files in advance.
 - When a pending MVA morning/afternoon run is resumed from the UI, it now reuses matching local `..._mva_auto` payment files first and only goes back to Azulzinha/Caixa if the current-date payment files are still missing.
 - Both the manual `Caixa` flow and the scheduled/test automation now reuse matching local `..._eh_auto` / `..._mva_auto` payment files first, so they do not attempt a fresh Azulzinha/Caixa login when both payment files for that date are already present.
-- MVA reconciliation now also consults `Minhas Notas` model `65` to detect canceled coupons and bring them into the pending totals/report when they are absent from the local closing report.
+- MVA reconciliation now also consults `Minhas Notas` model `65` to detect canceled coupons and show them in the report without adding them to pending totals.
+- MVA Clipp closing reconciliation now also detects canceled coupons paid in cash, so they appear in `Cupons Cancelados` instead of being skipped as an internal payment row.
 - EH and MVA bank reconciliation now expose canceled coupons in a dedicated `Cupons Cancelados` section instead of mixing them into `CF sem Transação Bancária`.
 - Canceled coupons now leave the EH/MVA payment-matching pool before value-only bank reconciliation, so same-value active coupons keep priority and the canceled CF goes to `Cupons Cancelados`.
 - EH partial/daily closing generation no longer crashes when a canceled coupon is promoted into the dedicated `Cupons Cancelados` section during bank reconciliation.
 - Runs `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
 - MVA closing screens now mirror the EH sectioned `Fechamento de Caixa` structure in the app and in A4 printing, including the same reconciliation sections and observations block.
 - When MVA uses the newer Clipp closing file, the app now also attempts to auto-download missing Caixa/Azulzinha PIX and card reports with the local MVA credentials before reconciling payments.
+- In the packaged app, MVA `DAV`, budget, and closing PDF auto-discovery now uses the folder where the executable is running, avoiding stale PDFs from another workspace.
+- If the MVA card totals from Caixa/Azulzinha are missing or lower than the Clipp closing totals, the app now checks Cielo card reports as an additional source and merges Cielo transactions into the same card reconciliation.
+- Before opening the Cielo portal, MVA reconciliation now checks for a valid local Cielo report for the same date and uses it directly when available.
+- If Caixa/Azulzinha PIX or card totals come back as zero or below the Clipp closing totals, the app now revalidates those reports and redownloads only the affected report types once before continuing.
+- MVA local card report detection now prefers the consolidated `*_mva_auto.xlsx` Azulzinha export over per-establishment `*_est*.xlsx` files, so debit transactions from the main terminal are not dropped.
+- The MVA Cielo fallback now opens the Cielo portal only when 15 or more card pendencies remain after Caixa/Azulzinha/local reports, so small differences do not block report generation.
+- Cielo login runs in a visible browser and pauses for the user to solve any `I'm not a robot` verification manually before continuing with e-mail code and report export.
+- Cielo automation no longer writes local `cielo_*_debug_*.log` files or adds success/log-path notices to the user report during normal MVA reconciliation.
+- The Cielo token flow now blocks automatic clicks on `Resend code` / `New code` actions after the e-mail method has already been selected, avoiding repeated token requests.
+- If the Cielo e-mail token is not found quickly in Gmail, the visible browser now asks for manual token entry instead of looping through long Gmail polling cycles.
+- After the manual token notice, the Cielo login flow keeps retrying Gmail periodically and discards any token rejected by Cielo before looking for a newer e-mail.
+- Cielo token lookup now filters e-mails by the current login attempt timestamp instead of ignoring all messages already present after password submission, because Cielo can send the valid code immediately at that step.
+- Cielo form actions now use only the portal button click and no longer dispatch an extra synthetic form submit after the click, avoiding duplicate login/token/e-mail requests.
+- After Cielo login, the MVA fallback opens `Vendas > Minhas Vendas` and switches to the `Detalhado` tab before exporting, so it downloads transaction-level card data instead of the consolidated summary.
+- For historical Cielo exports, the automation now opens `Detalhado` before applying the `Data da venda` filter inside that detail view.
+- Cielo MVA downloads now require the generated report to be the detailed sales report; summary CSVs are ignored and the reports-area fallback stops instead of repeatedly clicking the page-level `Exportar`.
+- The MVA Cielo fallback also runs for same-day reports when 15 or more card pendencies remain, using the portal's current-day sales flow instead of blocking on the historical-date rule.
+- For same-day Cielo exports, the automation now opens the `Detalhado` tab beside `Resumo`/`Calendário` and exports directly, without selecting or applying a date filter.
+- The Cielo historical date filter now fills the required single range field as `DD/MM/YYYY Até DD/MM/YYYY`; if the filtered detailed sales page leaves `Exportar` disabled, the app exits that fallback without waiting on a download.
+- Cielo filter confirmation now clicks only the dedicated apply/search action and rejects `Filtrar mais`, so the filter panel toggle is not mistaken for the search button.
+- After opening the Cielo export modal, the automation now selects the `CSV` option explicitly and clicks the short `Avançar` action instead of the dialog container.
+- If the Cielo export modal advances to a second confirmation step, the automation now clicks only follow-up actions still inside the modal so it can finish the export without reopening the page-level `Exportar` button.
+- When Cielo sends the generated export to the `Relatórios` area instead of downloading immediately, the automation now waits for the visible reports CTA and falls back to the in-page `Relatórios` tab instead of using routes that redirect back to login.
+- In the Cielo `Relatórios` side panel, the automation now downloads the topmost matching `Vendas Cielo histórico resumo` item, since the newest generated reports appear from top to bottom and the download action is icon-only.
+- Cielo downloads are now accepted by the requested date embedded in the filename even before transaction parsing succeeds, preventing repeated clicks on the same report icon.
+- The Cielo historical date filter now prefers the portal calendar/datepicker selection over raw input value changes, and it no longer treats an unconfirmed date selection as a valid no-results response.
+- If the Cielo `Consolidado de vendas` page is already open and shows no exportable results, the app now stops the Cielo fallback instead of probing alternate routes that can redirect back to login.
 - If the MVA `Fechamento de Caixa` PDF is actually a Clipp `Relatório de Vendas` or another unsupported layout, the app now warns that the file will be treated only as a local report and will not trigger automatic Azulzinha/Caixa payment downloads.
 - Manual `Caixa` flows now auto-detect the available closing scope: a single morning closing is generated directly, and when a full-day closing is detected the app lets the user choose between the daily report and an afternoon-only report.
 - Afternoon-only EH/MVA reports now reuse the same closing-window logic as the morning flow, filtering Caixa/Azulzinha payments and the supported cashier data down to the afternoon window instead of keeping the whole day.
@@ -107,6 +136,7 @@ Desktop application for reconciling sales reports from two business flows:
 - Same-day Caixa/Azulzinha card downloads now switch to the `Hoje` tab instead of `Histórico de vendas`, because the historical calendar only releases dates up to the previous day.
 - The Caixa/Azulzinha PIX export flow now confirms the real `Gerar arquivo` step and keeps monitoring the export until the report is actually captured, instead of bailing out on a short quiet window.
 - Bank reconciliation reports keep only the visible PIX/card sections, and the `Pendências` counter is recalculated from those displayed rows so the summary matches the visible evidence.
+- Bank reconciliation `Total Pendências` now sums only PIX/card unmatched differences; cash, canceled coupons, and fiscal/operational observations stay visible but do not affect that total.
 - Shows the EH `Fechamento de Caixa` with total-sales/pending text plus organized tables for PIX/card missing bank transactions and bank-only transactions without CF/NF.
 - Prints sectioned cashier reports through a printer selection dialog.
 - Keeps printed A4 cashier tables on a shared full-width layout so sections stay visually consistent.
@@ -169,6 +199,33 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - Executa `Caixa > MVA` com PDFs importados e conferência no `Minhas Notas`.
 - O fechamento da MVA agora espelha a estrutura seccionada do `Fechamento de Caixa` da EH no aplicativo e na impressão A4, incluindo as mesmas seções de conciliação e observações.
 - Quando a MVA usa o fechamento novo do Clipp, o app agora também tenta baixar automaticamente os relatórios PIX e cartões da Caixa/Azulzinha com as credenciais locais da MVA antes de conciliar os pagamentos.
+- No aplicativo empacotado, a busca automática dos PDFs de `DAV`, orçamento e fechamento da MVA agora usa a pasta onde o executável está rodando, evitando PDFs antigos de outro workspace.
+- Se os totais de cartão da MVA na Caixa/Azulzinha estiverem ausentes ou abaixo dos totais do fechamento Clipp, o app agora consulta relatórios da Cielo como fonte adicional e soma essas transações na mesma conciliação de cartões.
+- Antes de abrir o portal da Cielo, a conciliacao da MVA agora verifica se ja existe relatorio Cielo local valido para a mesma data e usa esse arquivo diretamente quando disponivel.
+- Se os totais de PIX ou cartoes da Caixa/Azulzinha vierem zerados ou abaixo dos totais do fechamento Clipp, o app agora revalida esses relatorios e baixa novamente apenas os tipos afetados uma vez antes de continuar.
+- A detecção local de cartões da MVA agora prioriza o export consolidado `*_mva_auto.xlsx` da Azulzinha em vez dos arquivos por estabelecimento `*_est*.xlsx`, evitando perder os débitos do terminal principal.
+- O fallback da Cielo na MVA agora abre o portal da Cielo apenas quando restarem 15 ou mais pendências de cartão após Caixa/Azulzinha/arquivos locais, evitando bloquear a geração por diferenças pequenas.
+- O login da Cielo roda em navegador visível e pausa para o usuário resolver manualmente qualquer verificação `não sou um robô` antes de continuar com código por e-mail e exportação do relatório.
+- A automacao da Cielo nao grava mais arquivos locais `cielo_*_debug_*.log` nem adiciona avisos de sucesso/caminho de log ao relatorio da MVA em uso normal.
+- O fluxo de token da Cielo agora bloqueia cliques automáticos em `Reenviar código` / `Novo código` depois que o método por e-mail já foi selecionado, evitando pedidos repetidos de token.
+- Se o token da Cielo por e-mail não for encontrado rapidamente no Gmail, o navegador visível agora pede preenchimento manual do código em vez de ficar repetindo ciclos longos de consulta ao Gmail.
+- Depois do aviso de token manual, o login da Cielo continua tentando ler o Gmail periodicamente e descarta qualquer token rejeitado pela Cielo antes de procurar um e-mail mais novo.
+- A busca do token da Cielo agora filtra e-mails pelo horário da tentativa atual de login em vez de ignorar todas as mensagens já presentes após o envio da senha, porque a Cielo pode enviar o código válido imediatamente nessa etapa.
+- As ações de formulário da Cielo agora usam apenas o clique real no botão do portal e não disparam mais um `submit` sintético adicional depois do clique, evitando requisições duplicadas de login/token/e-mail.
+- Depois do login da Cielo, o fallback da MVA abre `Vendas > Minhas Vendas` e muda para a aba `Detalhado` antes de exportar, para baixar cartoes em nivel de transacao em vez do resumo consolidado.
+- Para exportacoes Cielo historicas, a automacao agora abre `Detalhado` antes de aplicar o filtro de `Data da venda` dentro do detalhamento.
+- Os downloads da Cielo na MVA agora exigem o relatorio detalhado de vendas; CSVs de resumo sao ignorados e o fallback da area de relatorios para de tentar em vez de clicar repetidamente no `Exportar` da pagina.
+- O fallback da Cielo na MVA agora tambem roda para relatorios do dia atual quando restarem 15 ou mais pendencias de cartao, usando o fluxo de vendas de hoje do portal em vez de bloquear pela regra de historico.
+- Para exportações Cielo do dia atual, a automação agora abre a aba `Detalhado` ao lado de `Resumo`/`Calendário` e exporta direto, sem selecionar nem aplicar filtro de data.
+- O filtro historico de data da Cielo agora preenche o campo unico de intervalo como `DD/MM/AAAA Até DD/MM/AAAA`; se a pagina detalhada de vendas filtrada deixar `Exportar` bloqueado, o app sai desse fallback sem aguardar download.
+- A confirmação do filtro da Cielo agora clica apenas na ação dedicada de aplicar/pesquisar e rejeita `Filtrar mais`, para não confundir o botão que abre o painel com o botão de busca.
+- Depois de abrir o modal de exportação da Cielo, a automação agora seleciona explicitamente `CSV` e clica na ação curta `Avançar` em vez do container do diálogo.
+- Se o modal de exportação da Cielo avançar para uma segunda confirmação, a automação agora clica apenas em ações seguintes ainda dentro do modal, para finalizar a exportação sem reabrir o botão `Exportar` da página.
+- Quando a Cielo envia a exportação gerada para a área de `Relatórios` em vez de baixar imediatamente, a automação agora aguarda o CTA visível de relatórios e usa a aba `Relatórios` da própria página como fallback, sem acessar rotas que redirecionam de volta para login.
+- No painel lateral de `Relatórios` da Cielo, a automação agora baixa o primeiro item compatível com `Vendas Cielo histórico resumo`, já que os relatórios mais recentes aparecem de cima para baixo e a ação de download é apenas um ícone.
+- Os downloads da Cielo agora são aceitos pela data solicitada no nome do arquivo mesmo antes da validação completa das transações, evitando cliques repetidos no mesmo ícone de relatório.
+- O filtro histórico de data da Cielo agora prioriza a seleção pelo calendário/datepicker do portal em vez de apenas alterar o valor bruto do campo, e não trata seleção de data não confirmada como uma resposta válida sem resultados.
+- Se a página `Consolidado de vendas` da Cielo já estiver aberta e sem resultados exportáveis, o app agora encerra o fallback da Cielo em vez de testar rotas alternativas que podem redirecionar de volta para o login.
 - Se o PDF informado como `Fechamento de Caixa` da MVA for na verdade um `Relatório de Vendas` do Clipp ou outro layout não suportado, o app agora avisa que esse arquivo será tratado apenas como relatório local e não acionará o download automático dos pagamentos da Azulzinha/Caixa.
 - Os fluxos manuais de `Caixa` agora detectam automaticamente o escopo disponível: se existir só o fechamento da manhã, ele gera a manhã direto; se o fechamento do dia inteiro estiver disponível, o app deixa o usuário escolher entre o relatório diário e o relatório só da tarde.
 - Os relatórios só da tarde da EH/MVA agora reutilizam a mesma lógica de janela horária do fechamento da manhã, filtrando os pagamentos da Caixa/Azulzinha e os dados de caixa suportados para a segunda janela do dia, em vez de manter o dia inteiro.
@@ -176,6 +233,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - No dia corrente, o download de cartões da Caixa/Azulzinha agora troca automaticamente para a aba `Hoje`, porque o calendário de `Histórico de vendas` só libera datas até ontem.
 - O fluxo de exportação PIX da Caixa/Azulzinha agora confirma o passo real de `Gerar arquivo` e continua monitorando a exportação até capturar o relatório de fato, em vez de encerrar por uma janela curta sem eventos.
 - Os relatórios de conciliação bancária agora mantêm apenas as seções visíveis de PIX/cartão, e o contador de `Pendências` passa a ser recalculado por essas linhas exibidas para bater com a evidência visível.
+- O `Total Pendências` da conciliação bancária agora soma apenas diferenças não casadas de PIX/cartão; dinheiro, cupons cancelados e observações fiscais/operacionais continuam visíveis, mas não afetam esse total.
 - Exibe o `Fechamento de Caixa` da EH com texto de total de vendas/pendências e tabelas organizadas para divergências de PIX e cartão.
 - Imprime relatórios seccionados de caixa pela tela de seleção de impressora.
 - Normaliza mojibake e acentuação quebrada em diálogos, relatórios e impressão com `ftfy` e fallback interno.
@@ -198,7 +256,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
   - Se a Azulzinha exibir o popup vermelho do portal, como `Ops, um erro aconteceu, tente novamente mais tarde`, ao confirmar o token, a automacao agora trata isso como erro real do portal e reinicia a autenticacao em vez de ficar travada na tela do token.
 - A conciliacao bancaria da EH agora exclui da coluna `Pagamentos` os valores da Azulzinha/Caixa que forem identificados como pertencentes a NF-e filtrada, para refletir apenas o universo de NFC-e.
 - A conciliacao bancaria da EH e da MVA agora tambem separa cupons cancelados em uma secao dedicada `Cupons Cancelados`, em vez de misturar esses CFs em `CF sem Transacao Bancaria`.
-- Os cupons cancelados da EH continuam contando em `Pendências`, `Total Pendências` e no status `Faltante`, agora com exibição dedicada na seção `Cupons Cancelados`.
+- Os cupons cancelados da EH continuam visíveis para auditoria, mas não entram em `Pendências`, `Total Pendências` nem no status `Faltante`.
 - A geracao do fechamento parcial/diario da EH nao quebra mais quando um cupom cancelado e promovido para a secao dedicada `Cupons Cancelados` durante a conciliacao bancaria.
 - A impressao automatica do caixa agora volta a sair em pagina A4 pelo mesmo caminho estavel do `QTextDocument.print_`, evitando o relatorio minusculo na impressao silenciosa.
   - Relatorios automaticos da EH, como downloads da Caixa/Azulzinha e HTMLs exportados do Zweb, agora sao excluidos automaticamente ao fechar o app, para que o workspace nao acumule arquivos `_auto` entre sessoes.
@@ -244,6 +302,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - Os popups de confirmacao baseados em `Sim/Não` agora resolvem a escolha antes de o `QMessageBox` ser destruido, evitando o crash ao confirmar a mesclagem quando apenas uma origem foi importada.
 - O card `Modo atual` foi removido do painel principal do dashboard para simplificar a leitura e deixar apenas `Automação`, `Pendências` e `Workspace`.
 - O card `Pendências` agora deixa a linha de detalhe vazia quando o total está em `0`, exibindo observações abaixo do número apenas quando há algo pendente para informar.
+- O card `Pendências` agora mostra apenas `EH`, `MVA` ou `EH | MVA` no detalhe, sem contador de impressões nem texto `aguardando`.
 - Quando a tabela principal entra em modo de edição, as linhas horizontais e verticais do grid agora ganham um vermelho suave para sinalizar visualmente que a edição está ativa.
 - No modo de edição da tabela principal, o destaque da linha agora segue o mouse e o clique no mesmo comportamento visual, mantendo apenas uma linha iluminada por vez na posição onde o cursor parou.
 - Os cards de topo do dashboard (`Automação`, `Pendências` e `Workspace`) agora usam largura uniforme mais comprimida e deixam sobra lateral na linha, em vez de se esticarem até as bordas do painel.
@@ -255,7 +314,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - As tabelas do dialogo de `Fechamento de Caixa` agora tambem usam um alvo total de largura menor, sem esticar desnecessariamente os grids centrais quando ha poucas colunas.
 - As tabelas curtas de `CF sem Transacao Bancaria` e `Cupons Cancelados` no `Fechamento de Caixa` agora encolhem pela largura real das colunas, removendo a faixa vazia que sobrava a direita do `Valor`.
 - A automacao da Caixa/Azulzinha agora reconhece melhor exportacoes de `cartoes` em `JSON`/`XLSX` e tambem checa o download fisico durante a propria espera da exportacao, reduzindo os casos em que a MVA ficava parada varios minutos mesmo com o arquivo ja baixado.
-- Quando a MVA encontra mais de um estabelecimento no filtro da Caixa/Azulzinha, o fluxo agora aceita o primeiro que gerar arquivo válido e deixa de insistir nos estabelecimentos seguintes se eles passarem a falhar, evitando travamentos longos no fim do download.
+- Quando a MVA encontra mais de um estabelecimento no filtro da Caixa/Azulzinha, o fluxo agora aceita o primeiro que gerar arquivo valido e pula estabelecimentos seguintes que ja aparecem sem resultado na tela, evitando esperas de exportacao desnecessarias.
 - As colunas de `Fechamento` e `Detalhe` foram reduzidas mais um nivel no dialogo de `Caixa`, para deixar as secoes bancarias ainda mais compactas.
 - A impressao/exportacao da aba bancaria do `Fechamento de Caixa` da `EH` agora preserva o sufixo de turno no titulo, exibindo `(M)` para manha e `(T)` para tarde quando o escopo foi filtrado.
 - O contador de `Pendências` no `Fechamento de Caixa` agora segue apenas as linhas visíveis da conciliação bancária, sem incluir alertas internos que não aparecem nas tabelas.
@@ -269,7 +328,8 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - Quando uma pendencia de manha/tarde da MVA e retomada pelo botao da interface, o app agora reaproveita primeiro os pagamentos locais `..._mva_auto` da mesma data e so volta para a Azulzinha/Caixa se esses arquivos ainda estiverem faltando.
 - Tanto o fluxo manual de `Caixa` quanto a automacao agendada/de teste agora reaproveitam primeiro os pagamentos locais `..._eh_auto` / `..._mva_auto` da data correspondente, sem tentar novo login na Azulzinha/Caixa quando os dois arquivos de pagamento daquele dia ja estiverem presentes.
 - Ao fechar o aplicativo, quando houver relatorios automaticos `_auto` da Azulzinha/Zweb no workspace, o app agora pergunta se o usuario quer manter esses arquivos ou exclui-los antes de encerrar.
-- A conciliacao da MVA agora tambem consulta o `Minhas Notas` no modelo `65` para detectar cupons cancelados e traz-los para as pendencias/totais do relatorio quando eles estiverem ausentes do fechamento local.
+- A conciliacao da MVA agora tambem consulta o `Minhas Notas` no modelo `65` para detectar cupons cancelados e exibi-los no relatorio sem soma-los as pendencias/totais.
+- A conciliação da MVA com fechamento Clipp agora também detecta cupons cancelados pagos em dinheiro, exibindo esses CFs em `Cupons Cancelados` em vez de ignorá-los como linha interna de pagamento.
 - Quando um CF cancelado da MVA seria tratado como sobra de pagamento, ele agora vai para a secao `Cupons Cancelados` em vez de aparecer em `CF sem Transacao Bancaria`.
 - Cupons cancelados agora saem do pool de conciliacao bancaria da EH/MVA antes do cruzamento por valor, para que um CF ativo de mesmo valor tenha prioridade e o cancelado va para `Cupons Cancelados`.
 ### EH Debug

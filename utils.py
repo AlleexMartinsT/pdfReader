@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import time
@@ -16,7 +17,7 @@ import queue
 import difflib
 import unicodedata
 from urllib.parse import urljoin
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -906,6 +907,91 @@ def _normalize_ascii_text(value: str) -> str:
     return unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode().casefold()
 
 
+def _mask_sensitive_text(value: str) -> str:
+    text = str(value or "")
+    if "@" in text:
+        return re.sub(
+            r"([A-Za-z0-9._%+-]{1,3})[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+)",
+            r"\1***\2",
+            text,
+        )
+    return text
+
+
+def _sanitize_cielo_log_value(value, key: str = ""):
+    key_norm = _normalize_ascii_text(key)
+    sensitive_key = any(marker in key_norm for marker in ("senha", "password", "token", "codigo", "code", "secret"))
+    safe_metadata_key = any(
+        marker in key_norm
+        for marker in (
+            "visible",
+            "present",
+            "enabled",
+            "requested",
+            "attempt",
+            "count",
+            "length",
+            "len",
+            "found",
+            "source",
+            "state",
+            "status",
+            "challenge",
+            "selected",
+            "confirmed",
+            "matches",
+            "result",
+            "elapsed",
+            "timeout",
+        )
+    )
+    if sensitive_key and not safe_metadata_key:
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {str(k): _sanitize_cielo_log_value(v, str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_cielo_log_value(item, key) for item in value[:50]]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, str):
+        if sensitive_key:
+            return "[redacted]"
+        sanitized = _mask_sensitive_text(value)
+        return sanitized if len(sanitized) <= 700 else sanitized[:700] + "...[truncated]"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _new_cielo_debug_log_path(data_br: str, company: str = "MVA") -> Path:
+    safe_date = re.sub(r"\D", "", str(data_br or "")) or datetime.now().strftime("%Y%m%d")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = Path(_active_report_dir())
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir / f"cielo_{_normalize_ascii_text(company) or 'mva'}_debug_{safe_date}_{stamp}.log"
+
+
+CIELO_DEBUG_LOGS_ENABLED = False
+
+
+def _write_cielo_debug_log(log_path: Path | str | None, event: str, **details) -> None:
+    if not CIELO_DEBUG_LOGS_ENABLED:
+        return
+    if not log_path:
+        return
+    try:
+        path = Path(log_path)
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "event": str(event or "").strip(),
+            "details": _sanitize_cielo_log_value(details),
+        }
+        with path.open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def _display_eh_order_number(numero: str) -> str:
     return _display_fiscal_number(_normalize_fiscal_number(numero))
 
@@ -913,7 +999,14 @@ def _display_eh_order_number(numero: str) -> str:
 def _candidate_local_report_dirs() -> list[Path]:
     dirs = []
     seen = set()
-    for raw in [_active_report_dir()]:
+    raw_dirs: list[str | Path] = [_active_report_dir()]
+    if getattr(sys, "frozen", False):
+        try:
+            raw_dirs.append(Path(os.path.dirname(os.path.abspath(sys.executable))))
+        except Exception:
+            pass
+    raw_dirs.append(Path(r"D:\pdfReader"))
+    for raw in raw_dirs:
         path = Path(str(raw or "")).expanduser()
         key = str(path).casefold()
         if not path.exists() or key in seen:
@@ -1089,6 +1182,9 @@ def _read_excel_text(path: str | Path) -> str:
             if df.empty:
                 continue
             chunks.append(sheet_name)
+            header_text = " ".join(str(value or "").strip() for value in df.columns if str(value or "").strip())
+            if header_text:
+                chunks.append(header_text)
             chunks.extend(" ".join(str(value or "").strip() for value in row if str(value or "").strip()) for row in df.fillna("").values.tolist())
     except Exception:
         for sheet_name, rows in _read_xlsx_rows_fallback(path):
@@ -1189,7 +1285,9 @@ def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict
             return None
         def _score(item: Path) -> tuple[int, float]:
             name = item.stem.casefold()
-            if f"_{company_norm}_auto" in name:
+            if name.endswith(f"_{company_norm}_auto"):
+                company_score = 4
+            elif f"_{company_norm}_auto" in name:
                 company_score = 3
             elif "_auto" in name:
                 company_score = 1
@@ -1318,6 +1416,59 @@ def _load_azulzinha_credentials(company: str = "EH") -> dict | None:
                     "sales_url": "https://portal.azulzinhadacaixa.com.br/MinhasVendas?Router=0",
                 }
     return None
+
+
+def _load_cielo_credentials(company: str = "MVA") -> dict | None:
+    company_norm = _normalize_ascii_text(company) or "mva"
+    env_user = os.environ.get(f"CIELO_{company_norm.upper()}_EMAIL") or os.environ.get("CIELO_EMAIL")
+    env_password = os.environ.get(f"CIELO_{company_norm.upper()}_PASSWORD") or os.environ.get("CIELO_PASSWORD")
+    if env_user and env_password:
+        return {
+            "email": str(env_user).strip(),
+            "password": str(env_password).strip(),
+            "login_url": "https://minhaconta2.cielo.com.br/site/acessos/login",
+            "base_url": "https://minhaconta2.cielo.com.br",
+        }
+
+    base_dir = Path(_runtime_user_dir())
+    candidate_files = [base_dir / "credenciais.txt", base_dir / "credencias.txt", base_dir / "passo-a-passo.txt"]
+    for caminho in candidate_files:
+        if not caminho.is_file():
+            continue
+        try:
+            linhas = [corrigir_texto(linha.strip()) for linha in caminho.read_text(encoding="utf-8", errors="ignore").splitlines()]
+        except OSError:
+            continue
+        for idx, linha in enumerate(linhas):
+            if "cielo" not in _normalize_ascii_text(linha):
+                continue
+            email = ""
+            password = ""
+            for candidate in linhas[idx + 1 : idx + 10]:
+                candidate = str(candidate or "").strip()
+                if not candidate:
+                    continue
+                if "@" in candidate and not email:
+                    email = candidate
+                    continue
+                if email and not password:
+                    password = candidate
+                    break
+            if email and password:
+                return {
+                    "email": email,
+                    "password": password,
+                    "login_url": "https://minhaconta2.cielo.com.br/site/acessos/login",
+                    "base_url": "https://minhaconta2.cielo.com.br",
+                }
+    return None
+
+
+def _cielo_browser_profile_dir(company: str = "MVA") -> str:
+    root = os.path.join(_runtime_user_dir(), "cielo_browser")
+    profile = os.path.join(root, _normalize_ascii_text(company) or "mva")
+    os.makedirs(profile, exist_ok=True)
+    return profile
 
 
 def _azulzinha_browser_profile_dir(company: str = "EH") -> str:
@@ -1534,6 +1685,213 @@ def _is_likely_login_token_email(sender: str, subject: str, body: str) -> bool:
             "seguranca desta conta",
         )
     )
+
+
+def _extract_cielo_email_token(text: str) -> str | None:
+    texto = corrigir_texto(str(text or ""))
+    texto = re.sub(r"(?is)<style\b.*?>.*?</style>", " ", texto)
+    texto = re.sub(r"(?is)<script\b.*?>.*?</script>", " ", texto)
+    texto = re.sub(r"(?is)<[^>]+>", " ", texto)
+    texto = html.unescape(texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+
+    candidatos_prioritarios: list[str] = []
+    candidatos_contexto: list[str] = []
+    for match in re.finditer(r"(?<!\d)(\d{4,8})(?!\d)", texto):
+        inicio = max(0, match.start() - 140)
+        fim = min(len(texto), match.end() + 140)
+        contexto = _normalize_ascii_text(texto[inicio:fim])
+        codigo = match.group(1)
+        if "cielo" in contexto and any(
+            marker in contexto
+            for marker in ("codigo", "token", "verificacao", "validacao", "autenticacao", "seguranca", "acesso")
+        ):
+            candidatos_prioritarios.append(codigo)
+            continue
+        if any(marker in contexto for marker in ("codigo", "token", "verificacao", "validacao", "autenticacao")):
+            candidatos_contexto.append(codigo)
+
+    if candidatos_prioritarios:
+        return candidatos_prioritarios[0]
+    if candidatos_contexto:
+        return candidatos_contexto[0]
+    return None
+
+
+def _is_likely_cielo_token_email(sender: str, subject: str, body: str) -> bool:
+    texto = _normalize_ascii_text("\n".join([str(sender or ""), str(subject or ""), str(body or "")]))
+    return "cielo" in texto and any(
+        marker in texto
+        for marker in (
+            "codigo",
+            "token",
+            "verificacao",
+            "validacao",
+            "autenticacao",
+            "seguranca",
+            "acesso",
+            "minha conta",
+        )
+    )
+
+
+def _cielo_gmail_session(on_status=None) -> requests.Session:
+    creds = _get_gmail_api_credentials(on_status=on_status)
+    if not creds:
+        raise RuntimeError("Credenciais OAuth do Gmail indisponiveis.")
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {creds.token}"})
+    return session
+
+
+def _refresh_cielo_gmail_session_if_needed(session: requests.Session, response, on_status=None) -> bool:
+    if response.status_code != 401:
+        return False
+    try:
+        creds = _get_gmail_api_credentials(on_status=on_status)
+        if not creds or not getattr(creds, "refresh_token", None):
+            return False
+        from google.auth.transport.requests import Request
+
+        creds.refresh(Request())
+        _gmail_oauth_token_path().write_text(creds.to_json(), encoding="utf-8")
+        session.headers.update({"Authorization": f"Bearer {creds.token}"})
+        return True
+    except Exception:
+        return False
+
+
+def _list_recent_cielo_token_message_ids(on_status=None, max_results: int = 20) -> set[str]:
+    try:
+        session = _cielo_gmail_session(on_status=on_status)
+        response = session.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            params={
+                "q": "cielo newer_than:7d",
+                "maxResults": max_results,
+                "includeSpamTrash": "false",
+                "fields": "messages/id,resultSizeEstimate",
+            },
+            timeout=15.0,
+        )
+        if _refresh_cielo_gmail_session_if_needed(session, response, on_status=on_status):
+            response = session.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                params={
+                    "q": "cielo newer_than:7d",
+                    "maxResults": max_results,
+                    "includeSpamTrash": "false",
+                    "fields": "messages/id,resultSizeEstimate",
+                },
+                timeout=15.0,
+            )
+        response.raise_for_status()
+        return {
+            str(item.get("id") or "").strip()
+            for item in ((response.json() or {}).get("messages") or [])
+            if str(item.get("id") or "").strip()
+        }
+    except Exception:
+        return set()
+
+
+def _fetch_cielo_token_from_gmail(
+    timeout: float = 90.0,
+    on_status=None,
+    ignored_tokens: set[str] | None = None,
+    ignored_message_ids: set[str] | None = None,
+    min_internal_ts: float | None = None,
+    debug_info: dict | None = None,
+) -> str | None:
+    ignored_tokens_normalized = {
+        str(token or "").strip()
+        for token in (ignored_tokens or set())
+        if str(token or "").strip()
+    }
+    ignored_message_ids_normalized = {
+        str(message_id or "").strip()
+        for message_id in (ignored_message_ids or set())
+        if str(message_id or "").strip()
+    }
+    deadline = time.time() + timeout
+    last_error = None
+    try:
+        session = _cielo_gmail_session(on_status=on_status)
+        while time.time() < deadline:
+            _emit_pix_status(on_status, "Consultando codigo recente da Cielo no Gmail...")
+            response = session.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                params={
+                    "q": "cielo newer_than:7d",
+                    "maxResults": 30,
+                    "includeSpamTrash": "true",
+                    "fields": "messages/id,resultSizeEstimate",
+                },
+                timeout=15.0,
+            )
+            if _refresh_cielo_gmail_session_if_needed(session, response, on_status=on_status):
+                continue
+            response.raise_for_status()
+            messages = (response.json() or {}).get("messages") or []
+            candidates: list[tuple[float, str, str, str]] = []
+            for item in messages:
+                msg_id = str(item.get("id") or "").strip()
+                if not msg_id:
+                    continue
+                msg_resp = session.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    params={
+                        "format": "metadata",
+                        "metadataHeaders": ["Subject", "From"],
+                        "fields": "id,internalDate,payload/headers",
+                    },
+                    timeout=15.0,
+                )
+                msg_resp.raise_for_status()
+                payload = msg_resp.json() or {}
+                internal_date_ms = float(payload.get("internalDate") or 0.0)
+                msg_ts = internal_date_ms / 1000.0 if internal_date_ms else 0.0
+                if min_internal_ts is not None and msg_ts < float(min_internal_ts):
+                    continue
+                if msg_id in ignored_message_ids_normalized and min_internal_ts is None:
+                    continue
+                headers = payload.get("payload", {}).get("headers") or []
+                subject = next((str(h.get("value") or "") for h in headers if str(h.get("name") or "").lower() == "subject"), "")
+                sender = next((str(h.get("value") or "") for h in headers if str(h.get("name") or "").lower() == "from"), "")
+                candidates.append((internal_date_ms, msg_id, subject, sender))
+            if debug_info is not None:
+                debug_info["candidate_count"] = len(candidates)
+                debug_info["min_internal_ts"] = min_internal_ts
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            for _msg_ts, msg_id, subject, sender in candidates:
+                msg_resp = session.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    params={"format": "full", "fields": "id,internalDate,payload,snippet"},
+                    timeout=15.0,
+                )
+                msg_resp.raise_for_status()
+                payload = msg_resp.json() or {}
+                body = _extract_gmail_api_body(payload.get("payload") or {})
+                snippet = str(payload.get("snippet") or "").strip()
+                searchable_text = f"{body}\n{snippet}".strip()
+                token = _extract_cielo_email_token(f"{subject}\n{searchable_text}")
+                if token and token not in ignored_tokens_normalized and _is_likely_cielo_token_email(sender, subject, searchable_text):
+                    if debug_info is not None:
+                        internal_date_ms = float(payload.get("internalDate") or 0.0)
+                        msg_ts = internal_date_ms / 1000.0 if internal_date_ms else 0.0
+                        debug_info["selected_message_id_tail"] = msg_id[-8:]
+                        debug_info["selected_message_ts"] = datetime.fromtimestamp(msg_ts).isoformat(timespec="seconds") if msg_ts else ""
+                        debug_info["selected_sender"] = sender
+                        debug_info["selected_subject"] = subject
+                    _emit_pix_status(on_status, "Codigo da Cielo encontrado no Gmail.")
+                    return token
+            time.sleep(5.0)
+    except Exception as exc:
+        last_error = exc
+
+    if last_error:
+        _emit_pix_status(on_status, f"Nao foi possivel ler o codigo da Cielo no Gmail: {last_error}")
+    return None
 
 
 def _write_gmail_body_debug(
@@ -2056,6 +2414,7 @@ def _cleanup_azulzinha_debug_artifacts() -> None:
 _EH_AUTO_PAYMENT_REPORT_PREFIXES = (
     "relatorio_de_vendas_pix_",
     "historico_simplificado_de_vendas_",
+    "cielo_cartoes_",
 )
 _EH_AUTO_PAYMENT_REPORT_SUFFIXES = (".csv", ".xlsx", ".pdf", ".crdownload")
 _AUTO_ZWEB_REPORT_PREFIXES = (
@@ -2124,6 +2483,7 @@ def _cleanup_eh_auto_payment_reports(*paths_like: str | os.PathLike | None) -> N
             if (
                 "relatorio_de_vendas_pix" in name
                 or ("historico" in name and "vendas" in name)
+                or "cielo_cartoes" in name
             ):
                 targets[str(candidate).casefold()] = candidate
 
@@ -2262,6 +2622,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
 
         async with websockets.connect(ws_url, max_size=50_000_000) as conn:
             next_id = 0
+            send_lock = asyncio.Lock()
             pending = {}
             event_log: list[dict] = []
             event_cond = asyncio.Condition()
@@ -2292,7 +2653,8 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     mensagem["params"] = params
                 if session_id:
                     mensagem["sessionId"] = session_id
-                await conn.send(json.dumps(mensagem))
+                async with send_lock:
+                    await conn.send(json.dumps(mensagem))
                 resposta = await asyncio.wait_for(future, timeout)
                 if "error" in resposta:
                     raise RuntimeError(resposta["error"])
@@ -3799,6 +4161,47 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     f"A Caixa abriu a pagina de erro ao preparar a exportacao do relatorio de {'PIX' if kind == 'pix' else 'cartoes'}."
                 )
 
+            async def tab_has_no_results(
+                session_id: str,
+                tab_id: str,
+                timeout: float = 6.0,
+            ) -> bool:
+                content_id = f"{tab_id}Content"
+                expression = f"""
+                (() => {{
+                    const content = document.querySelector("#{content_id} [role='tabpanel']");
+                    if (!content || content.getAttribute('aria-hidden') === 'true') return '';
+                    const visible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    }};
+                    const busyNodes = [...content.querySelectorAll('[aria-busy="true"], .ph-item, .ph-picture, .ph-picture-small, .spinner-border, .spinner-grow, .loading, .skeleton, .ant-skeleton')]
+                        .filter(visible);
+                    if (busyNodes.length) return '';
+                    const text = (content.innerText || content.textContent || '')
+                        .normalize('NFD')
+                        .replace(/[\\u0300-\\u036f]/g, '')
+                        .replace(/\\s+/g, ' ')
+                        .toLowerCase();
+                    if (/nenhum resultado|sem resultado|nao encontramos|nenhuma venda|tente filtrar por outros periodos/.test(text)) {{
+                        return 'no-results';
+                    }}
+                    return 'has-results';
+                }})()
+                """
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    state = str(await eval_js(session_id, expression, timeout=10.0) or "").strip()
+                    if state == "no-results":
+                        return True
+                    if state == "has-results":
+                        return False
+                    await asyncio.sleep(0.3)
+                return False
+
             async def click_export(session_id: str, kind: str, tab_id: str | None = None) -> None:
                 tab_content_selector = f"#{tab_id}Content [role='tabpanel']" if tab_id else None
                 await eval_js(
@@ -4488,7 +4891,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             [
                                 "Receber codigo por e-mail ou SMS",
                                 "Receber código por e-mail ou SMS",
-                                "Receber cÃ³digo por e-mail ou SMS",
                                 "Reenviar codigo",
                                 "Reenviar token",
                             ],
@@ -4599,7 +5001,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         [
                             "Receber codigo por e-mail ou SMS",
                             "Receber código por e-mail ou SMS",
-                            "Receber cÃ³digo por e-mail ou SMS",
                         ],
                         timeout=20.0,
                     ):
@@ -6599,6 +7000,18 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 )
                                 if applied_count <= 0:
                                     continue
+                                if await tab_has_no_results(session_id, active_tab_id, timeout=6.0):
+                                    _emit_pix_status(
+                                        on_status,
+                                        f"O estabelecimento {establishment_id} nao tem resultados na Caixa; pulando a exportacao.",
+                                    )
+                                    if captured_paths:
+                                        _emit_pix_status(
+                                            on_status,
+                                            "A MVA ja tinha um estabelecimento valido; ignorando os estabelecimentos restantes sem resultado.",
+                                        )
+                                        break
+                                    continue
                                 _emit_pix_status(on_status, f"Preparando exportacao do relatorio de {'cartoes' if kind == 'cartoes' else 'PIX'}...")
                                 per_establishment_captured_timeout = captured_timeout
                                 per_establishment_download_timeout = download_timeout
@@ -6727,11 +7140,11 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     pass
                 await ensure_authenticated_sales_area(session_id, company_norm, "a area de vendas")
                 resultado = {"pix": None, "cartoes": None, "avisos": []}
-                if need_cartoes:
+                if need_cartoes and not resultado["cartoes"]:
                     resultado["cartoes"] = await download_report(session_id, "cartoes")
                     if not resultado["cartoes"]:
                         resultado["avisos"].append("Não foi possível baixar o relatório de cartões da Azulzinha/Caixa.")
-                if need_pix:
+                if need_pix and not resultado["pix"]:
                     resultado["pix"] = await download_report(session_id, "pix")
                     if not resultado["pix"]:
                         resultado["avisos"].append("Não foi possível baixar o relatório PIX da Azulzinha/Caixa.")
@@ -6759,6 +7172,3127 @@ def baixar_relatorios_caixa_eh_azulzinha(
         shutil.rmtree(profile_dir, ignore_errors=True)
         shutil.rmtree(browser_download_dir, ignore_errors=True)
         _cleanup_azulzinha_debug_artifacts()
+
+
+def _cielo_report_looks_detailed(path: str | Path) -> bool:
+    report_path = Path(path)
+    name_norm = _normalize_ascii_text(report_path.name)
+    if any(marker in name_norm for marker in ("detalh", "detalhe", "detalhado")):
+        return True
+    try:
+        suffix = _effective_local_report_suffix(report_path)
+        if suffix == ".csv":
+            text = _read_text_file(str(report_path))[:8000]
+            text_norm = _normalize_ascii_text(text)
+            return (
+                "detalhado de vendas cielo" in text_norm
+                or (
+                    "data da venda" in text_norm
+                    and "hora da venda" in text_norm
+                    and any(marker in text_norm for marker in ("codigo de autorizacao", "nsu/doc", "codigo da venda"))
+                )
+            )
+        if suffix == ".xlsx":
+            try:
+                rows = _collect_card_rows_from_cielo_xlsx(str(report_path))
+            except Exception:
+                rows = []
+            if rows:
+                header_text = _normalize_ascii_text(" ".join(str(key) for key in rows[0].keys()))
+                return "hora da venda" in header_text and any(
+                    marker in header_text for marker in ("codigo de autorizacao", "nsu/doc", "codigo da venda")
+                )
+    except Exception:
+        return False
+    return False
+
+
+def _wait_for_cielo_downloaded_report(
+    download_dir: str,
+    data_br: str,
+    started_at: float,
+    timeout: float = 90.0,
+    require_detailed: bool = False,
+) -> str | None:
+    data_digits = re.sub(r"\D", "", str(data_br or ""))
+    data_iso_digits = ""
+    if len(data_digits) == 8:
+        data_iso_digits = f"{data_digits[4:8]}{data_digits[2:4]}{data_digits[0:2]}"
+
+    def _matches_requested_date(path: Path) -> bool:
+        name_norm = _normalize_ascii_text(path.name)
+        if data_digits and data_digits in re.sub(r"\D", "", path.name):
+            return True
+        if data_iso_digits and data_iso_digits in re.sub(r"\D", "", path.name):
+            return True
+        if data_iso_digits and f"{data_iso_digits}-{data_iso_digits}" in name_norm:
+            return True
+        return False
+
+    def _find_once() -> str | None:
+        fallback: str | None = None
+        for pattern in ("*.csv", "*.xlsx", "*.crdownload"):
+            candidates = sorted(
+                Path(download_dir).glob(pattern),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            for path in candidates:
+                try:
+                    if path.stat().st_mtime < started_at - 1:
+                        continue
+                    effective_suffix = _effective_local_report_suffix(path)
+                    if effective_suffix not in {".csv", ".xlsx"} or path.name.endswith(".tmp"):
+                        continue
+                    normalized_path = _finalize_local_report_path(path)
+                    if require_detailed and not _cielo_report_looks_detailed(normalized_path):
+                        continue
+                    if fallback is None and _matches_requested_date(Path(normalized_path)):
+                        fallback = normalized_path
+                    try:
+                        reports = _build_card_reports_from_cielo(normalized_path, data_br)
+                    except Exception:
+                        reports = {}
+                    if any((report.get("itens_autorizados") or []) for report in reports.values()):
+                        return normalized_path
+                except Exception:
+                    continue
+        return fallback
+
+    found = _find_once()
+    if found:
+        return found
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = _find_once()
+        if found:
+            return found
+        time.sleep(0.6)
+    return None
+
+
+def _persist_cielo_auto_report(source_path: str, data_br: str) -> str:
+    source = Path(source_path)
+    suffix = _effective_local_report_suffix(source) or source.suffix.lower() or ".csv"
+    safe_date = re.sub(r"\D", "", str(data_br or "")) or datetime.now().strftime("%Y%m%d")
+    target_dir = Path(_active_report_dir())
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"cielo_cartoes_{safe_date}_mva_auto{suffix}"
+    if target.exists():
+        target = target_dir / f"cielo_cartoes_{safe_date}_{int(time.time())}_mva_auto{suffix}"
+    try:
+        shutil.move(str(source), str(target))
+    except Exception:
+        shutil.copy2(str(source), str(target))
+    return str(target)
+
+
+def baixar_relatorio_cielo_mva(
+    data_br: str,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+    token_callback=None,
+) -> dict[str, object]:
+    cancel_event = cancel_event or threading.Event()
+    cielo_debug_log_path = _new_cielo_debug_log_path(data_br, "MVA") if CIELO_DEBUG_LOGS_ENABLED else None
+
+    def cielo_log(event: str, **details) -> None:
+        _write_cielo_debug_log(cielo_debug_log_path, event, **details)
+
+    cielo_log("run_start", data_br=data_br)
+
+    def _check_cancelled() -> None:
+        if cancel_event.is_set():
+            cielo_log("cancel_requested")
+            raise RuntimeError("__cancelled__")
+
+    credenciais = _load_cielo_credentials("MVA")
+    if not credenciais:
+        cielo_log("credentials_missing")
+        return {
+            "cartoes": None,
+            "avisos": ["As credenciais da Cielo da MVA não foram encontradas no credenciais.txt."],
+            "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+        }
+
+    navegador = _find_chromium_browser_path()
+    if not navegador:
+        cielo_log("browser_missing")
+        return {
+            "cartoes": None,
+            "avisos": ["Nenhum navegador Chromium compatível foi encontrado para baixar o relatório da Cielo."],
+            "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+        }
+
+    try:
+        data_iso = datetime.strptime(str(data_br or "").strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        cielo_log("invalid_date", data_br=data_br)
+        raise ValueError("A data da consulta Cielo é inválida.") from exc
+    cielo_log(
+        "credentials_loaded",
+        email=credenciais.get("email"),
+        password_length=len(str(credenciais.get("password") or "")),
+        browser=os.path.basename(str(navegador)),
+        data_iso=data_iso,
+    )
+
+    profile_root = _cielo_browser_profile_dir("MVA")
+    profile_dir = tempfile.mkdtemp(prefix="run_mva_", dir=profile_root)
+    browser_download_dir = tempfile.mkdtemp(prefix="downloads_mva_", dir=profile_root)
+    _prepare_chromium_profile(profile_dir, browser_download_dir)
+    port = _pick_free_local_port()
+    cielo_log("browser_profile_prepared", port=port, profile_dir=profile_dir, download_dir=browser_download_dir)
+    chrome_args = [
+        navegador,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-component-update",
+        "--disable-popup-blocking",
+        "--disable-notifications",
+        "--disable-renderer-backgrounding",
+        "--deny-permission-prompts",
+        "--disable-save-password-bubble",
+        "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication",
+        "--window-size=1400,900",
+        "--window-position=80,60",
+        "--disable-gpu",
+        str(credenciais.get("login_url") or "https://minhaconta2.cielo.com.br/site/acessos/login"),
+    ]
+
+    async def _run() -> dict[str, object]:
+        import websockets
+
+        _check_cancelled()
+        meta = _wait_for_devtools_ready(port)
+        ws_url = str(meta.get("webSocketDebuggerUrl") or "").strip()
+        if not ws_url:
+            cielo_log("devtools_missing_ws_url", meta=meta)
+            raise RuntimeError("Não foi possível conectar ao Chromium para acessar a Cielo.")
+        cielo_log("devtools_ready", browser_url=meta.get("Browser"), ws_url_present=bool(ws_url))
+
+        async with websockets.connect(ws_url, max_size=50_000_000) as conn:
+            next_id = 0
+            pending = {}
+
+            async def recv_loop():
+                while True:
+                    _check_cancelled()
+                    mensagem = json.loads(await conn.recv())
+                    if "id" in mensagem and mensagem["id"] in pending:
+                        pending.pop(mensagem["id"]).set_result(mensagem)
+
+            recv_task = asyncio.create_task(recv_loop())
+
+            async def cdp(method: str, params: dict | None = None, session_id: str | None = None, timeout: float = 45.0):
+                nonlocal next_id
+                _check_cancelled()
+                next_id += 1
+                future = asyncio.get_running_loop().create_future()
+                pending[next_id] = future
+                mensagem = {"id": next_id, "method": method}
+                if params is not None:
+                    mensagem["params"] = params
+                if session_id:
+                    mensagem["sessionId"] = session_id
+                await conn.send(json.dumps(mensagem))
+                try:
+                    resposta = await asyncio.wait_for(future, timeout=timeout)
+                finally:
+                    pending.pop(next_id, None)
+                if "error" in resposta:
+                    raise RuntimeError(resposta["error"])
+                return resposta.get("result") or {}
+
+            async def eval_js(session_id: str, expression: str, timeout: float = 30.0):
+                result = await cdp(
+                    "Runtime.evaluate",
+                    {"expression": expression, "awaitPromise": True, "returnByValue": True},
+                    session_id=session_id,
+                    timeout=timeout,
+                )
+                value = result.get("result") or {}
+                return value.get("value")
+
+            async def dispatch_cielo_native_click(session_id: str, click_result: dict | None) -> bool:
+                if not isinstance(click_result, dict):
+                    return False
+                try:
+                    x = float(click_result.get("clickX"))
+                    y = float(click_result.get("clickY"))
+                except Exception:
+                    return False
+                if not (0 <= x <= 10000 and 0 <= y <= 10000):
+                    return False
+                try:
+                    await cdp(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mouseMoved", "x": x, "y": y, "button": "none"},
+                        session_id=session_id,
+                        timeout=15.0,
+                    )
+                    await cdp(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+                        session_id=session_id,
+                        timeout=15.0,
+                    )
+                    await cdp(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+                        session_id=session_id,
+                        timeout=15.0,
+                    )
+                    return True
+                except Exception as exc:
+                    cielo_log("native_click_failed", error=str(exc)[:300], error_type=type(exc).__name__, click_result=click_result)
+                    return False
+
+            async def visible_text(session_id: str) -> str:
+                text = await eval_js(session_id, "document.body ? document.body.innerText : ''", timeout=10.0)
+                return str(text or "")
+
+            async def show_cielo_banner(session_id: str, message: str, color: str = "#1d4ed8") -> None:
+                try:
+                    await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                          let banner = document.getElementById('pdfreader-cielo-manual-banner');
+                          if (!banner) {{
+                            banner = document.createElement('div');
+                            banner.id = 'pdfreader-cielo-manual-banner';
+                            document.documentElement.appendChild(banner);
+                          }}
+                          Object.assign(banner.style, {{
+                            position: 'fixed',
+                            left: '24px',
+                            right: '24px',
+                            top: '18px',
+                            zIndex: '2147483647',
+                            padding: '14px 18px',
+                            borderRadius: '12px',
+                            background: {json.dumps(color)},
+                            color: '#fff',
+                            font: '700 17px Arial, sans-serif',
+                            textAlign: 'center',
+                            whiteSpace: 'pre-wrap',
+                            boxShadow: '0 14px 36px rgba(0,0,0,.32)'
+                          }});
+                          banner.textContent = {json.dumps(message)};
+                          return true;
+                        }})()
+                        """,
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+
+            async def hide_cielo_banner(session_id: str) -> None:
+                try:
+                    await eval_js(
+                        session_id,
+                        "(() => { const banner = document.getElementById('pdfreader-cielo-manual-banner'); if (banner) banner.remove(); return true; })()",
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+
+            async def cielo_manual_challenge_present(session_id: str) -> bool:
+                try:
+                    return bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                              const text = (document.body && document.body.innerText || '')
+                                .normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                              if (/nao sou um robo|i'm not a robot|recaptcha|captcha|verificacao de seguranca/.test(text)) return true;
+                              const selectors = [
+                                'iframe[src*="recaptcha"]',
+                                'iframe[title*="reCAPTCHA"]',
+                                'iframe[src*="captcha"]',
+                                '.g-recaptcha',
+                                '[data-sitekey]'
+                              ];
+                              return selectors.some(selector => !!document.querySelector(selector));
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+                except Exception:
+                    return False
+
+            async def cielo_submit_enabled(session_id: str) -> bool:
+                try:
+                    return bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                              const button = document.querySelector('#bt-submit')
+                                || [...document.querySelectorAll('button,input[type=submit]')]
+                                  .find(e => /entrar|acessar|continuar|enviar|validar|confirmar/i.test(e.innerText || e.value || ''));
+                              return !!(button && !button.disabled);
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+                except Exception:
+                    return False
+
+            async def cielo_token_input_present(session_id: str) -> bool:
+                try:
+                    return bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                              const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                              const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                              const bodyText = norm(document.body && document.body.innerText || '');
+                              const inputs = [...document.querySelectorAll('input')]
+                                .filter(visible)
+                                .filter(e => !/hidden|checkbox|radio|submit|button|email/.test((e.type || '').toLowerCase()));
+                              if (inputs.length >= 4 && inputs.every(e => {
+                                const maxLength = Number(e.getAttribute('maxlength') || e.maxLength || 0);
+                                const width = Math.round(e.getBoundingClientRect().width || 0);
+                                return maxLength === 1 || width <= 90;
+                              })) return true;
+                              if (inputs.length && /codigo|token|otp|mfa|verificacao|validacao|autenticacao|verificar/.test(bodyText)) return true;
+                              const hasVerifyButton = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                                .filter(visible)
+                                .some(e => /verificar|validar codigo|validar token|confirmar codigo|confirmar token/.test(norm(e.innerText || e.value || e.getAttribute('aria-label') || '')));
+                              if (inputs.length && hasVerifyButton) return true;
+                              return inputs.some(e => {
+                                  const text = norm([
+                                    e.type,
+                                    e.name,
+                                    e.id,
+                                    e.placeholder,
+                                    e.getAttribute('aria-label'),
+                                    e.getAttribute('autocomplete'),
+                                    e.getAttribute('inputmode')
+                                  ].join(' '));
+                                  const maxLength = Number(e.getAttribute('maxlength') || e.maxLength || 0);
+                                  return /codigo|token|otp|mfa|verificacao|validacao|autenticacao|one-time-code|numeric/.test(text)
+                                    || (maxLength >= 4 && maxLength <= 8 && /text|tel|number|password/.test((e.type || '').toLowerCase()));
+                                });
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+                except Exception:
+                    return False
+
+            async def cielo_token_challenge_present(session_id: str, text_norm: str | None = None) -> bool:
+                text_norm = text_norm if text_norm is not None else _normalize_ascii_text(await visible_text(session_id))
+                if await cielo_token_input_present(session_id):
+                    return True
+                return any(
+                    marker in text_norm
+                    for marker in (
+                        "digite o codigo",
+                        "digite o token",
+                        "informe o codigo",
+                        "informe o token",
+                        "codigo enviado",
+                        "codigo de verificacao",
+                        "insira o codigo",
+                        "validar codigo",
+                        "validar token",
+                        "verificar codigo",
+                        "verificar token",
+                        "verificar",
+                    )
+                )
+
+            async def wait_for_manual_cielo_challenge(session_id: str, context_label: str, timeout: float = 600.0) -> None:
+                challenge_visible = await cielo_manual_challenge_present(session_id)
+                submit_enabled = await cielo_submit_enabled(session_id)
+                if not challenge_visible and submit_enabled:
+                    return
+                status_label = (
+                    "verificacao 'nao sou um robo'"
+                    if challenge_visible
+                    else "liberacao manual do botao Entrar"
+                )
+                _emit_pix_status(
+                    on_status,
+                    f"Resolva manualmente a {status_label} da Cielo na janela aberta ({context_label}).",
+                )
+                await show_cielo_banner(
+                    session_id,
+                    "Ação manual necessária\nResolva o reCAPTCHA / 'não sou um robô' nesta janela.\nDepois que o botão Entrar liberar, o app continuará automaticamente.",
+                    "#92400e",
+                )
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    _check_cancelled()
+                    current_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                    text_norm = _normalize_ascii_text(await visible_text(session_id))
+                    if await cielo_token_challenge_present(session_id, text_norm):
+                        await hide_cielo_banner(session_id)
+                        return
+                    if any(
+                        marker in text_norm
+                        for marker in (
+                            "e-mail para",
+                            "email para",
+                            "gmail.com",
+                            "receber por e-mail",
+                            "receber por email",
+                            "enviar por e-mail",
+                            "enviar por email",
+                        )
+                    ):
+                        await hide_cielo_banner(session_id)
+                        return
+                    if await cielo_submit_enabled(session_id):
+                        await hide_cielo_banner(session_id)
+                        return
+                    if "acessos/login" not in current_url:
+                        await hide_cielo_banner(session_id)
+                        return
+                    await asyncio.sleep(2.0)
+                raise RuntimeError("A verificacao manual da Cielo nao foi concluida dentro do tempo limite.")
+
+            async def fill_visible_input(session_id: str, index: int, value: str) -> bool:
+                script = """
+                ((idx, value) => {
+                  const inputs = [...document.querySelectorAll('input')]
+                    .filter(e => e.type !== 'hidden' && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const input = inputs[idx];
+                  if (!input) return false;
+                  input.scrollIntoView({block: 'center'});
+                  input.focus();
+                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                  setter.call(input, '');
+                  input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                  setter.call(input, value);
+                  input.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: value}));
+                  input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                  input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                  input.blur();
+                  return true;
+                })
+                """
+                return bool(await eval_js(session_id, f"{script}({index}, {json.dumps(value)})", timeout=10.0))
+
+            async def focus_cielo_login_input(session_id: str) -> bool:
+                return bool(
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                          const visible = e => !!(e && !e.disabled && !e.readOnly && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const inputs = [...document.querySelectorAll('input')]
+                            .filter(e => visible(e) && !/hidden|password|checkbox|radio|submit|button/.test((e.type || '').toLowerCase()));
+                          const target = inputs.find(e => /login|email|usuario|user|cpf|cnpj|estabelecimento|document/.test([
+                            e.type,
+                            e.name,
+                            e.id,
+                            e.placeholder,
+                            e.getAttribute('aria-label'),
+                            e.parentElement && e.parentElement.innerText
+                          ].join(' ').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase())) || inputs[0];
+                          if (!target) return false;
+                          target.scrollIntoView({block: 'center'});
+                          target.focus();
+                          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                          setter.call(target, '');
+                          target.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                          target.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                          return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+
+            async def fill_cielo_login_input(session_id: str, value: str) -> bool:
+                if not await focus_cielo_login_input(session_id):
+                    return False
+                try:
+                    await cdp("Input.insertText", {"text": str(value or "")}, session_id=session_id, timeout=10.0)
+                except Exception:
+                    return await fill_visible_input(session_id, 0, value)
+                await asyncio.sleep(0.5)
+                return bool(
+                    await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                          const expectedValue = {json.dumps(str(value or ""))};
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          return [...document.querySelectorAll('input')]
+                            .filter(e => visible(e) && !/hidden|password|checkbox|radio|submit|button/.test((e.type || '').toLowerCase()))
+                            .some(e => String(e.value || '') === expectedValue);
+                        }})()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+
+            async def cielo_login_input_state(session_id: str, expected: str) -> dict:
+                try:
+                    state = await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                          const expectedValue = {json.dumps(str(expected or ""))};
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const inputs = [...document.querySelectorAll('input')]
+                            .filter(e => visible(e) && !/hidden|password|checkbox|radio|submit|button/.test((e.type || '').toLowerCase()));
+                          const values = inputs.map(e => String(e.value || ''));
+                          return {{
+                            present: inputs.length > 0,
+                            anyValue: values.some(Boolean),
+                            matches: values.some(v => v === expectedValue),
+                            firstValueLength: values.length ? values[0].length : 0
+                          }};
+                        }})()
+                        """,
+                        timeout=10.0,
+                    )
+                    return state if isinstance(state, dict) else {}
+                except Exception:
+                    return {}
+
+            async def fill_cielo_token(session_id: str, token: str) -> bool:
+                digits = re.sub(r"\D+", "", str(token or ""))
+                if not digits:
+                    return False
+                focus_script = """
+                ((value) => {
+                  const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                  const inputs = [...document.querySelectorAll('input')]
+                    .filter(e => visible(e) && !/hidden|checkbox|radio|submit|button|email/.test((e.type || '').toLowerCase()));
+                  const candidates = inputs.filter(e => {
+                    const text = norm([
+                      e.type,
+                      e.name,
+                      e.id,
+                      e.placeholder,
+                      e.getAttribute('aria-label'),
+                      e.getAttribute('autocomplete'),
+                      e.getAttribute('inputmode')
+                    ].join(' '));
+                    const maxLength = Number(e.getAttribute('maxlength') || e.maxLength || 0);
+                    return /codigo|token|otp|mfa|verificacao|validacao|autenticacao|one-time-code|numeric|number|tel/.test(text)
+                      || (maxLength >= 1 && maxLength <= 8);
+                  });
+                  const singleDigitInputs = candidates.filter(e => {
+                    const maxLength = Number(e.getAttribute('maxlength') || e.maxLength || 0);
+                    const width = Math.round(e.getBoundingClientRect().width || 0);
+                    return maxLength === 1 || width <= 80;
+                  });
+                  if (singleDigitInputs.length >= value.length) {
+                    singleDigitInputs.forEach(e => { e.value = ''; e.dispatchEvent(new Event('input', {bubbles: true, composed: true})); });
+                    singleDigitInputs[0].scrollIntoView({block: 'center'});
+                    singleDigitInputs[0].focus();
+                    return {mode: 'split'};
+                  }
+                  const target = candidates.find(e => /one-time-code|otp|token|codigo|numeric|number|tel/.test(norm([
+                    e.name,
+                    e.id,
+                    e.placeholder,
+                    e.getAttribute('aria-label'),
+                    e.getAttribute('autocomplete'),
+                    e.getAttribute('inputmode')
+                  ].join(' ')))) || candidates[candidates.length - 1] || inputs[inputs.length - 1];
+                  if (!target) return {mode: 'none'};
+                  target.value = '';
+                  target.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                  target.scrollIntoView({block: 'center'});
+                  target.focus();
+                  return {mode: 'single'};
+                })
+                """
+                prepared = await eval_js(session_id, f"{focus_script}({json.dumps(digits)})", timeout=10.0)
+                if isinstance(prepared, dict) and prepared.get("mode") in {"split", "single"}:
+                    try:
+                        await cdp("Input.insertText", {"text": digits}, session_id=session_id, timeout=10.0)
+                        await asyncio.sleep(0.6)
+                        typed_ok = bool(
+                            await eval_js(
+                                session_id,
+                                f"""
+                                (() => {{
+                                  const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                                  const value = {json.dumps(digits)};
+                                  const values = [...document.querySelectorAll('input')]
+                                    .filter(e => visible(e) && !/hidden|checkbox|radio|submit|button|email/.test((e.type || '').toLowerCase()))
+                                    .map(e => String(e.value || '').replace(/\\D+/g, ''))
+                                    .filter(Boolean);
+                                  return values.join('').includes(value) || values.some(v => v === value);
+                                }})()
+                                """,
+                                timeout=10.0,
+                            )
+                        )
+                        if typed_ok:
+                            return True
+                    except Exception:
+                        pass
+                fallback_script = """
+                ((value) => {
+                  const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                  const setValue = (input, val) => {
+                    input.scrollIntoView({block: 'center'});
+                    input.focus();
+                    setter.call(input, '');
+                    input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                    setter.call(input, val);
+                    input.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: val}));
+                    input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                    input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                  };
+                  const inputs = [...document.querySelectorAll('input')]
+                    .filter(e => visible(e) && !/hidden|checkbox|radio|submit|button|email/.test((e.type || '').toLowerCase()));
+                  const candidates = inputs.filter(e => {
+                    const text = norm([
+                      e.type,
+                      e.name,
+                      e.id,
+                      e.placeholder,
+                      e.getAttribute('aria-label'),
+                      e.getAttribute('autocomplete'),
+                      e.getAttribute('inputmode')
+                    ].join(' '));
+                    const maxLength = Number(e.getAttribute('maxlength') || e.maxLength || 0);
+                    return /codigo|token|otp|mfa|verificacao|validacao|autenticacao|one-time-code|numeric|number|tel/.test(text)
+                      || (maxLength >= 1 && maxLength <= 8);
+                  });
+                  const singleDigitInputs = candidates.filter(e => {
+                    const maxLength = Number(e.getAttribute('maxlength') || e.maxLength || 0);
+                    const width = Math.round(e.getBoundingClientRect().width || 0);
+                    return maxLength === 1 || width <= 80;
+                  });
+                  if (singleDigitInputs.length >= value.length) {
+                    value.split('').forEach((digit, idx) => setValue(singleDigitInputs[idx], digit));
+                    singleDigitInputs[Math.min(value.length, singleDigitInputs.length) - 1].blur();
+                    return true;
+                  }
+                  const target = candidates.find(e => /one-time-code|otp|token|codigo|numeric|number|tel/.test(norm([
+                    e.name,
+                    e.id,
+                    e.placeholder,
+                    e.getAttribute('aria-label'),
+                    e.getAttribute('autocomplete'),
+                    e.getAttribute('inputmode')
+                  ].join(' ')))) || candidates[candidates.length - 1] || inputs[inputs.length - 1];
+                  if (!target) return false;
+                  setValue(target, value);
+                  target.blur();
+                  return true;
+                })
+                """
+                return bool(await eval_js(session_id, f"{fallback_script}({json.dumps(digits)})", timeout=10.0))
+
+            async def fill_password_input(session_id: str, value: str) -> bool:
+                focused_password = bool(
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                          const visible = e => !!(e && !e.disabled && !e.readOnly && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const inputs = [...document.querySelectorAll('input')]
+                            .filter(e => e.type === 'password' && visible(e));
+                          const input = inputs[0];
+                          if (!input) return false;
+                          input.scrollIntoView({block: 'center'});
+                          input.focus();
+                          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                          setter.call(input, '');
+                          input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                          input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                          return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+                if focused_password:
+                    try:
+                        await cdp("Input.insertText", {"text": str(value or "")}, session_id=session_id, timeout=10.0)
+                        await asyncio.sleep(0.5)
+                        typed_ok = bool(
+                            await eval_js(
+                                session_id,
+                                f"""
+                                (() => {{
+                                  const expectedLength = {len(str(value or ""))};
+                                  const expectedValue = {json.dumps(str(value or ""))};
+                                  const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                                  return [...document.querySelectorAll('input')]
+                                    .filter(e => e.type === 'password' && visible(e))
+                                    .some(e => String(e.value || '') === expectedValue && String(e.value || '').length === expectedLength);
+                                }})()
+                                """,
+                                timeout=10.0,
+                            )
+                        )
+                        if typed_ok:
+                            return True
+                    except Exception:
+                        pass
+                script = """
+                ((value) => {
+                  const inputs = [...document.querySelectorAll('input')]
+                    .filter(e => e.type !== 'hidden' && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const input = inputs.find(e => e.type === 'password') || inputs[inputs.length - 1];
+                  if (!input) return false;
+                  input.scrollIntoView({block: 'center'});
+                  input.focus();
+                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                  setter.call(input, '');
+                  input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                  setter.call(input, value);
+                  input.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: value}));
+                  input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                  input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                  input.blur();
+                  return true;
+                })
+                """
+                return bool(await eval_js(session_id, f"{script}({json.dumps(value)})", timeout=10.0))
+
+            cielo_resend_reject_markers = (
+                "reenviar",
+                "reenvie",
+                "novo codigo",
+                "novo código",
+                "novo token",
+                "pedir novo",
+                "solicitar novo",
+                "gerar novo",
+                "outro codigo",
+                "outro código",
+                "outro token",
+                "enviar novamente",
+                "receber novamente",
+                "envie novamente",
+            )
+
+            async def click_by_text(
+                session_id: str,
+                markers: tuple[str, ...],
+                timeout: float = 12.0,
+                reject_markers: tuple[str, ...] = (),
+            ) -> bool:
+                deadline = time.time() + timeout
+                markers_json = json.dumps([_normalize_ascii_text(marker) for marker in markers])
+                reject_markers_json = json.dumps([_normalize_ascii_text(marker) for marker in reject_markers])
+                while time.time() < deadline:
+                    script = """
+                        (() => {
+                          const markers = __MARKERS__;
+                          const rejectMarkers = __REJECT_MARKERS__;
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                          const rejected = text => rejectMarkers.some(marker => marker && text.includes(marker));
+                          const rawCandidates = [...document.querySelectorAll('button,a,label,span,div,input[type=button],input[type=submit],[role=button],[role=option],[role=menuitem],[role=radio]')]
+                            .filter(visible)
+                            .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || '')])
+                            .filter(([e, text]) => text && markers.some(marker => text.includes(marker)) && !rejected(text));
+                          const seen = new Set();
+                          const candidates = rawCandidates
+                            .map(([e, text]) => {
+                              const clickable = e.closest('button,a,label,[role=button],[role=option],[role=menuitem],[role=radio],input[type=button],input[type=submit]') || e;
+                              const clickableText = norm(clickable.innerText || clickable.value || clickable.getAttribute('aria-label') || text);
+                              return [clickable, clickableText || text];
+                            })
+                            .filter(([e, text]) => {
+                              if (!visible(e) || rejected(text)) return false;
+                              const rect = e.getBoundingClientRect();
+                              const key = [e.tagName, text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                              if (seen.has(key)) return false;
+                              seen.add(key);
+                              return true;
+                            })
+                            .map(([e, text]) => {
+                              const rect = e.getBoundingClientRect();
+                              const area = Math.max(1, rect.width * rect.height);
+                              const exact = markers.some(marker => text === marker) ? 5000 : 0;
+                              const starts = markers.some(marker => text.startsWith(marker)) ? 1000 : 0;
+                              const tagBonus = /^(BUTTON|A|LABEL|INPUT)$/.test(e.tagName) || e.getAttribute('role') ? 500 : 0;
+                              const shortBonus = Math.max(0, 400 - text.length);
+                              const areaPenalty = Math.min(1000, Math.log10(area) * 120);
+                              return {e, text, score: exact + starts + tagBonus + shortBonus - areaPenalty};
+                            })
+                            .sort((a, b) => b.score - a.score);
+                          if (!candidates.length) return false;
+                          const chosen = candidates[0].e;
+                          chosen.scrollIntoView({block: 'center'});
+                          chosen.focus && chosen.focus();
+                          chosen.click();
+                          return true;
+                        })()
+                    """.replace("__MARKERS__", markers_json).replace("__REJECT_MARKERS__", reject_markers_json)
+                    clicked = await eval_js(
+                        session_id,
+                        script,
+                        timeout=10.0,
+                    )
+                    if clicked:
+                        return True
+                    await asyncio.sleep(0.5)
+                return False
+
+            async def click_submit(session_id: str, reject_markers: tuple[str, ...] = ()) -> bool:
+                reject_markers_json = json.dumps([_normalize_ascii_text(marker) for marker in reject_markers])
+                script = """
+                (() => {
+                  const rejectMarkers = __REJECT_MARKERS__;
+                  const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                  const rejected = e => rejectMarkers.some(marker => marker && norm(e.innerText || e.value || e.getAttribute('aria-label') || '').includes(marker));
+                  const primary = document.querySelector('#bt-submit');
+                  const button = (visible(primary) && !primary.disabled && !rejected(primary) ? primary : null)
+                    || [...document.querySelectorAll('button,input[type=submit]')].find(e => visible(e) && !e.disabled && !rejected(e) && /entrar|acessar|continuar|enviar|validar|verificar|confirmar|consultar|pesquisar|buscar|exportar|baixar|prosseguir|avancar/.test(norm(e.innerText || e.value || e.getAttribute('aria-label') || '')));
+                  if (!button) return false;
+                  button.scrollIntoView({block: 'center'});
+                  button.focus();
+                  button.click();
+                  return true;
+                })()
+                """.replace("__REJECT_MARKERS__", reject_markers_json)
+                return bool(
+                    await eval_js(
+                        session_id,
+                        script,
+                        timeout=10.0,
+                    )
+                )
+
+            async def click_cielo_filter_apply(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const wanted = ['aplicar', 'filtrar', 'consultar', 'pesquisar', 'buscar'];
+                  const rejected = text => [
+                    'filtrar mais',
+                    'mais filtros',
+                    'data da venda',
+                    'data de venda',
+                    'historico',
+                    'hoje',
+                    'exportar',
+                    'reenviar',
+                    'novo codigo',
+                    'novo token',
+                  ].some(marker => text.includes(marker));
+                  const seen = new Set();
+                  const candidates = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit],label,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const clickable = e.closest('button,a,[role=button],input[type=button],input[type=submit],label') || e;
+                      const text = norm(clickable.innerText || clickable.value || clickable.getAttribute('aria-label') || e.innerText || e.textContent || '');
+                      return [clickable, text];
+                    })
+                    .filter(([e, text]) => {
+                      if (!text || rejected(text)) return false;
+                      if (!wanted.some(marker => text === marker || text.startsWith(marker + ' '))) return false;
+                      const rect = e.getBoundingClientRect();
+                      const key = [e.tagName, text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    })
+                    .map(([e, text]) => {
+                      const rect = e.getBoundingClientRect();
+                      const exact = wanted.some(marker => text === marker) ? 5000 : 0;
+                      const tagBonus = /^(BUTTON|A|LABEL|INPUT)$/.test(e.tagName) || e.getAttribute('role') ? 700 : 0;
+                      const shortBonus = Math.max(0, 200 - text.length);
+                      const areaPenalty = Math.min(800, Math.log10(Math.max(1, rect.width * rect.height)) * 90);
+                      return {
+                        e,
+                        text,
+                        score: exact + tagBonus + shortBonus - areaPenalty,
+                        tag: e.tagName,
+                        role: e.getAttribute('role') || '',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = candidates[0];
+                  const summary = candidates.slice(0, 8).map(({text, tag, role, x, y, w, h, score}) => ({text, tag, role, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, candidates: summary};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  chosen.e.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.click();
+                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, candidates: summary};
+                })()
+                """
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_sales_detail_after_filter(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const dataBr = __DATA_BR__;
+                  const dataIso = __DATA_ISO__;
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    return rect.width > 0 && rect.height > 0
+                      && rect.right > 0 && rect.bottom > 0 && rect.left < vw && rect.top < vh
+                      && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const clickSelector = 'button,a,[role=button],label,input[type=button],input[type=submit]';
+                  const ancestorText = e => {
+                    let current = e;
+                    let best = norm(e.innerText || e.textContent || '');
+                    for (let depth = 0; current && depth < 8; depth++, current = current.parentElement) {
+                      const text = norm(current.innerText || current.textContent || '');
+                      if (!text || text.length > 900) continue;
+                      if (text.includes(dataBr) || text.includes(dataIso)) return text;
+                      if (text.length > best.length) best = text;
+                    }
+                    return best;
+                  };
+                  const candidates = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit],label,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const target = e.closest(clickSelector) || e;
+                      const text = norm(target.innerText || target.value || target.getAttribute('aria-label') || target.getAttribute('title') || e.innerText || e.textContent || '');
+                      const rowText = ancestorText(target);
+                      return {e: target, text, rowText};
+                    })
+                    .filter(item => {
+                      if (!visible(item.e)) return false;
+                      if (!item.text || item.text.length > 80) return false;
+                      if (!/detalhar/.test(item.text)) return false;
+                      if (/detalhado|resumo detalhado|calendario|relatorios|exportar|filtrar|filtro/.test(item.text)) return false;
+                      return true;
+                    })
+                    .map(item => {
+                      const rect = item.e.getBoundingClientRect();
+                      const dataMatch = item.rowText.includes(dataBr) || item.rowText.includes(dataIso);
+                      const exact = /^(detalhar|detalhar este dia|detalhar dia)$/.test(item.text);
+                      const tagBonus = /^(BUTTON|A|LABEL|INPUT)$/.test(item.e.tagName) || item.e.getAttribute('role') ? 1200 : 0;
+                      return {
+                        ...item,
+                        score: (dataMatch ? 5000 : 0) + (exact ? 2500 : 800) + tagBonus + Math.max(0, 1000 - rect.top),
+                        tag: item.e.tagName,
+                        role: item.e.getAttribute('role') || '',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = candidates[0];
+                  const summary = candidates.slice(0, 8).map(({text, rowText, tag, role, x, y, w, h, score}) => ({text, rowText: rowText.slice(0, 260), tag, role, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, candidates: summary, href: location.href};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  const clickRect = chosen.e.getBoundingClientRect();
+                  return {
+                    clicked: true,
+                    targetText: chosen.text,
+                    rowText: chosen.rowText.slice(0, 260),
+                    tag: chosen.tag,
+                    role: chosen.role,
+                    href: location.href,
+                    clickX: Math.round(clickRect.left + clickRect.width / 2),
+                    clickY: Math.round(clickRect.top + clickRect.height / 2),
+                    candidates: summary
+                  };
+                })()
+                """.replace("__DATA_BR__", json.dumps(data_br)).replace("__DATA_ISO__", json.dumps(data_iso))
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_export_format(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const overlaySelector = '[role=dialog], [class*="modal"], [class*="Modal"], [class*="overlay"], [class*="Overlay"], [class*="popover"], [class*="Popover"]';
+                  const seen = new Set();
+                  const candidates = [...document.querySelectorAll('label,button,a,[role=button],[role=radio],[role=option],input,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const clickable = e.closest('label,button,a,[role=button],[role=radio],[role=option]') || e;
+                      const text = norm(clickable.innerText || clickable.value || clickable.getAttribute('aria-label') || e.innerText || e.textContent || '');
+                      const input = clickable.querySelector && clickable.querySelector('input[type=radio],input[type=checkbox]');
+                      return [clickable, text, input];
+                    })
+                    .filter(([e, text]) => {
+                      if (!text) return false;
+                      if (!/excel|xlsx|csv/.test(text)) return false;
+                      if (/exportar relatorios|selecione o formato|fechar|avancar|filtrar/.test(text) && text.length > 40) return false;
+                      const rect = e.getBoundingClientRect();
+                      const key = [e.tagName, text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    })
+                    .map(([e, text, input]) => {
+                      const rect = e.getBoundingClientRect();
+                      const inOverlay = !!e.closest(overlaySelector);
+                      const csv = text === 'csv';
+                      const xlsx = /excel|xlsx/.test(text);
+                      const exact = /^(excel|excel\\(\\.xlsx\\)|xlsx|csv)$/.test(text);
+                      const checked = !!(input && input.checked);
+                      const tagBonus = /^(LABEL|BUTTON|A|INPUT)$/.test(e.tagName) || e.getAttribute('role') ? 900 : 0;
+                      const cardBonus = e.tagName === 'DIV' && rect.width > 80 && rect.height > 60 ? 1200 : 0;
+                      const shortBonus = Math.max(0, 240 - text.length);
+                      const areaPenalty = Math.min(800, Math.log10(Math.max(1, rect.width * rect.height)) * 80);
+                      return {
+                        e,
+                        input,
+                        text,
+                        score: (inOverlay ? 2500 : 0) + (csv ? 2400 : xlsx ? 1200 : 700) + (exact ? 1500 : 0) + (checked ? 300 : 0) + tagBonus + cardBonus + shortBonus - areaPenalty,
+                        tag: e.tagName,
+                        role: e.getAttribute('role') || '',
+                        inOverlay,
+                        checked,
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = candidates[0];
+                  const summary = candidates.slice(0, 10).map(({text, tag, role, inOverlay, checked, x, y, w, h, score}) => ({text, tag, role, inOverlay, checked, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, candidates: summary};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  const target = chosen.input || chosen.e;
+                  target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                  target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                  target.click();
+                  target.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, inOverlay: chosen.inOverlay, checked: chosen.checked, candidates: summary};
+                })()
+                """
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_export_confirm(session_id: str, require_overlay: bool = False) -> dict:
+                require_overlay_js = "true" if require_overlay else "false"
+                script = """
+                (() => {
+                  const requireOverlay = __REQUIRE_OVERLAY__;
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const overlaySelector = '[role=dialog], [class*="modal"], [class*="Modal"], [class*="overlay"], [class*="Overlay"], [class*="popover"], [class*="Popover"]';
+                  const textOf = e => norm(e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('title') || '');
+                  const nodes = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].filter(visible);
+                  const seen = new Set();
+                  const candidates = nodes
+                    .map(e => [e, textOf(e)])
+                    .filter(([e, text]) => {
+                      const inOverlay = !!e.closest(overlaySelector);
+                      if (requireOverlay && !inOverlay) return false;
+                      if (!text || text.length > 45) return false;
+                      if (!/^(avancar|avançar|exportar|baixar|download|gerar arquivo|confirmar|concluir|solicitar)$/.test(text)) return false;
+                      if (/filtrar|data da venda|historico|hoje|inicio|recebiveis|pix|sair|notificacoes/.test(text)) return false;
+                      const rect = e.getBoundingClientRect();
+                      const key = [e.tagName, text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    })
+                    .map(([e, text]) => {
+                      const rect = e.getBoundingClientRect();
+                      const inOverlay = !!e.closest(overlaySelector);
+                      const priority =
+                        /^(avancar|avançar)$/.test(text) ? 7000 :
+                        /^exportar$/.test(text) ? 5000 :
+                        /^(baixar|download|gerar arquivo)$/.test(text) ? 4500 :
+                        3500;
+                      return {
+                        e,
+                        text,
+                        score: priority + (inOverlay ? 2500 : 0) - Math.min(600, Math.log10(Math.max(1, rect.width * rect.height)) * 70),
+                        tag: e.tagName,
+                        role: e.getAttribute('role') || '',
+                        inOverlay,
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = candidates[0];
+                  const summary = candidates.slice(0, 10).map(({text, tag, role, inOverlay, x, y, w, h, score}) => ({text, tag, role, inOverlay, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, candidates: summary};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  chosen.e.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.click();
+                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, inOverlay: chosen.inOverlay, candidates: summary};
+                })()
+                """.replace("__REQUIRE_OVERLAY__", require_overlay_js)
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_reports_cta(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    return rect.width > 0 && rect.height > 0
+                      && rect.right > 0 && rect.bottom > 0 && rect.left < vw && rect.top < vh
+                      && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const overlaySelector = '[role=dialog], [class*="modal"], [class*="Modal"], [class*="overlay"], [class*="Overlay"], [class*="popover"], [class*="Popover"], [class*="toast"], [class*="Toast"], [class*="snackbar"], [class*="Snackbar"]';
+                  const clickableSelector = 'button,a,[role=button],input[type=button],input[type=submit],label';
+                  const clickAtCenter = e => {
+                    const rect = e.getBoundingClientRect();
+                    const x = Math.max(1, Math.min((window.innerWidth || document.documentElement.clientWidth || 1) - 1, rect.left + rect.width / 2));
+                    const y = Math.max(1, Math.min((window.innerHeight || document.documentElement.clientHeight || 1) - 1, rect.top + rect.height / 2));
+                    const pointed = document.elementFromPoint(x, y);
+                    return (pointed && pointed.closest(clickableSelector)) || pointed || e;
+                  };
+                  const nodes = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit],label,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const text = norm(e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('title') || '');
+                      const clickTarget = e.closest(clickableSelector) || e.closest('[class*="button"],[class*="Button"],[class*="btn"],[class*="Btn"]') || clickAtCenter(e);
+                      return [e, clickTarget, text];
+                    })
+                    .filter(([e, clickTarget, text]) => {
+                      if (!text || text.length > 45) return false;
+                      if (!/relatorio|relatorios/.test(text)) return false;
+                      if (/exportar relatorios|selecione o formato|planilha|csv|excel|xlsx/.test(text)) return false;
+                      return /^(acessar relatorios|ver relatorios|ir para relatorios|acompanhar relatorios|consultar relatorios)$/.test(text);
+                    })
+                    .filter(([e, clickTarget]) => visible(clickTarget))
+                    .map(([e, clickTarget, text]) => {
+                      const rect = e.getBoundingClientRect();
+                      const inOverlay = !!e.closest(overlaySelector);
+                      const targetRect = clickTarget.getBoundingClientRect();
+                      const tagBonus = /^(BUTTON|A|LABEL|INPUT)$/.test(clickTarget.tagName) || clickTarget.getAttribute('role') ? 1200 : 0;
+                      const exactish = text === 'acessar relatorios' ? 3500 : 2500;
+                      return {
+                        e,
+                        clickTarget,
+                        text,
+                        score: (inOverlay ? 2000 : 0) + tagBonus + exactish + Math.max(0, 180 - text.length),
+                        tag: clickTarget.tagName,
+                        role: clickTarget.getAttribute('role') || '',
+                        nodeTag: e.tagName,
+                        inOverlay,
+                        x: Math.round(targetRect.x),
+                        y: Math.round(targetRect.y),
+                        w: Math.round(targetRect.width),
+                        h: Math.round(targetRect.height),
+                        textX: Math.round(rect.x),
+                        textY: Math.round(rect.y),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = nodes[0];
+                  const summary = nodes.slice(0, 10).map(({text, tag, role, nodeTag, inOverlay, x, y, w, h, textX, textY, score}) => ({text, tag, role, nodeTag, inOverlay, x, y, w, h, textX, textY, score}));
+                  if (!chosen) return {clicked: false, candidates: summary};
+                  const target = chosen.clickTarget;
+                  target.scrollIntoView({block: 'center', inline: 'center'});
+                  target.focus && target.focus();
+                  target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                  target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                  target.click();
+                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, inOverlay: chosen.inOverlay, href: location.href, candidates: summary};
+                })()
+                """
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_ready_report_download(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const docHeight = Math.max(
+                      document.documentElement.scrollHeight || 0,
+                      document.body?.scrollHeight || 0,
+                      window.innerHeight || 0
+                    );
+                    return rect.width > 0 && rect.height > 0
+                      && rect.left >= 0 && rect.top >= 0 && rect.right > 0 && rect.left < vw && rect.top < docHeight
+                      && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const bodyText = norm(document.body?.innerText || '');
+                  const href = norm(location.href || '');
+                  const reportsAreaText = /meus relatorios|seus relatorios|relatorios solicitados|central de relatorios|historico de relatorios|relatorios gerados|arquivos gerados|baixar relatorio|download do relatorio|relatorio pronto|tipo de relatorio|data da solicitacao|relatorio inicio|vendas cielo historico resumo|vendas cielo historico detalhado/.test(bodyText);
+                  const strongReportsArea = /tipo de relatorio|data da solicitacao|relatorio inicio|vendas cielo historico resumo|vendas cielo historico detalhado/.test(bodyText);
+                  const onReportsArea = /\\/site\\/relatorio|\\/relatorios|\\/reports/.test(href) || reportsAreaText;
+                  if (!onReportsArea || /seu relatorio ja esta em processamento/.test(bodyText)) {
+                    return {clicked: false, wrongPage: true, processing: /processando|gerando|aguarde|pendente|em andamento|solicitado/.test(bodyText), candidates: [], bodyText: bodyText.slice(0, 500), href: location.href};
+                  }
+                  const seen = new Set();
+                  const reportRows = [...document.querySelectorAll('tr,li,[role=row],section,article,div')]
+                    .filter(visible)
+                    .map(row => {
+                      const rect = row.getBoundingClientRect();
+                      const rowText = norm(row.innerText || row.textContent || '');
+                      return {row, rect, rowText};
+                    })
+                    .filter(({rect, rowText}) => {
+                      if (!rowText || rowText.length > 260) return false;
+                      if (rect.top < 90 || rect.height < 28 || rect.height > 140 || rect.width < 220) return false;
+                      if (!(rowText.includes(__DATA_BR__) || rowText.includes(__DATA_DASH__) || rowText.includes(__DATA_ISO__))) return false;
+                      return /vendas cielo|historico resumo|historico detalhado|histórico resumo|histórico detalhado|csv|xls|xlsx/.test(rowText);
+                    })
+                    .map(({row, rect, rowText}) => {
+                      const controls = [...row.querySelectorAll('button,a,[role=button],svg,i')]
+                        .map(e => e.closest('button,a,[role=button]') || e)
+                        .filter((e, index, arr) => arr.indexOf(e) === index)
+                        .filter(visible)
+                        .filter(e => {
+                          const text = norm(e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('title') || '');
+                          return !/fechar|filtro|tipo de relatorio|gerenciar recorrencias|agendar recorrencia|atualizar/.test(text);
+                        })
+                        .sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+                      const target = controls[0];
+                      if (!target) return null;
+                      const targetRect = target.getBoundingClientRect();
+                      const ready = !/processando|gerando|aguarde|pendente|em andamento|solicitado/.test(rowText);
+                      const detailBonus = /historico detalhado|histórico detalhado|detalhado/.test(rowText) ? 5000 : 0;
+                      const summaryPenalty = /historico resumo|histórico resumo/.test(rowText) ? 1200 : 0;
+                      return {
+                        e: target,
+                        text: norm(target.innerText || target.value || target.getAttribute('aria-label') || target.getAttribute('title') || 'download'),
+                        rowText: rowText.slice(0, 220),
+                        score: (ready ? 3000 : -1500) + detailBonus - summaryPenalty + Math.max(0, 1600 - rect.top) + Math.max(0, targetRect.left),
+                        tag: target.tagName,
+                        role: target.getAttribute('role') || '',
+                        x: Math.round(targetRect.x),
+                        y: Math.round(targetRect.y),
+                        w: Math.round(targetRect.width),
+                        h: Math.round(targetRect.height),
+                        rowY: Math.round(rect.y),
+                      };
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => b.score - a.score);
+                  const iconChosen = reportRows[0];
+                  const iconSummary = reportRows.slice(0, 8).map(({text, rowText, tag, role, x, y, w, h, rowY, score}) => ({text, rowText, tag, role, x, y, w, h, rowY, score}));
+                  if (iconChosen) {
+                    iconChosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                    iconChosen.e.focus && iconChosen.e.focus();
+                    const clickRect = iconChosen.e.getBoundingClientRect();
+                    return {
+                      clicked: true,
+                      method: 'latest_report_icon',
+                      targetText: iconChosen.text,
+                      rowText: iconChosen.rowText,
+                      tag: iconChosen.tag,
+                      role: iconChosen.role,
+                      href: location.href,
+                      clickX: Math.round(clickRect.left + clickRect.width / 2),
+                      clickY: Math.round(clickRect.top + clickRect.height / 2),
+                      candidates: iconSummary
+                    };
+                  }
+                  if (!strongReportsArea) {
+                    return {clicked: false, wrongPage: true, processing: /processando|gerando|aguarde|pendente|em andamento|solicitado/.test(bodyText), candidates: [], iconCandidates: iconSummary, bodyText: bodyText.slice(0, 500), href: location.href};
+                  }
+                  const nodes = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit],label')]
+                    .filter(visible)
+                    .map(e => {
+                      const text = norm(e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('title') || '');
+                      return [e, text];
+                    })
+                    .filter(([e, text]) => {
+                      if (!text || text.length > 80) return false;
+                      if (/^exportar$/.test(text)) return false;
+                      if (!/baixar|download|arquivo|excel|xlsx|csv|planilha/.test(text)) return false;
+                      if (/filtrar|filtro|data da venda|historico|hoje|exportar relatorios|selecione o formato|avancar|fechar|acessar relatorios/.test(text)) return false;
+                      const rect = e.getBoundingClientRect();
+                      if (rect.left < 0 || rect.top < 0) return false;
+                      const key = [e.tagName, text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    })
+                    .map(([e, text]) => {
+                      const rect = e.getBoundingClientRect();
+                      const rowText = norm(e.closest('tr,li,[role=row],section,article,div')?.innerText || '');
+                      const ready = !/processando|gerando|aguarde|pendente|em andamento|solicitado/.test(rowText);
+                      const dataMatch = rowText.includes(__DATA_BR__) || rowText.includes(__DATA_DASH__) || rowText.includes(__DATA_ISO__);
+                      const downloadText = /baixar|download/.test(text);
+                      const fileText = /excel|xlsx|csv|planilha|arquivo/.test(text);
+                      const tagBonus = /^(BUTTON|A|LABEL|INPUT)$/.test(e.tagName) || e.getAttribute('role') ? 1000 : 0;
+                      return {
+                        e,
+                        text,
+                        rowText: rowText.slice(0, 220),
+                        score: (ready ? 2500 : -1500) + (dataMatch ? 1600 : 0) + (downloadText ? 1400 : 0) + (fileText ? 700 : 0) + tagBonus + Math.max(0, 160 - text.length) + Math.max(0, 1000 - rect.y / 2),
+                        tag: e.tagName,
+                        role: e.getAttribute('role') || '',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = nodes[0];
+                  const summary = nodes.slice(0, 12).map(({text, rowText, tag, role, x, y, w, h, score}) => ({text, rowText, tag, role, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, processing: /processando|gerando|aguarde|pendente|em andamento|solicitado/.test(bodyText), candidates: summary, iconCandidates: iconSummary, bodyText: bodyText.slice(0, 500)};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  const clickRect = chosen.e.getBoundingClientRect();
+                  return {
+                    clicked: true,
+                    targetText: chosen.text,
+                    rowText: chosen.rowText,
+                    tag: chosen.tag,
+                    role: chosen.role,
+                    href: location.href,
+                    clickX: Math.round(clickRect.left + clickRect.width / 2),
+                    clickY: Math.round(clickRect.top + clickRect.height / 2),
+                    candidates: summary
+                  };
+                })()
+                """.replace("__DATA_BR__", json.dumps(data_br)).replace("__DATA_DASH__", json.dumps(data_br.replace("/", "-"))).replace("__DATA_ISO__", json.dumps(data_iso))
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_sales_reports_tab(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    return rect.width > 0 && rect.height > 0
+                      && rect.right > 0 && rect.bottom > 0 && rect.left < vw && rect.top < vh
+                      && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const clickableSelector = 'button,a,[role=button],label';
+                  window.scrollTo({top: 0, left: 0, behavior: 'instant'});
+                  const seen = new Set();
+                  const candidates = [...document.querySelectorAll('button,a,[role=button],label,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const text = norm(e.innerText || e.getAttribute('aria-label') || e.getAttribute('title') || '');
+                      const target = e.closest(clickableSelector) || e;
+                      return [e, target, text];
+                    })
+                    .filter(([e, target, text]) => {
+                      if (text !== 'relatorios') return false;
+                      if (!visible(target)) return false;
+                      const rect = target.getBoundingClientRect();
+                      const key = [target.tagName, text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    })
+                    .map(([e, target, text]) => {
+                      const rect = target.getBoundingClientRect();
+                      const tagBonus = /^(BUTTON|A|LABEL)$/.test(target.tagName) || target.getAttribute('role') ? 1000 : 0;
+                      const navBand = rect.top >= 120 && rect.top <= 320 ? 1200 : 0;
+                      return {
+                        e: target,
+                        text,
+                        score: tagBonus + navBand + Math.max(0, 500 - rect.top),
+                        tag: target.tagName,
+                        role: target.getAttribute('role') || '',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = candidates[0];
+                  const summary = candidates.slice(0, 8).map(({text, tag, role, x, y, w, h, score}) => ({text, tag, role, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, candidates: summary, href: location.href};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  chosen.e.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.click();
+                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, href: location.href, candidates: summary};
+                })()
+                """
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def click_cielo_sales_detail_tab(session_id: str) -> dict:
+                script = """
+                (() => {
+                  const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const visible = e => {
+                    if (!e || e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+                    const rect = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    return rect.width > 0 && rect.height > 0
+                      && rect.right > 0 && rect.bottom > 0 && rect.left < vw && rect.top < vh
+                      && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const clickableSelector = 'button,a,[role=tab],[role=button],label';
+                  window.scrollTo({top: 0, left: 0, behavior: 'instant'});
+                  const contextText = e => {
+                    let current = e;
+                    let best = '';
+                    for (let depth = 0; current && depth < 5; depth++, current = current.parentElement) {
+                      const text = norm(current.innerText || current.textContent || '');
+                      if (text && text.length <= 500 && text.length > best.length) best = text;
+                    }
+                    return best;
+                  };
+                  const seen = new Set();
+                  const candidates = [...document.querySelectorAll('button,a,[role=tab],[role=button],label,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const target = e.closest(clickableSelector) || e;
+                      const text = norm(target.innerText || target.value || target.getAttribute('aria-label') || target.getAttribute('title') || e.innerText || e.textContent || '');
+                      const ctx = contextText(target);
+                      return {e: target, text, ctx};
+                    })
+                    .filter(item => {
+                      if (!visible(item.e)) return false;
+                      if (!item.text || item.text.length > 80) return false;
+                      if (!/^(detalhado|detalhamento|vendas detalhadas|detalhado de vendas)$/.test(item.text)) return false;
+                      if (/historico detalhado|histórico detalhado|relatorio|relatório|exportar|baixar|download|csv|xlsx/.test(item.text)) return false;
+                      const rect = item.e.getBoundingClientRect();
+                      const key = [item.e.tagName, item.text, Math.round(rect.x), Math.round(rect.y)].join(':');
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    })
+                    .map(item => {
+                      const rect = item.e.getBoundingClientRect();
+                      const tabRole = item.e.getAttribute('role') === 'tab' ? 2500 : 0;
+                      const clickableBonus = /^(BUTTON|A|LABEL)$/.test(item.e.tagName) || item.e.getAttribute('role') ? 1200 : 0;
+                      const tabContext = item.ctx.includes('resumo') && (item.ctx.includes('calendario') || item.ctx.includes('calendário')) ? 3000 : 0;
+                      const navBand = rect.top >= 80 && rect.top <= 420 ? 1000 : 0;
+                      const selectedPenalty = item.e.getAttribute('aria-selected') === 'true' || /active|selected|selecionado/.test(String(item.e.className || '')) ? -250 : 0;
+                      return {
+                        ...item,
+                        score: tabContext + tabRole + clickableBonus + navBand + selectedPenalty + Math.max(0, 1000 - rect.top),
+                        tag: item.e.tagName,
+                        role: item.e.getAttribute('role') || '',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const chosen = candidates[0];
+                  const summary = candidates.slice(0, 8).map(({text, ctx, tag, role, x, y, w, h, score}) => ({text, context: ctx.slice(0, 220), tag, role, x, y, w, h, score}));
+                  if (!chosen) return {clicked: false, candidates: summary, href: location.href};
+                  chosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                  chosen.e.focus && chosen.e.focus();
+                  chosen.e.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                  chosen.e.click();
+                  return {
+                    clicked: true,
+                    targetText: chosen.text,
+                    context: chosen.ctx.slice(0, 220),
+                    tag: chosen.tag,
+                    role: chosen.role,
+                    href: location.href,
+                    candidates: summary
+                  };
+                })()
+                """
+                result = await eval_js(session_id, script, timeout=10.0)
+                return result if isinstance(result, dict) else {"clicked": bool(result)}
+
+            async def download_cielo_generated_report_from_reports_area(session_id: str, started_at: float) -> str | None:
+                reports_cta = {"clicked": False}
+                for cta_attempt in range(1, 16):
+                    _check_cancelled()
+                    downloaded = await asyncio.to_thread(
+                        _wait_for_cielo_downloaded_report,
+                        browser_download_dir,
+                        data_br,
+                        started_at,
+                        0.5,
+                        True,
+                    )
+                    if downloaded:
+                        cielo_log("export_reports_download_detected_while_waiting_cta", attempt=cta_attempt, downloaded=downloaded)
+                        return downloaded
+                    reports_cta = await click_cielo_reports_cta(session_id)
+                    if cta_attempt <= 3 or bool(reports_cta.get("clicked")) or cta_attempt % 5 == 0:
+                        cielo_log("export_reports_cta_click", attempt=cta_attempt, result=reports_cta)
+                    if bool(reports_cta.get("clicked")):
+                        await asyncio.sleep(6.0)
+                        try:
+                            reports_state = await eval_js(
+                                session_id,
+                                """
+                                (() => ({
+                                  href: location.href,
+                                  text: (document.body?.innerText || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 700)
+                                }))()
+                                """,
+                                timeout=10.0,
+                            )
+                        except Exception as exc:
+                            reports_state = {"error": str(exc)}
+                        cielo_log("export_reports_after_cta", state=reports_state)
+                        state_text = str((reports_state or {}).get("text", "")) if isinstance(reports_state, dict) else ""
+                        state_href = str((reports_state or {}).get("href", "")) if isinstance(reports_state, dict) else ""
+                        if (
+                            ("/vendas/resumo" in state_href or "/vendas/detalhado" in state_href)
+                            and ("seu relatorio ja esta em processamento" in state_text or "acessar relatorios" in state_text)
+                        ):
+                            second_cta = await click_cielo_reports_cta(session_id)
+                            cielo_log("export_reports_cta_second_click", result=second_cta)
+                            if bool(second_cta.get("clicked")):
+                                await asyncio.sleep(6.0)
+                        if ("/vendas/resumo" in state_href or "/vendas/detalhado" in state_href) and not any(
+                            marker in state_text
+                            for marker in (
+                                "meus relatorios",
+                                "seus relatorios",
+                                "relatorios solicitados",
+                                "central de relatorios",
+                                "historico de relatorios",
+                                "relatorios gerados",
+                                "arquivos gerados",
+                                "baixar relatorio",
+                                "download do relatorio",
+                                "relatorio pronto",
+                            )
+                        ):
+                            reports_tab = await click_cielo_sales_reports_tab(session_id)
+                            cielo_log("export_reports_tab_click_after_cta", result=reports_tab)
+                            if bool(reports_tab.get("clicked")):
+                                await asyncio.sleep(8.0)
+                        break
+                    await asyncio.sleep(3.0)
+                if not bool(reports_cta.get("clicked")):
+                    current_url = await eval_js(session_id, "location.href", timeout=10.0)
+                    cielo_log("export_reports_cta_not_found", current_url=current_url)
+                    reports_tab = await click_cielo_sales_reports_tab(session_id)
+                    cielo_log("export_reports_tab_click", result=reports_tab)
+                    if bool(reports_tab.get("clicked")):
+                        await asyncio.sleep(8.0)
+
+                latest_report_icon_clicked = False
+                wrong_page_count = 0
+                for attempt in range(1, 31):
+                    _check_cancelled()
+                    downloaded = await asyncio.to_thread(
+                        _wait_for_cielo_downloaded_report,
+                        browser_download_dir,
+                        data_br,
+                        started_at,
+                        1.0,
+                        True,
+                    )
+                    if downloaded:
+                        cielo_log("export_reports_download_detected_before_click", attempt=attempt, downloaded=downloaded)
+                        return downloaded
+                    try:
+                        current_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                    except Exception:
+                        current_url = ""
+                    if latest_report_icon_clicked:
+                        click_result = {"clicked": False, "skipped": True, "reason": "latest_report_icon_already_clicked"}
+                    else:
+                        click_result = await click_cielo_ready_report_download(session_id)
+                    if attempt <= 3 or bool(click_result.get("clicked")) or attempt % 5 == 0:
+                        cielo_log("export_reports_ready_download_click", attempt=attempt, current_url=current_url, result=click_result)
+                    if not bool(click_result.get("clicked")) and bool(click_result.get("wrongPage")):
+                        wrong_page_count += 1
+                    else:
+                        wrong_page_count = 0
+                    if wrong_page_count >= 4:
+                        cielo_log("export_reports_wrong_page_abort", attempt=attempt, current_url=current_url, result=click_result)
+                        return None
+                    if (
+                        not bool(click_result.get("clicked"))
+                        and bool(click_result.get("wrongPage"))
+                        and ("/vendas/resumo" in current_url or "/vendas/detalhado" in current_url)
+                        and attempt in {1, 5, 10, 15}
+                    ):
+                        reports_tab = await click_cielo_sales_reports_tab(session_id)
+                        cielo_log("export_reports_tab_click_retry", attempt=attempt, result=reports_tab)
+                        if bool(reports_tab.get("clicked")):
+                            await asyncio.sleep(8.0)
+                            continue
+                    if bool(click_result.get("clicked")):
+                        native_report_clicked = await dispatch_cielo_native_click(session_id, click_result)
+                        cielo_log("export_reports_ready_download_native_click", attempt=attempt, clicked=native_report_clicked, result=click_result)
+                        if str(click_result.get("method") or "") == "latest_report_icon":
+                            latest_report_icon_clicked = True
+                        downloaded = await asyncio.to_thread(
+                            _wait_for_cielo_downloaded_report,
+                            browser_download_dir,
+                            data_br,
+                            started_at,
+                            8.0,
+                            True,
+                        )
+                        if downloaded:
+                            cielo_log("export_reports_download_detected_after_click", attempt=attempt, downloaded=downloaded)
+                            return downloaded
+                    await asyncio.sleep(4.0)
+                cielo_log("export_reports_download_timeout", files=_cielo_download_snapshot(started_at))
+                return None
+
+            async def select_cielo_email_delivery(session_id: str) -> bool:
+                return bool(
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                          const isEmail = text => (/e-?mail para|gmail\\.com|receber por e-?mail/.test(text) && !/sms|whatsapp|reenviar|reenvie|novo codigo|novo token/.test(text));
+                          const all = [...document.querySelectorAll('label,button,a,[role=button],[role=radio],[role=option],input,span,div')]
+                            .filter(visible)
+                            .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || e.textContent || '')])
+                            .filter(([e, text]) => text && isEmail(text));
+                          if (!all.length) return false;
+                          all.sort((a, b) => {
+                            const ar = a[0].getBoundingClientRect();
+                            const br = b[0].getBoundingClientRect();
+                            return (ar.height * ar.width) - (br.height * br.width);
+                          });
+                          const textNode = all[0][0];
+                          const candidates = [
+                            textNode.closest('label'),
+                            textNode.closest('[role=radio]'),
+                            textNode.closest('[role=option]'),
+                            textNode.closest('[role=button]'),
+                            textNode.closest('button'),
+                            textNode.closest('a'),
+                            textNode.closest('.mat-radio-button'),
+                            textNode.closest('.flui-radio'),
+                            textNode.closest('.flui-option'),
+                            textNode.closest('.option'),
+                            textNode.closest('.card'),
+                            textNode.parentElement,
+                            textNode
+                          ].filter(Boolean);
+                          for (const root of candidates) {
+                            const input = root.querySelector && root.querySelector('input[type=radio],input[type=checkbox]');
+                            if (input && !input.disabled) {
+                              input.scrollIntoView({block: 'center'});
+                              input.click();
+                              input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                              return true;
+                            }
+                          }
+                          const target = candidates.find(visible);
+                          if (!target) return false;
+                          target.scrollIntoView({block: 'center'});
+                          target.focus && target.focus();
+                          target.click();
+                          return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+
+            async def click_cielo_email_delivery_confirm(session_id: str) -> bool:
+                clicked = bool(
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                          const reject = /sms|whatsapp|e-?mail para|gmail\\.com|reenviar|voltar|cancelar|sair|primeiro acesso|esqueci/;
+                          const buttons = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                            .filter(visible)
+                            .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || '')])
+                            .filter(([e, text]) => text && /confirmar|continuar|enviar|receber|prosseguir|avancar/.test(text) && !reject.test(text));
+                          if (!buttons.length) return false;
+                          const target = buttons[0][0];
+                          target.scrollIntoView({block: 'center'});
+                          target.focus && target.focus();
+                          target.click();
+                          return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+                if clicked:
+                    return True
+                return await click_by_text(
+                    session_id,
+                    (
+                        "confirmar",
+                        "continuar",
+                        "enviar",
+                        "enviar codigo",
+                        "enviar código",
+                        "receber codigo",
+                        "receber código",
+                        "prosseguir",
+                        "avancar",
+                        "avançar",
+                    ),
+                    timeout=4.0,
+                    reject_markers=cielo_resend_reject_markers,
+                )
+
+            async def click_cielo_token_confirm(session_id: str) -> bool:
+                reject_markers_json = json.dumps([_normalize_ascii_text(marker) for marker in cielo_resend_reject_markers])
+                try:
+                    focused_token_input = bool(
+                        await eval_js(
+                            session_id,
+                            """
+                            (() => {
+                              const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                              const inputs = [...document.querySelectorAll('input')]
+                                .filter(e => visible(e) && !/hidden|checkbox|radio|submit|button|email/.test((e.type || '').toLowerCase()));
+                              const filled = inputs.filter(e => String(e.value || '').trim());
+                              const target = filled[filled.length - 1] || inputs[inputs.length - 1];
+                              if (!target) return false;
+                              target.scrollIntoView({block: 'center'});
+                              target.focus();
+                              return true;
+                            })()
+                            """,
+                            timeout=10.0,
+                        )
+                    )
+                    if focused_token_input:
+                        await cdp(
+                            "Input.dispatchKeyEvent",
+                            {"type": "rawKeyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+                            session_id=session_id,
+                            timeout=5.0,
+                        )
+                        await cdp(
+                            "Input.dispatchKeyEvent",
+                            {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+                            session_id=session_id,
+                            timeout=5.0,
+                        )
+                        await asyncio.sleep(0.8)
+                except Exception:
+                    pass
+                token_confirm_script = """
+                        (() => {
+                          const rejectMarkers = __REJECT_MARKERS__;
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                          const reject = /e-?mail|email|sms|whatsapp|voltar|cancelar|sair|alterar/;
+                          const rejected = text => reject.test(text) || rejectMarkers.some(marker => marker && text.includes(marker));
+                          const tokenInputs = [...document.querySelectorAll('input')]
+                            .filter(e => visible(e) && !/hidden|checkbox|radio|submit|button|email/.test((e.type || '').toLowerCase()));
+                          const tokenY = tokenInputs.length
+                            ? Math.min(...tokenInputs.map(e => e.getBoundingClientRect().top))
+                            : -Infinity;
+                          const candidates = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                            .filter(visible)
+                            .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || '')])
+                            .filter(([e, text]) => text && /verificar|validar|confirmar|continuar|entrar|acessar|prosseguir|avancar/.test(text) && !rejected(text));
+                          const scoped = candidates.find(([e]) => {
+                            const y = e.getBoundingClientRect().top;
+                            return y >= tokenY - 80 && y <= tokenY + 600;
+                          });
+                          const chosen = scoped || candidates[0] || null;
+                          const target = chosen ? chosen[0] : null;
+                          if (!target) return {clicked: false, method: 'primary', targetText: '', candidatesCount: candidates.length};
+                          target.scrollIntoView({block: 'center'});
+                          target.focus && target.focus();
+                          target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                          target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                          target.click();
+                          return {clicked: true, method: 'primary', targetText: chosen ? chosen[1] : '', candidatesCount: candidates.length};
+                        })()
+                        """.replace("__REJECT_MARKERS__", reject_markers_json)
+                click_result = await eval_js(
+                        session_id,
+                        token_confirm_script,
+                        timeout=10.0,
+                    )
+                click_result = click_result if isinstance(click_result, dict) else {"clicked": bool(click_result), "method": "primary"}
+                cielo_log("auth_token_confirm_primary_result", result=click_result)
+                clicked = bool(click_result.get("clicked"))
+                if clicked:
+                    return True
+                clicked = await click_by_text(
+                    session_id,
+                    (
+                        "verificar",
+                        "verificar codigo",
+                        "verificar código",
+                        "validar",
+                        "validar codigo",
+                        "validar código",
+                        "confirmar",
+                        "continuar",
+                        "entrar",
+                        "acessar",
+                    ),
+                    timeout=4.0,
+                    reject_markers=cielo_resend_reject_markers,
+                )
+                if clicked:
+                    return True
+                if await click_submit(session_id, reject_markers=cielo_resend_reject_markers):
+                    return True
+                try:
+                    await cdp(
+                        "Input.dispatchKeyEvent",
+                        {"type": "rawKeyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+                        session_id=session_id,
+                        timeout=5.0,
+                    )
+                    await cdp(
+                        "Input.dispatchKeyEvent",
+                        {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+                        session_id=session_id,
+                        timeout=5.0,
+                    )
+                    return True
+                except Exception:
+                    return False
+
+            async def wait_for_password(session_id: str, timeout: float = 35.0) -> bool:
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    has_password = await eval_js(
+                        session_id,
+                        "[...document.querySelectorAll('input')].some(e => e.type === 'password' && (e.offsetWidth || e.offsetHeight || e.getClientRects().length))",
+                        timeout=10.0,
+                    )
+                    if has_password:
+                        return True
+                    await asyncio.sleep(1.0)
+                return False
+
+            async def authenticate(session_id: str) -> None:
+                email = str(credenciais.get("email") or "").strip()
+                password = str(credenciais.get("password") or "").strip()
+                _emit_pix_status(on_status, "Autenticando na Cielo...")
+                try:
+                    auth_start_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                except Exception:
+                    auth_start_url = ""
+                cielo_log("auth_start", current_url=auth_start_url, login_email=email, password_length=len(password))
+                await show_cielo_banner(
+                    session_id,
+                    "Cielo aberta pelo app.\nSe aparecer reCAPTCHA / 'não sou um robô', resolva manualmente nesta janela.",
+                    "#1d4ed8",
+                )
+                login_filled = await fill_cielo_login_input(session_id, email)
+                cielo_log("auth_login_fill", filled=login_filled)
+                if not login_filled:
+                    raise RuntimeError("A Cielo não recebeu o login no campo inicial.")
+                login_submit_clicked = await click_submit(session_id)
+                cielo_log("auth_login_submit", clicked=login_submit_clicked)
+                password_visible = await wait_for_password(session_id, timeout=12.0)
+                cielo_log("auth_password_wait_initial", visible=password_visible)
+                if not password_visible:
+                    manual_challenge_visible = await cielo_manual_challenge_present(session_id)
+                    cielo_log("auth_password_wait_blocked", manual_challenge_visible=manual_challenge_visible)
+                    if manual_challenge_visible:
+                        await wait_for_manual_cielo_challenge(session_id, "abrir campo de senha")
+                        login_submit_clicked = await click_submit(session_id)
+                        cielo_log("auth_login_submit_after_manual_challenge", clicked=login_submit_clicked)
+                        password_visible = await wait_for_password(session_id, timeout=35.0)
+                        cielo_log("auth_password_wait_after_manual_challenge", visible=password_visible)
+                        if not password_visible:
+                            raise RuntimeError("A Cielo não exibiu o campo de senha depois do e-mail.")
+                    else:
+                        raise RuntimeError("A Cielo não exibiu o campo de senha depois do e-mail.")
+                login_state = await cielo_login_input_state(session_id, email)
+                cielo_log("auth_login_state_before_password", state=login_state)
+                if login_state.get("present") and not login_state.get("matches"):
+                    login_refilled = await fill_cielo_login_input(session_id, email)
+                    cielo_log("auth_login_refill_before_password", filled=login_refilled)
+                    if not login_refilled:
+                        raise RuntimeError("A Cielo não recebeu o login ao preencher a senha.")
+                    login_state = await cielo_login_input_state(session_id, email)
+                    cielo_log("auth_login_state_after_refill", state=login_state)
+                if login_state.get("present") and not login_state.get("matches"):
+                    raise RuntimeError("O login exibido pela Cielo não corresponde ao login configurado; envio bloqueado.")
+                password_filled = await fill_password_input(session_id, password)
+                cielo_log("auth_password_fill", filled=password_filled, password_length=len(password))
+                if not password_filled:
+                    raise RuntimeError("A Cielo não recebeu a senha no campo de senha.")
+                login_state = await cielo_login_input_state(session_id, email)
+                cielo_log("auth_login_state_before_password_submit", state=login_state)
+                if login_state.get("present") and not login_state.get("matches"):
+                    raise RuntimeError("O login foi alterado antes do envio da senha; envio bloqueado.")
+                if await cielo_manual_challenge_present(session_id) or not await cielo_submit_enabled(session_id):
+                    cielo_log(
+                        "auth_wait_manual_challenge_before_password_submit",
+                        manual_challenge_visible=await cielo_manual_challenge_present(session_id),
+                        submit_enabled=await cielo_submit_enabled(session_id),
+                    )
+                    await wait_for_manual_cielo_challenge(session_id, "apos preencher a senha")
+                    if not await cielo_submit_enabled(session_id):
+                        cielo_log("auth_password_submit_blocked_after_manual_challenge")
+                        raise RuntimeError("A verificacao manual da Cielo foi concluida, mas o botao Entrar continuou bloqueado.")
+                password_submit_clicked = await click_submit(session_id)
+                cielo_log("auth_password_submit", clicked=password_submit_clicked)
+                await hide_cielo_banner(session_id)
+                password_submit_started_at = time.time()
+
+                ignored_tokens: set[str] = set()
+                ignored_token_message_ids: set[str] = set()
+                token_lookup_min_ts = max(0.0, password_submit_started_at - 15.0)
+                deadline = time.time() + 300.0
+                login_error_seen_at: float | None = None
+                email_delivery_requested_at: float | None = None
+                email_delivery_confirm_attempted = False
+                email_delivery_manual_notice_shown = False
+                last_token_poll_started_at = 0.0
+                token_fetch_miss_count = 0
+                token_manual_entry_waiting = False
+                current_cielo_token: str | None = None
+                current_cielo_token_last_submit = 0.0
+                current_cielo_token_submit_attempts = 0
+                token_manual_notice_shown = False
+                last_auth_state_signature = None
+
+                async def submit_cielo_token_from_gmail(fetch_timeout: float, allow_callback: bool = True) -> bool:
+                    nonlocal current_cielo_token, current_cielo_token_last_submit, current_cielo_token_submit_attempts, last_token_poll_started_at, token_manual_notice_shown, token_fetch_miss_count, token_manual_entry_waiting
+                    if current_cielo_token:
+                        token = current_cielo_token
+                        cielo_log(
+                            "auth_token_reuse",
+                            submit_attempts=current_cielo_token_submit_attempts,
+                            seconds_since_last_submit=round(time.time() - current_cielo_token_last_submit, 1)
+                            if current_cielo_token_last_submit
+                            else None,
+                        )
+                    else:
+                        if token_manual_entry_waiting:
+                            seconds_since_last_poll = time.time() - last_token_poll_started_at if last_token_poll_started_at else None
+                            if seconds_since_last_poll is not None and seconds_since_last_poll < 12.0:
+                                cielo_log(
+                                    "auth_token_waiting_manual_entry",
+                                    miss_count=token_fetch_miss_count,
+                                    seconds_until_retry=round(12.0 - seconds_since_last_poll, 1),
+                                )
+                                return False
+                            cielo_log("auth_token_retry_gmail_after_manual_wait", miss_count=token_fetch_miss_count)
+                        if time.time() - last_token_poll_started_at < 3.0:
+                            cielo_log("auth_token_fetch_throttled")
+                            return False
+                        last_token_poll_started_at = time.time()
+                        effective_fetch_timeout = 12.0 if token_fetch_miss_count else min(fetch_timeout, 30.0)
+                        token_debug_info: dict[str, object] = {}
+                        cielo_log(
+                            "auth_token_fetch_start",
+                            timeout=effective_fetch_timeout,
+                            allow_callback=allow_callback,
+                            miss_count=token_fetch_miss_count,
+                            min_ts=token_lookup_min_ts,
+                        )
+                        token = _fetch_cielo_token_from_gmail(
+                            timeout=effective_fetch_timeout,
+                            on_status=on_status,
+                            ignored_tokens=ignored_tokens,
+                            ignored_message_ids=ignored_token_message_ids,
+                            min_internal_ts=token_lookup_min_ts,
+                            debug_info=token_debug_info,
+                        )
+                        token_source = "gmail" if token else None
+                        if not token:
+                            token_fetch_miss_count += 1
+                            last_token_poll_started_at = time.time()
+                        if not token and allow_callback and callable(token_callback):
+                            token = str(token_callback("Informe o código enviado por e-mail pela Cielo") or "").strip()
+                            token_source = "manual_callback" if token else token_source
+                        elif not token and allow_callback and token_fetch_miss_count >= 1:
+                            token_manual_entry_waiting = True
+                            _emit_pix_status(
+                                on_status,
+                                "Codigo da Cielo nao encontrado no Gmail; preencha/valide manualmente na janela se o codigo chegou.",
+                            )
+                            await show_cielo_banner(
+                                session_id,
+                                "Ação manual necessária\nO app não encontrou um novo código da Cielo no Gmail. Se o código chegou, preencha e confirme manualmente nesta janela.",
+                                "#92400e",
+                            )
+                            cielo_log("auth_token_manual_entry_required_after_gmail_miss", miss_count=token_fetch_miss_count)
+                            return False
+                        cielo_log(
+                            "auth_token_fetch_result",
+                            found=bool(token),
+                            source=token_source,
+                            value_length=len(token or ""),
+                            gmail=token_debug_info,
+                        )
+                        if token:
+                            token_fetch_miss_count = 0
+                            token_manual_entry_waiting = False
+                            current_cielo_token = token
+                            current_cielo_token_submit_attempts = 0
+                    if not current_cielo_token:
+                        cielo_log("auth_token_missing")
+                        return False
+                    if current_cielo_token_submit_attempts >= 1:
+                        if not token_manual_notice_shown:
+                            token_manual_notice_shown = True
+                            _emit_pix_status(
+                                on_status,
+                                "Codigo da Cielo preenchido; confirme manualmente na janela para evitar bloqueio por excesso de tentativas.",
+                            )
+                            await show_cielo_banner(
+                                session_id,
+                                "Ação manual necessária\nO código da Cielo foi preenchido. Clique manualmente em Verificar/Confirmar para evitar excesso de tentativas automáticas.",
+                                "#92400e",
+                            )
+                            cielo_log("auth_token_manual_confirmation_required", submit_attempts=current_cielo_token_submit_attempts)
+                        return False
+                    if time.time() - current_cielo_token_last_submit < 12.0:
+                        cielo_log(
+                            "auth_token_submit_waiting_cooldown",
+                            seconds_since_last_submit=round(time.time() - current_cielo_token_last_submit, 1),
+                        )
+                        return False
+                    token = current_cielo_token
+                    _emit_pix_status(on_status, "Preenchendo codigo da Cielo...")
+                    filled_token = await fill_cielo_token(session_id, token)
+                    cielo_log("auth_token_fill_primary", filled=filled_token, value_length=len(token or ""))
+                    if not filled_token:
+                        inputs_count = int(
+                            await eval_js(
+                                session_id,
+                                "[...document.querySelectorAll('input')].filter(e => e.type !== 'hidden' && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length)).length",
+                                timeout=10.0,
+                            )
+                            or 0
+                        )
+                        target_index = max(0, inputs_count - 1)
+                        filled_token = await fill_visible_input(session_id, target_index, token)
+                        cielo_log("auth_token_fill_fallback", filled=filled_token, inputs_count=inputs_count, target_index=target_index)
+                    if not filled_token:
+                        cielo_log("auth_token_fill_failed")
+                        return False
+                    clicked_confirm = await click_cielo_token_confirm(session_id)
+                    cielo_log("auth_token_confirm_click", clicked=clicked_confirm)
+                    current_cielo_token_last_submit = time.time()
+                    current_cielo_token_submit_attempts += 1
+                    await asyncio.sleep(8.0)
+                    return True
+
+                while time.time() < deadline:
+                    _check_cancelled()
+                    await asyncio.sleep(2.0)
+                    if await cielo_manual_challenge_present(session_id) and not await cielo_submit_enabled(session_id):
+                        cielo_log("auth_manual_challenge_during_login")
+                        await wait_for_manual_cielo_challenge(session_id, "validar login")
+                        challenge_submit_clicked = await click_submit(session_id)
+                        cielo_log("auth_manual_challenge_submit", clicked=challenge_submit_clicked)
+                        password_submit_started_at = time.time()
+                        continue
+                    text = await visible_text(session_id)
+                    text_norm = _normalize_ascii_text(text)
+                    current_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                    token_input_visible = await cielo_token_input_present(session_id)
+                    resend_code_visible = any(
+                        marker in text_norm
+                        for marker in (
+                            "reenviar codigo",
+                            "reenviar token",
+                            "reenvie o codigo",
+                            "reenvie o token",
+                            "novo codigo",
+                            "novo token",
+                            "enviar novamente",
+                        )
+                    )
+                    token_challenge_visible = (
+                        token_input_visible
+                        or await cielo_token_challenge_present(session_id, text_norm)
+                        or resend_code_visible
+                    )
+                    email_delivery_visible = any(
+                        marker in text_norm
+                        for marker in (
+                            "e-mail para",
+                            "email para",
+                            "gmail.com",
+                            "receber por e-mail",
+                            "receber por email",
+                            "enviar por e-mail",
+                            "enviar por email",
+                        )
+                    )
+                    login_error_visible = any(
+                        marker in text_norm
+                        for marker in (
+                            "dados de acesso estao incorretos",
+                            "usuario ou senha",
+                            "senha incorreta",
+                            "acesso incorreto",
+                            "credenciais invalidas",
+                        )
+                    )
+                    manual_challenge_visible_now = await cielo_manual_challenge_present(session_id)
+                    submit_enabled_now = await cielo_submit_enabled(session_id)
+                    auth_state_signature = (
+                        current_url,
+                        token_input_visible,
+                        token_challenge_visible,
+                        email_delivery_visible,
+                        resend_code_visible,
+                        login_error_visible,
+                        manual_challenge_visible_now,
+                        submit_enabled_now,
+                    )
+                    if auth_state_signature != last_auth_state_signature:
+                        last_auth_state_signature = auth_state_signature
+                        cielo_log(
+                            "auth_state",
+                            current_url=current_url,
+                            token_input_visible=token_input_visible,
+                            token_challenge_visible=token_challenge_visible,
+                            email_delivery_visible=email_delivery_visible,
+                            resend_code_visible=resend_code_visible,
+                            login_error_visible=login_error_visible,
+                            manual_challenge_visible=manual_challenge_visible_now,
+                            submit_enabled=submit_enabled_now,
+                        )
+                    if email_delivery_visible and not token_challenge_visible:
+                        login_error_seen_at = None
+                        if email_delivery_requested_at is None:
+                            _emit_pix_status(on_status, "Selecionando envio do token da Cielo por e-mail...")
+                            selected_email_delivery = await select_cielo_email_delivery(session_id)
+                            if not selected_email_delivery:
+                                selected_email_delivery = await click_by_text(
+                                    session_id,
+                                    ("e-mail para", "email para", "gmail.com", "receber por e-mail", "receber por email"),
+                                    timeout=8.0,
+                                    reject_markers=cielo_resend_reject_markers,
+                                )
+                            cielo_log("auth_email_delivery_select", selected=selected_email_delivery)
+                            email_delivery_requested_at = time.time()
+                            await asyncio.sleep(1.5)
+                        if not email_delivery_confirm_attempted:
+                            email_delivery_confirm_attempted = True
+                            confirmed_email_delivery = await click_cielo_email_delivery_confirm(session_id)
+                            if not confirmed_email_delivery:
+                                confirmed_email_delivery = await click_submit(session_id, reject_markers=cielo_resend_reject_markers)
+                            cielo_log("auth_email_delivery_confirm", clicked=confirmed_email_delivery)
+                            await asyncio.sleep(4.0)
+                            continue
+                        if not email_delivery_manual_notice_shown:
+                            email_delivery_manual_notice_shown = True
+                            _emit_pix_status(
+                                on_status,
+                                "A Cielo ainda esta na confirmacao do e-mail; confirme manualmente na janela se o botao estiver disponivel.",
+                            )
+                            await show_cielo_banner(
+                                session_id,
+                                "Ação manual necessária\nSe a Cielo pedir confirmação depois de escolher o e-mail, clique no botão confirmar/continuar nesta janela.\nO app aguardará a tela do código.",
+                                "#92400e",
+                            )
+                            cielo_log("auth_email_delivery_manual_notice")
+                        await asyncio.sleep(2.0)
+                        continue
+                    if token_challenge_visible:
+                        login_error_seen_at = None
+                    elif login_error_visible and "acessos/login" in current_url:
+                        if login_error_seen_at is None:
+                            login_error_seen_at = time.time()
+                            cielo_log("auth_login_error_visible", current_url=current_url)
+                            _emit_pix_status(
+                                on_status,
+                                "A Cielo exibiu uma mensagem de credenciais, mas pode avancar apos o reCAPTCHA; aguardando...",
+                            )
+                        elif time.time() - login_error_seen_at > 75.0:
+                            cielo_log("auth_login_error_timeout", current_url=current_url, elapsed=round(time.time() - login_error_seen_at, 1))
+                            raise RuntimeError(
+                                "A Cielo manteve a mensagem de dados de acesso incorretos e nao avancou apos a verificacao manual."
+                            )
+                    elif "acessos/login" not in current_url:
+                        login_error_seen_at = None
+                    token_error_visible = token_challenge_visible and any(
+                        marker in text_norm
+                        for marker in (
+                            "codigo incorreto",
+                            "codigo invalido",
+                            "codigo expirado",
+                            "codigo nao confere",
+                            "token incorreto",
+                            "token invalido",
+                            "token expirado",
+                            "tentativas excedidas",
+                        )
+                    )
+                    if token_error_visible:
+                        if current_cielo_token:
+                            ignored_tokens.add(current_cielo_token)
+                        cielo_log(
+                            "auth_token_rejected_by_cielo",
+                            had_token=bool(current_cielo_token),
+                            submit_attempts=current_cielo_token_submit_attempts,
+                        )
+                        current_cielo_token = None
+                        current_cielo_token_last_submit = 0.0
+                        current_cielo_token_submit_attempts = 0
+                        token_manual_entry_waiting = False
+                        token_fetch_miss_count = 0
+                        last_token_poll_started_at = 0.0
+                        _emit_pix_status(
+                            on_status,
+                            "A Cielo rejeitou o codigo; buscando o e-mail de token mais recente novamente...",
+                        )
+                        await asyncio.sleep(2.0)
+                        continue
+                    if "acessos/login" in current_url and not token_challenge_visible:
+                        password_visible = bool(
+                            await eval_js(
+                                session_id,
+                                "[...document.querySelectorAll('input')].some(e => e.type === 'password' && (e.offsetWidth || e.offsetHeight || e.getClientRects().length))",
+                                timeout=10.0,
+                            )
+                        )
+                        if password_visible and time.time() - password_submit_started_at > 90.0 and not login_error_visible:
+                            cielo_log(
+                                "auth_password_submit_timeout",
+                                current_url=current_url,
+                                elapsed=round(time.time() - password_submit_started_at, 1),
+                            )
+                            raise RuntimeError(
+                                "A Cielo não avançou após a senha. Verifique as credenciais no credenciais.txt."
+                            )
+                    if "acessos/login" not in current_url and not token_challenge_visible:
+                        cielo_log("auth_success", current_url=current_url, elapsed=round(time.time() - password_submit_started_at, 1))
+                        return
+                    if (
+                        not resend_code_visible
+                        and any(marker in text_norm for marker in ("email", "e-mail"))
+                        and any(marker in text_norm for marker in ("codigo", "token", "verificacao", "autenticacao"))
+                    ):
+                        fallback_delivery_clicked = await click_by_text(
+                            session_id,
+                            ("e-mail", "email", "enviar codigo", "receber codigo"),
+                            timeout=4.0,
+                            reject_markers=cielo_resend_reject_markers,
+                        )
+                        fallback_submit_clicked = await click_submit(session_id, reject_markers=cielo_resend_reject_markers)
+                        cielo_log(
+                            "auth_email_delivery_fallback_click",
+                            delivery_clicked=fallback_delivery_clicked,
+                            submit_clicked=fallback_submit_clicked,
+                        )
+                    if token_challenge_visible:
+                        await submit_cielo_token_from_gmail(fetch_timeout=45.0)
+                cielo_log("auth_timeout")
+                raise RuntimeError("A Cielo não confirmou a autenticação dentro do tempo limite.")
+
+            last_cielo_export_state: dict[str, object] = {}
+
+            def _cielo_download_snapshot(started_at: float) -> list[dict[str, object]]:
+                items: list[dict[str, object]] = []
+                try:
+                    for path in sorted(Path(browser_download_dir).glob("*"), key=lambda item: item.stat().st_mtime, reverse=True):
+                        stat = path.stat()
+                        items.append(
+                            {
+                                "name": path.name,
+                                "suffix": path.suffix.lower(),
+                                "effective_suffix": _effective_local_report_suffix(path),
+                                "size": stat.st_size,
+                                "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                                "new": stat.st_mtime >= started_at - 1,
+                            }
+                        )
+                except Exception as exc:
+                    items.append({"error": str(exc), "error_type": type(exc).__name__})
+                return items[:20]
+
+            def _cielo_export_state_is_terminal_no_result() -> bool:
+                date_selection_trusted = bool(last_cielo_export_state.get("dateSelectionTrusted"))
+                return bool(
+                    date_selection_trusted
+                    and last_cielo_export_state.get("noResultsVisible")
+                    and _normalize_ascii_text(str(last_cielo_export_state.get("targetText") or "")) == "exportar"
+                )
+
+            async def select_cielo_historical_sale_date(session_id: str) -> dict:
+                script = r"""
+                (async (dataBr, dataIso) => {
+                  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+                  const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                  const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                  const [dayText, monthText, yearText] = dataBr.split('/');
+                  const day = String(Number(dayText || '0'));
+                  const monthIndex = Math.max(0, Number(monthText || '1') - 1);
+                  const monthPt = ['janeiro','fevereiro','marco','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'][monthIndex];
+                  const monthPtAccent = ['janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'][monthIndex];
+                  const monthEn = ['january','february','march','april','may','june','july','august','september','october','november','december'][monthIndex];
+                  const result = {
+                    selected: false,
+                    trusted: false,
+                    method: null,
+                    monthNavClicks: 0,
+                    dateBr: dataBr,
+                    dateIso: dataIso,
+                    inputValuesBefore: [],
+                    inputValuesAfter: [],
+                    exportStateAfter: null,
+                    visibleButtonsAfterCalendar: [],
+                    visibleCalendarLikeNodes: [],
+                    exactRangeForced: false,
+                    exactRangeValue: null,
+                  };
+                  const exactRangeValue = `${dataBr} At\u00e9 ${dataBr}`;
+                  const exactRangeNorm = norm(exactRangeValue);
+
+                  const inputSnapshot = () => [...document.querySelectorAll('input')]
+                    .filter(visible)
+                    .map(e => ({
+                      type: e.type || '',
+                      name: e.name || e.id || e.placeholder || e.getAttribute('aria-label') || '',
+                      value: e.value || '',
+                      text: (e.closest('label,div,section,form')?.innerText || '').slice(0, 120),
+                    }))
+                    .slice(0, 20);
+
+                  const exportState = () => {
+                    const all = [...document.querySelectorAll('body *')].filter(e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length)));
+                    const titlePattern = /consolidado de vendas|detalhado de vendas|detalhamento de vendas|vendas detalhadas|historico de vendas|histórico de vendas|detalhes da venda|detalhe da venda|consolidado/;
+                    const title = all.find(e => {
+                      const text = norm(e.innerText || e.textContent || '');
+                      return text.length <= 180 && titlePattern.test(text);
+                    });
+                    const titleY = title ? title.getBoundingClientRect().top : -Infinity;
+                    const candidates = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                      .filter(e => visible(e) || !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length)))
+                      .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || '')])
+                      .filter(([e, text]) => /exportar|baixar|download|excel|xlsx|csv/.test(text));
+                    const target = candidates.find(([e]) => {
+                      const y = e.getBoundingClientRect().top;
+                      return title && y >= titleY - 40 && y <= titleY + 700;
+                    }) || candidates[0];
+                    return {
+                      available: !!(target && !target[0].disabled && target[0].getAttribute('aria-disabled') !== 'true'),
+                      targetText: target ? target[1] : '',
+                      targetDisabled: target ? !!target[0].disabled : null,
+                    };
+                  };
+
+                  const dispatchClick = el => {
+                    if (!el || !visible(el)) return false;
+                    el.scrollIntoView({block: 'center', inline: 'center'});
+                    el.focus && el.focus();
+                    el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                    el.click();
+                    return true;
+                  };
+
+                  const setInputValue = (input, value) => {
+                    input.scrollIntoView({block: 'center', inline: 'center'});
+                    input.focus();
+                    if (setter) setter.call(input, '');
+                    else input.value = '';
+                    input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                    if (setter) setter.call(input, value);
+                    else input.value = value;
+                    input.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: value}));
+                    input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                    input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+                  };
+
+                  const plausibleDateInputs = () => [...document.querySelectorAll('input')]
+                    .filter(e => visible(e) && !/hidden|checkbox|radio|submit|button/.test((e.type || '').toLowerCase()))
+                    .filter(e => {
+                      const hint = norm([
+                        e.type,
+                        e.name,
+                        e.id,
+                        e.placeholder,
+                        e.getAttribute('aria-label'),
+                        e.value,
+                        e.closest('label,div,section,form')?.innerText || '',
+                      ].join(' '));
+                      return /data|periodo|historico|histórico|venda|calendar|date/.test(hint) || /\d{2}\/\d{2}\/\d{4}/.test(e.value || '');
+                    });
+
+                  const tryFlatpickr = () => {
+                    for (const input of [...document.querySelectorAll('input')].filter(visible)) {
+                      const fp = input._flatpickr || input.__flatpickr;
+                      if (!fp || typeof fp.setDate !== 'function') continue;
+                      const mode = fp.config && fp.config.mode || '';
+                      fp.setDate(mode === 'range' ? [dataIso, dataIso] : dataIso, true, 'Y-m-d');
+                      if (typeof fp.close === 'function') fp.close();
+                      result.selected = true;
+                      result.trusted = true;
+                      result.method = 'flatpickr';
+                      result.flatpickrMode = mode;
+                      return true;
+                    }
+                    return false;
+                  };
+
+                  const dateMatches = text => {
+                    const t = norm(text);
+                    return t.includes(dataBr)
+                      || t.includes(dataIso)
+                      || (t.includes(day) && t.includes(yearText) && (t.includes(monthPt) || t.includes(monthEn)))
+                      || t.includes(`${day} de ${monthPt} de ${yearText}`)
+                      || t.includes(`${day} de ${monthPtAccent} de ${yearText}`);
+                  };
+
+                  const likelyCalendarNode = el => {
+                    const host = el.closest('[role=dialog], [class*="calendar"], [class*="Calendar"], [class*="datepicker"], [class*="DatePicker"], [class*="picker"], [class*="Picker"], [class*="popover"], [class*="Popover"], [class*="modal"], [class*="Modal"]');
+                    return !!host || /calendar|datepicker|picker|calendario|calendário/.test(norm(el.outerHTML || ''));
+                  };
+
+                  const findCalendarDateNode = () => {
+                    const nodes = [...document.querySelectorAll('button,a,[role=button],[role=gridcell],td,div,span')]
+                      .filter(e => visible(e) && e.getAttribute('aria-disabled') !== 'true' && !e.disabled);
+                    let target = nodes.find(e => dateMatches([
+                      e.getAttribute('aria-label'),
+                      e.getAttribute('title'),
+                      e.getAttribute('data-date'),
+                      e.getAttribute('data-day'),
+                      e.getAttribute('data-value'),
+                      e.textContent,
+                    ].join(' ')));
+                    if (target) return target.closest('button,a,[role=button],[role=gridcell],td') || target;
+                    const dayNodes = nodes.filter(e => norm(e.innerText || e.textContent || '') === day && likelyCalendarNode(e));
+                    return dayNodes.find(e => !/fora|disabled|inativo|indisponivel|indisponível/.test(norm(e.className || e.getAttribute('aria-label') || ''))) || null;
+                  };
+
+                  const visibleButtonSnapshot = () => [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit],label,span,div')]
+                    .filter(visible)
+                    .map(e => {
+                      const rect = e.getBoundingClientRect();
+                      return {
+                        tag: e.tagName,
+                        role: e.getAttribute('role') || '',
+                        type: e.getAttribute('type') || '',
+                        cls: String(e.className || '').slice(0, 160),
+                        text: norm(e.innerText || e.textContent || e.value || e.getAttribute('aria-label') || e.getAttribute('title') || '').slice(0, 160),
+                        aria: norm(e.getAttribute('aria-label') || '').slice(0, 160),
+                        title: norm(e.getAttribute('title') || '').slice(0, 160),
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .filter(item => item.text || item.aria || item.title || /calendar|date|picker|calend|day|month|year|mes|ano|dia/.test(norm(item.cls)))
+                    .slice(0, 120);
+
+                  const calendarLikeSnapshot = () => [...document.querySelectorAll('[role=dialog], [role=grid], [role=gridcell], [class*="calendar"], [class*="Calendar"], [class*="datepicker"], [class*="DatePicker"], [class*="picker"], [class*="Picker"], [class*="day"], [class*="Day"], [class*="month"], [class*="Month"]')]
+                    .filter(e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length)))
+                    .map(e => {
+                      const rect = e.getBoundingClientRect();
+                      return {
+                        tag: e.tagName,
+                        role: e.getAttribute('role') || '',
+                        cls: String(e.className || '').slice(0, 220),
+                        text: norm(e.innerText || e.textContent || e.getAttribute('aria-label') || '').slice(0, 300),
+                        aria: norm(e.getAttribute('aria-label') || '').slice(0, 180),
+                        title: norm(e.getAttribute('title') || '').slice(0, 180),
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                      };
+                    })
+                    .slice(0, 120);
+
+                  const findPreviousMonthButton = () => {
+                    const nodes = [...document.querySelectorAll('button,a,[role=button],span,div')]
+                      .filter(e => visible(e) && e.getAttribute('aria-disabled') !== 'true' && !e.disabled);
+                    return nodes.find(e => {
+                      const text = norm([
+                        e.innerText,
+                        e.textContent,
+                        e.getAttribute('aria-label'),
+                        e.getAttribute('title'),
+                        e.className,
+                      ].join(' '));
+                      return /mes anterior|anterior|previous|prev|chevron_left|arrow_left|voltar/.test(text)
+                        && !/proximo|próximo|next|right/.test(text);
+                    }) || null;
+                  };
+
+                  const tryCalendarClick = async () => {
+                    for (const input of plausibleDateInputs()) {
+                      dispatchClick(input);
+                      await delay(250);
+                      const directAfterInput = findCalendarDateNode();
+                      if (directAfterInput) break;
+                    }
+                    for (let attempt = 0; attempt < 14; attempt++) {
+                      const target = findCalendarDateNode();
+                      if (target) {
+                        dispatchClick(target);
+                        await delay(350);
+                        const secondTarget = findCalendarDateNode();
+                        if (secondTarget) {
+                          dispatchClick(secondTarget);
+                          await delay(250);
+                        }
+                        const apply = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                          .filter(visible)
+                          .find(e => /^(aplicar|ok|confirmar|selecionar|concluir)$/.test(norm(e.innerText || e.value || e.getAttribute('aria-label') || '')));
+                        if (apply) {
+                          dispatchClick(apply);
+                          await delay(250);
+                        }
+                        result.selected = true;
+                        result.trusted = true;
+                        result.method = 'calendar_click';
+                        return true;
+                      }
+                      const prev = findPreviousMonthButton();
+                      if (!prev) break;
+                      dispatchClick(prev);
+                      result.monthNavClicks += 1;
+                      await delay(300);
+                    }
+                    return false;
+                  };
+
+                  const tryInputFallback = () => {
+                    const inputs = plausibleDateInputs();
+                    const values = [exactRangeValue, dataBr];
+                    for (const input of inputs) {
+                      const value = (input.type || '').toLowerCase() === 'date' ? dataIso : values.find(v => !input.maxLength || v.length <= input.maxLength) || dataBr;
+                      setInputValue(input, value);
+                      input.blur();
+                      result.selected = true;
+                      result.trusted = false;
+                      result.method = 'input_fallback';
+                      return true;
+                    }
+                    return false;
+                  };
+
+                  const forceExactRangeIfNeeded = () => {
+                    const dataNorm = norm(dataBr);
+                    for (const input of plausibleDateInputs()) {
+                      const valueNorm = norm(input.value || '');
+                      if (!valueNorm.includes(dataNorm)) continue;
+                      if (valueNorm.includes(exactRangeNorm)) return false;
+                      setInputValue(input, exactRangeValue);
+                      input.dispatchEvent(new KeyboardEvent('keydown', {bubbles: true, cancelable: true, key: 'Enter', code: 'Enter'}));
+                      input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, cancelable: true, key: 'Enter', code: 'Enter'}));
+                      input.blur();
+                      result.selected = true;
+                      result.exactRangeForced = true;
+                      result.exactRangeValue = exactRangeValue;
+                      result.method = result.method ? `${result.method}_exact_range` : 'input_exact_range';
+                      return true;
+                    }
+                    return false;
+                  };
+
+                  result.inputValuesBefore = inputSnapshot();
+                  if (!tryFlatpickr()) {
+                    if (!await tryCalendarClick()) {
+                      tryInputFallback();
+                    }
+                  }
+                  await delay(250);
+                  forceExactRangeIfNeeded();
+                  await delay(350);
+                  result.inputValuesAfter = inputSnapshot();
+                  result.exportStateAfter = exportState();
+                  result.visibleButtonsAfterCalendar = visibleButtonSnapshot();
+                  result.visibleCalendarLikeNodes = calendarLikeSnapshot();
+                  return result;
+                })(__DATA_BR__, __DATA_ISO__)
+                """.replace("__DATA_BR__", json.dumps(data_br)).replace("__DATA_ISO__", json.dumps(data_iso))
+                result = await eval_js(session_id, script, timeout=20.0)
+                return result if isinstance(result, dict) else {"selected": bool(result), "trusted": False, "method": "unknown"}
+
+            async def try_export_current_area(session_id: str) -> str | None:
+                nonlocal last_cielo_export_state
+                same_day = data_br == datetime.now().strftime("%d/%m/%Y")
+                try:
+                    export_start_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                except Exception:
+                    export_start_url = ""
+                last_cielo_export_state = {"current_url": export_start_url, "same_day": same_day}
+                cielo_log("export_area_start", current_url=export_start_url, same_day=same_day, data_br=data_br)
+                date_set_result = (
+                    {"selected": True, "trusted": True, "method": "same_day_detail_tab"}
+                    if same_day
+                    else {"selected": False, "trusted": False, "method": "detail_tab_before_historical_filter"}
+                )
+                cielo_log("export_date_filter_select", result=date_set_result)
+                if same_day:
+                    cielo_log("export_same_day_filter_skipped", action="click_detail_tab_then_export")
+                else:
+                    cielo_log("export_historical_filter_deferred", action="click_detail_tab_before_filter")
+                await asyncio.sleep(1.0)
+                try:
+                    after_filter_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                except Exception:
+                    after_filter_url = ""
+                cielo_log("export_before_detail_tab", current_url=after_filter_url)
+                detail_result = await click_cielo_sales_detail_tab(session_id)
+                cielo_log("export_detail_tab_click", result=detail_result)
+                detail_clicked = bool(detail_result.get("clicked")) if isinstance(detail_result, dict) else bool(detail_result)
+                detail_target_text = detail_result.get("targetText") if isinstance(detail_result, dict) else None
+                detail_direct_navigation = False
+                last_cielo_export_state["detailClicked"] = detail_clicked
+                if isinstance(detail_result, dict):
+                    last_cielo_export_state["detailTargetText"] = detail_target_text
+                if detail_clicked:
+                    await asyncio.sleep(4.0)
+                    try:
+                        after_detail_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                    except Exception:
+                        after_detail_url = ""
+                    cielo_log("export_detail_tab_after_wait", current_url=after_detail_url)
+                    if after_detail_url:
+                        after_filter_url = after_detail_url
+                if not detail_clicked:
+                    detail_url = (
+                        "https://minhaconta2.cielo.com.br/site/vendas/detalhado/cielo"
+                        if same_day
+                        else "https://minhaconta2.cielo.com.br/site/vendas/detalhado/cielo#historic"
+                    )
+                    cielo_log("export_detail_tab_not_clicked", action="navigate_direct_detail", current_url=after_filter_url, detail_url=detail_url)
+                    try:
+                        await cdp("Page.navigate", {"url": detail_url}, session_id=session_id, timeout=15.0)
+                        await asyncio.sleep(6.0)
+                        after_direct_detail_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                    except Exception as exc:
+                        after_direct_detail_url = ""
+                        cielo_log("export_detail_direct_navigation_error", error=str(exc)[:300], error_type=type(exc).__name__)
+                    cielo_log("export_detail_direct_navigation_after_wait", current_url=after_direct_detail_url)
+                    if after_direct_detail_url:
+                        detail_direct_navigation = True
+                        after_filter_url = after_direct_detail_url
+                if not same_day and "/vendas/detalhado" not in str(after_filter_url or ""):
+                    detail_url = "https://minhaconta2.cielo.com.br/site/vendas/detalhado/cielo#historic"
+                    cielo_log("export_detail_not_reached", current_url=after_filter_url, action="navigate_direct", detail_clicked=detail_clicked)
+                    try:
+                        await cdp("Page.navigate", {"url": detail_url}, session_id=session_id, timeout=15.0)
+                        await asyncio.sleep(8.0)
+                        after_direct_detail_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                    except Exception as exc:
+                        after_direct_detail_url = ""
+                        cielo_log("export_detail_direct_navigation_error", error=str(exc)[:300], error_type=type(exc).__name__)
+                    cielo_log("export_detail_direct_navigation_after_wait", current_url=after_direct_detail_url)
+                    if "/vendas/detalhado" in after_direct_detail_url:
+                        detail_direct_navigation = True
+                        after_filter_url = after_direct_detail_url
+                    else:
+                        last_cielo_export_state = {
+                            "current_url": after_direct_detail_url or after_filter_url,
+                            "same_day": same_day,
+                            "detailClicked": detail_clicked,
+                            "detailTargetText": detail_target_text,
+                            "detailRequiredFailed": True,
+                            "dateSelectionMethod": date_set_result.get("method") if isinstance(date_set_result, dict) else None,
+                            "dateSelectionTrusted": bool(
+                                same_day
+                                or (
+                                    isinstance(date_set_result, dict)
+                                    and date_set_result.get("trusted")
+                                    and date_set_result.get("selected")
+                                )
+                            ),
+                        }
+                        cielo_log("export_detail_required_failed", state=last_cielo_export_state)
+                        return None
+                if not same_day:
+                    try:
+                        more_filters_detail = await click_by_text(session_id, ("filtrar mais", "mais filtros"), timeout=5.0)
+                        cielo_log("export_detail_filter_more_clicked", clicked=more_filters_detail)
+                        await asyncio.sleep(0.8)
+                        sale_date_detail = await click_by_text(session_id, ("data da venda", "data de venda"), timeout=5.0)
+                        cielo_log("export_detail_filter_sale_date_clicked", clicked=sale_date_detail)
+                        await asyncio.sleep(0.8)
+                        historic_detail = await click_by_text(session_id, ("historico",), timeout=5.0)
+                        cielo_log("export_detail_filter_historic_clicked", clicked=historic_detail)
+                        await asyncio.sleep(0.8)
+                        date_set_result = await select_cielo_historical_sale_date(session_id)
+                        cielo_log("export_detail_date_filter_select", result=date_set_result)
+                        detail_filter_apply = await click_cielo_filter_apply(session_id)
+                        cielo_log("export_detail_filter_apply_clicked", result=detail_filter_apply)
+                        await asyncio.sleep(5.0)
+                        after_filter_url = str(await eval_js(session_id, "location.href", timeout=10.0) or after_filter_url)
+                        cielo_log("export_detail_filter_after_wait", current_url=after_filter_url)
+                    except Exception as exc:
+                        cielo_log("export_detail_filter_error", error=str(exc)[:300], error_type=type(exc).__name__)
+                started_at = time.time() - 1.0
+                export_state = await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                          const visibleAny = e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase();
+                          const bodyText = norm(document.body && document.body.innerText || '');
+                          const all = [...document.querySelectorAll('body *')].filter(visibleAny);
+                          const titlePattern = /consolidado de vendas|detalhado de vendas|detalhamento de vendas|vendas detalhadas|historico de vendas|histórico de vendas|detalhes da venda|detalhe da venda|consolidado/;
+                          const title = all.find(e => {
+                            const text = norm(e.innerText || e.textContent || '');
+                            return text.length <= 180 && titlePattern.test(text);
+                          });
+                          const titleY = title ? title.getBoundingClientRect().top : -Infinity;
+                          const exportCandidates = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                            .filter(visibleAny)
+                            .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || '')])
+                            .filter(([e, text]) => /exportar|baixar|download|excel|xlsx|csv/.test(text));
+                          const target = exportCandidates.find(([e]) => {
+                            const y = e.getBoundingClientRect().top;
+                            return title && y >= titleY - 40 && y <= titleY + 700;
+                          }) || exportCandidates[0];
+                          return {
+                            available: !!(target && !target[0].disabled && target[0].getAttribute('aria-disabled') !== 'true'),
+                            candidatesCount: exportCandidates.length,
+                            hasConsolidadoTitle: !!title,
+                            titleText: title ? norm(title.innerText || title.textContent || '').slice(0, 180) : '',
+                            targetText: target ? target[1] : '',
+                            targetDisabled: target ? !!target[0].disabled : null,
+                            targetAriaDisabled: target ? target[0].getAttribute('aria-disabled') : null,
+                            noResultsVisible: /nenhum resultado|sem resultado|nao encontramos|não encontramos|nenhuma venda/.test(bodyText)
+                          };
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                export_state = export_state if isinstance(export_state, dict) else {}
+                last_cielo_export_state = dict(export_state)
+                last_cielo_export_state["current_url"] = after_filter_url
+                last_cielo_export_state["same_day"] = same_day
+                last_cielo_export_state["detailClicked"] = detail_clicked
+                last_cielo_export_state["detailTargetText"] = detail_target_text
+                last_cielo_export_state["detailDirectNavigation"] = detail_direct_navigation
+                last_cielo_export_state["detailRequiredFailed"] = (
+                    not same_day and "/vendas/detalhado" not in str(after_filter_url or "")
+                )
+                last_cielo_export_state["dateSelectionMethod"] = date_set_result.get("method") if isinstance(date_set_result, dict) else None
+                last_cielo_export_state["dateSelectionTrusted"] = bool(
+                    same_day
+                    or (
+                        isinstance(date_set_result, dict)
+                        and date_set_result.get("trusted")
+                        and date_set_result.get("selected")
+                    )
+                )
+                export_available = bool(export_state.get("available"))
+                cielo_log("export_button_state", state=export_state)
+                if not export_available:
+                    cielo_log(
+                        "export_unavailable_after_filter",
+                        reason="export_button_disabled_or_missing",
+                        terminal_no_result=_cielo_export_state_is_terminal_no_result(),
+                    )
+                    return None
+                clicked = bool(
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                          const visible = e => !!(e && !e.disabled && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+                          const norm = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                          const all = [...document.querySelectorAll('body *')].filter(visible);
+                          const titlePattern = /consolidado de vendas|detalhado de vendas|detalhamento de vendas|vendas detalhadas|historico de vendas|histórico de vendas|detalhes da venda|detalhe da venda|consolidado/;
+                          const title = all.find(e => {
+                            const text = norm(e.innerText || e.textContent || '');
+                            return text.length <= 180 && titlePattern.test(text);
+                          });
+                          const titleY = title ? title.getBoundingClientRect().top : -Infinity;
+                          const exportCandidates = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+                            .filter(visible)
+                            .map(e => [e, norm(e.innerText || e.value || e.getAttribute('aria-label') || '')])
+                            .filter(([e, text]) => /exportar|baixar|download|excel|xlsx|csv/.test(text));
+                          const scoped = exportCandidates.find(([e]) => {
+                            const y = e.getBoundingClientRect().top;
+                            return title && y >= titleY - 40 && y <= titleY + 700;
+                          });
+                          const target = scoped || exportCandidates[0];
+                          if (!target) return false;
+                          target[0].scrollIntoView({block: 'center'});
+                          target[0].click();
+                          return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                )
+                cielo_log("export_button_click_primary", clicked=clicked)
+                if not clicked:
+                    clicked = await click_by_text(session_id, ("exportar", "baixar", "download", "excel", "xlsx", "csv"), timeout=10.0)
+                    cielo_log("export_button_click_text_fallback", clicked=clicked)
+                if not clicked:
+                    clicked = await click_submit(session_id)
+                    cielo_log("export_button_click_submit_fallback", clicked=clicked)
+                last_cielo_export_state["exportClicked"] = bool(clicked)
+                await asyncio.sleep(1.5)
+                format_result = await click_cielo_export_format(session_id)
+                cielo_log("export_format_click", result=format_result)
+                last_cielo_export_state["formatClicked"] = bool(format_result.get("clicked")) if isinstance(format_result, dict) else bool(format_result)
+                await asyncio.sleep(1.0)
+                confirm_result = await click_cielo_export_confirm(session_id, require_overlay=True)
+                cielo_log("export_confirm_click_after_format", result=confirm_result)
+                last_cielo_export_state["confirmClicked"] = bool(confirm_result.get("clicked")) if isinstance(confirm_result, dict) else bool(confirm_result)
+                await asyncio.sleep(1.5)
+                for confirm_attempt in range(1, 4):
+                    followup_result = await click_cielo_export_confirm(session_id, require_overlay=True)
+                    cielo_log("export_confirm_click_followup", attempt=confirm_attempt, result=followup_result)
+                    if not bool(followup_result.get("clicked")):
+                        break
+                    last_cielo_export_state["confirmClicked"] = True
+                    last_cielo_export_state["confirmFollowupClicks"] = confirm_attempt
+                    await asyncio.sleep(1.5)
+                downloaded = await asyncio.to_thread(_wait_for_cielo_downloaded_report, browser_download_dir, data_br, started_at, 5.0, True)
+                cielo_log("export_download_wait_direct_result", downloaded=downloaded, files=_cielo_download_snapshot(started_at))
+                if not downloaded:
+                    downloaded = await download_cielo_generated_report_from_reports_area(session_id, started_at)
+                cielo_log("export_download_wait_result", downloaded=downloaded, files=_cielo_download_snapshot(started_at))
+                if not downloaded:
+                    last_cielo_export_state["downloadTimedOut"] = True
+                return downloaded
+
+            try:
+                targets = (await cdp("Target.getTargets")).get("targetInfos") or []
+                target = next((t for t in targets if t.get("type") == "page"), targets[0] if targets else None)
+                if not target:
+                    raise RuntimeError("Não foi possível abrir uma aba da Cielo.")
+                cielo_log("target_selected", target_id=target.get("targetId"), target_url=target.get("url"), target_title=target.get("title"))
+                session_id = (await cdp("Target.attachToTarget", {"targetId": target["targetId"], "flatten": True})).get("sessionId")
+                if not session_id:
+                    raise RuntimeError("Não foi possível anexar a aba da Cielo.")
+                cielo_log("target_attached", session_id_present=bool(session_id))
+                await cdp("Page.enable", session_id=session_id)
+                await cdp("Runtime.enable", session_id=session_id)
+                try:
+                    await cdp("Page.bringToFront", session_id=session_id, timeout=5.0)
+                except Exception:
+                    pass
+                try:
+                    await cdp("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": browser_download_dir, "eventsEnabled": True})
+                    await cdp("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": browser_download_dir}, session_id=session_id)
+                except Exception:
+                    pass
+
+                await asyncio.sleep(4.0)
+                await authenticate(session_id)
+                _emit_pix_status(on_status, "Abrindo Minhas Vendas na Cielo...")
+                cielo_sales_summary_url = "https://minhaconta2.cielo.com.br/site/vendas/resumo/cielo"
+                cielo_log("navigate_sales_summary", url=cielo_sales_summary_url)
+                await cdp("Page.navigate", {"url": cielo_sales_summary_url}, session_id=session_id, timeout=10.0)
+                await asyncio.sleep(8.0)
+                current_url_after_sales = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                cielo_log("sales_summary_after_navigate", current_url=current_url_after_sales)
+                if "acessos/login" in current_url_after_sales:
+                    cielo_log("sales_summary_redirected_to_login", current_url=current_url_after_sales, action="reauthenticate")
+                    await authenticate(session_id)
+                    cielo_log("navigate_sales_summary_after_reauth", url=cielo_sales_summary_url)
+                    await cdp("Page.navigate", {"url": cielo_sales_summary_url}, session_id=session_id, timeout=10.0)
+                    await asyncio.sleep(8.0)
+                _emit_pix_status(on_status, "Exportando Detalhado de Vendas da Cielo...")
+
+                found = await try_export_current_area(session_id)
+                if found:
+                    persisted = _persist_cielo_auto_report(found, data_br)
+                    cielo_log("export_found_initial_area", downloaded=found, persisted=persisted)
+                    return {"cartoes": persisted, "avisos": [], "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None}
+                if not bool(last_cielo_export_state.get("dateSelectionTrusted")):
+                    cielo_log("export_stop_after_untrusted_date_selection", state=last_cielo_export_state)
+                    return {
+                        "cartoes": None,
+                        "avisos": [
+                            "A Cielo foi acessada, mas o app não conseguiu confirmar a seleção da data no calendário histórico."
+                        ],
+                        "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                    }
+                if bool(last_cielo_export_state.get("detailRequiredFailed")):
+                    cielo_log("export_stop_after_detail_required_failed", state=last_cielo_export_state)
+                    return {
+                        "cartoes": None,
+                        "avisos": [
+                                "A Cielo foi acessada, mas o app não conseguiu abrir a tela detalhada do dia antes de exportar. O resumo consolidado foi ignorado."
+                        ],
+                        "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                    }
+                if _cielo_export_state_is_terminal_no_result():
+                    cielo_log("export_stop_after_no_results_initial_area", state=last_cielo_export_state)
+                    return {
+                        "cartoes": None,
+                        "avisos": [
+                            "A Cielo foi acessada e o Consolidado de Vendas não retornou vendas exportáveis para a data filtrada."
+                        ],
+                        "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                    }
+                if bool(last_cielo_export_state.get("downloadTimedOut")):
+                    cielo_log("export_stop_after_download_timeout_initial_area", state=last_cielo_export_state)
+                    return {
+                        "cartoes": None,
+                        "avisos": [
+                            "A Cielo habilitou o Exportar e o app clicou no fluxo de exportacao, mas nenhum arquivo de relatorio apareceu nos downloads."
+                        ],
+                        "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                    }
+                if bool(last_cielo_export_state.get("hasConsolidadoTitle")):
+                    cielo_log("export_stop_after_initial_consolidado_unavailable", state=last_cielo_export_state)
+                    return {
+                        "cartoes": None,
+                        "avisos": [
+                            "A Cielo foi acessada, mas o botao Exportar do Consolidado de Vendas continuou bloqueado apos o filtro da data."
+                        ],
+                        "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                    }
+
+                cielo_log("export_not_found_after_primary_flow", state=last_cielo_export_state)
+                return {
+                    "cartoes": None,
+                    "avisos": ["A Cielo foi acessada, mas o app não conseguiu exportar automaticamente o relatório detalhado de cartões."],
+                    "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                }
+
+                candidate_urls = [
+                    "https://minhaconta2.cielo.com.br/site/vendas/resumo/cielo",
+                    "https://minhaconta2.cielo.com.br/site/vendas",
+                    "https://minhaconta2.cielo.com.br/site/extrato",
+                    "https://minhaconta2.cielo.com.br/site/relatorios",
+                    "https://minhaconta2.cielo.com.br/site/relatorios/vendas",
+                ]
+                for url in candidate_urls:
+                    _check_cancelled()
+                    try:
+                        cielo_log("candidate_navigate_start", url=url)
+                        await cdp("Page.navigate", {"url": url}, session_id=session_id, timeout=10.0)
+                        await asyncio.sleep(6.0)
+                        text_norm = _normalize_ascii_text(await visible_text(session_id))
+                        candidate_current_url = str(await eval_js(session_id, "location.href", timeout=10.0) or "")
+                        cielo_log(
+                            "candidate_navigate_result",
+                            requested_url=url,
+                            current_url=candidate_current_url,
+                            has_sales_terms=any(marker in text_norm for marker in ("venda", "relatorio", "extrato", "transacao")),
+                        )
+                        if "acessos/login" in candidate_current_url:
+                            cielo_log("candidate_redirected_to_login", requested_url=url, current_url=candidate_current_url, action="reauthenticate")
+                            await authenticate(session_id)
+                        if not any(marker in text_norm for marker in ("venda", "relatorio", "extrato", "transacao")):
+                            continue
+                        found = await try_export_current_area(session_id)
+                        if found:
+                            persisted = _persist_cielo_auto_report(found, data_br)
+                            cielo_log("export_found_candidate_area", requested_url=url, downloaded=found, persisted=persisted)
+                            return {"cartoes": persisted, "avisos": [], "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None}
+                        if _cielo_export_state_is_terminal_no_result():
+                            cielo_log("export_stop_after_no_results_candidate_area", requested_url=url, state=last_cielo_export_state)
+                            return {
+                                "cartoes": None,
+                                "avisos": [
+                                    "A Cielo foi acessada e o Consolidado de Vendas não retornou vendas exportáveis para a data filtrada."
+                                ],
+                                "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                            }
+                    except Exception as exc:
+                        cielo_log("candidate_navigate_error", requested_url=url, error=str(exc), error_type=type(exc).__name__)
+                        continue
+
+                cielo_log("fallback_click_menu_start")
+                await click_by_text(session_id, ("vendas", "relatorios", "relatórios", "extrato", "transacoes", "transações"), timeout=8.0)
+                await asyncio.sleep(5.0)
+                found = await try_export_current_area(session_id)
+                if found:
+                    persisted = _persist_cielo_auto_report(found, data_br)
+                    cielo_log("export_found_fallback_menu", downloaded=found, persisted=persisted)
+                    return {"cartoes": persisted, "avisos": [], "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None}
+                cielo_log("export_not_found")
+                return {
+                    "cartoes": None,
+                    "avisos": ["A Cielo foi acessada, mas o app não conseguiu localizar/exportar automaticamente o relatório de cartões."],
+                    "debug_log": str(cielo_debug_log_path) if cielo_debug_log_path else None,
+                }
+            finally:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except BaseException:
+                    pass
+
+    _emit_pix_status(on_status, "Abrindo portal da Cielo...")
+    cielo_log("browser_launch", command=os.path.basename(str(navegador)), port=port)
+    proc = _launch_browser_process(chrome_args)
+    try:
+        result = asyncio.run(asyncio.wait_for(_run(), timeout=900.0))
+        if isinstance(result, dict) and cielo_debug_log_path:
+            result.setdefault("debug_log", str(cielo_debug_log_path))
+        cielo_log("run_success", result={k: v for k, v in (result or {}).items() if k != "cartoes"})
+        return result
+    except Exception as exc:
+        cielo_log("run_error", error=str(exc), error_type=type(exc).__name__)
+        if str(exc).strip() == "__cancelled__":
+            raise
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        cielo_log("browser_cleanup_start")
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        shutil.rmtree(browser_download_dir, ignore_errors=True)
+        cielo_log("browser_cleanup_done")
 
 
 def _build_pix_report_from_caixa_pdf(caminho_pdf: str, data_br: str) -> dict:
@@ -7237,6 +10771,753 @@ def _build_card_reports_from_caixa(caminho: str, data_br: str) -> dict[str, dict
     return _build_card_reports_from_caixa_pdf(caminho, data_br)
 
 
+_CIELO_DATE_FIELDS = (
+    "data da venda",
+    "data venda",
+    "data da transacao",
+    "data transacao",
+    "data autorizacao",
+    "data",
+)
+_CIELO_TIME_FIELDS = (
+    "hora da venda",
+    "hora venda",
+    "hora da transacao",
+    "hora transacao",
+    "hora",
+)
+_CIELO_VALUE_FIELDS = (
+    "valor bruto",
+    "valor da venda",
+    "valor venda",
+    "valor transacao",
+    "valor da transacao",
+    "valor autorizado",
+    "valor",
+)
+_CIELO_STATUS_FIELDS = (
+    "status",
+    "situacao",
+    "situacao da venda",
+    "status da venda",
+    "status transacao",
+    "status da transacao",
+)
+_CIELO_PRODUCT_FIELDS = (
+    "produto",
+    "modalidade",
+    "tipo",
+    "tipo de venda",
+    "tipo venda",
+    "forma de pagamento",
+    "meio de pagamento",
+    "meio pagamento",
+)
+_CIELO_NUMBER_FIELDS = (
+    "codigo de autorizacao",
+    "cod de autorizacao",
+    "cod. de autorizacao",
+    "autorizacao",
+    "nsu",
+    "nsu host",
+    "comprovante",
+    "comprovante de venda",
+    "numero do pedido",
+    "pedido",
+    "tid",
+)
+
+
+def _pick_normalized_row_value(normalized_row: dict[str, str], field_names: tuple[str, ...]) -> str:
+    normalized_names = [_normalize_ascii_text(name) for name in field_names]
+    for name in normalized_names:
+        value = str(normalized_row.get(name) or "").strip()
+        if value:
+            return value
+    for key, value in normalized_row.items():
+        if not str(value or "").strip():
+            continue
+        if any(name and (key == name or name in key) for name in normalized_names):
+            return str(value or "").strip()
+    return ""
+
+
+def _cielo_header_score(cells: list[str]) -> int:
+    normalized = [_normalize_ascii_text(cell) for cell in cells]
+    joined = " ".join(normalized)
+    score = 0
+    if any("data" in cell for cell in normalized):
+        score += 2
+    if any("valor" in cell for cell in normalized):
+        score += 2
+    if any(marker in joined for marker in ("status", "situacao", "produto", "modalidade", "forma de pagamento", "meio de pagamento")):
+        score += 1
+    if any(marker in joined for marker in ("autorizacao", "comprovante", "nsu", "tid", "pedido")):
+        score += 4
+    if any("hora" in cell for cell in normalized):
+        score += 1
+    if "quantidade de vendas" in joined and not any(marker in joined for marker in ("status", "situacao", "autorizacao", "comprovante", "nsu", "tid", "pedido", "hora")):
+        score -= 4
+    return score
+
+
+def _dict_rows_from_tabular_rows(rows: list[list[str]]) -> list[dict[str, str]]:
+    header_idx = -1
+    headers: list[str] = []
+    best_score = -1
+    for idx, row in enumerate(rows):
+        row_values = [str(cell or "").strip() for cell in row]
+        score = _cielo_header_score(row_values)
+        if score >= 3 and score > best_score:
+            header_idx = idx
+            headers = row_values
+            best_score = score
+    if header_idx < 0 or not headers:
+        return []
+
+    output: list[dict[str, str]] = []
+    for row in rows[header_idx + 1 :]:
+        if not any(str(value or "").strip() for value in row):
+            continue
+        row_map = {
+            headers[idx]: str(row[idx] or "").strip()
+            for idx in range(min(len(headers), len(row)))
+            if str(headers[idx] or "").strip()
+        }
+        if any(str(value or "").strip() for value in row_map.values()):
+            output.append(row_map)
+    return output
+
+
+def _collect_card_rows_from_cielo_csv(caminho_csv: str) -> list[dict[str, str]]:
+    text = _read_text_file(caminho_csv)
+    lines = [line for line in text.splitlines() if str(line or "").strip()]
+    if lines and _normalize_ascii_text(lines[0]).startswith("sep="):
+        lines = lines[1:]
+    delimiters = [";", ",", "\t", "|"]
+    try:
+        dialect = csv.Sniffer().sniff("\n".join(lines[:8]), delimiters=";,\t|")
+        delimiters.insert(0, dialect.delimiter)
+    except Exception:
+        pass
+
+    seen_delimiters: set[str] = set()
+    for delimiter in delimiters:
+        if delimiter in seen_delimiters:
+            continue
+        seen_delimiters.add(delimiter)
+        try:
+            rows = [
+                [str(cell or "").strip() for cell in row]
+                for row in csv.reader(lines, delimiter=delimiter)
+            ]
+        except Exception:
+            continue
+        dict_rows = _dict_rows_from_tabular_rows(rows)
+        if dict_rows:
+            return dict_rows
+    return []
+
+
+def _collect_card_rows_from_cielo_xlsx(caminho_xlsx: str) -> list[dict[str, str]]:
+    import pandas as pd
+
+    rows_out: list[dict[str, str]] = []
+    try:
+        xls = pd.ExcelFile(caminho_xlsx)
+        for sheet_name in xls.sheet_names:
+            df_raw = pd.read_excel(xls, sheet_name=sheet_name, dtype=str, header=None).fillna("")
+            rows = [
+                [str(value or "").strip() for value in row]
+                for row in df_raw.values.tolist()
+            ]
+            rows_out.extend(_dict_rows_from_tabular_rows(rows))
+        if rows_out:
+            return rows_out
+    except Exception:
+        pass
+
+    for _sheet_name, rows in _read_xlsx_rows_fallback(caminho_xlsx):
+        rows_out.extend(_dict_rows_from_tabular_rows(rows))
+    return rows_out
+
+
+def _parse_cielo_card_datetime(normalized_row: dict[str, str], data_br: str) -> tuple[str, str] | None:
+    data_raw = _pick_normalized_row_value(normalized_row, _CIELO_DATE_FIELDS)
+    hora_raw = _pick_normalized_row_value(normalized_row, _CIELO_TIME_FIELDS)
+    if not data_raw:
+        return None
+
+    cleaned = corrigir_texto(str(data_raw or "")).strip()
+    if hora_raw and not re.search(r"\d{1,2}:\d{2}", cleaned):
+        cleaned = f"{cleaned} {hora_raw}"
+    cleaned = re.sub(r"\b(?:as|às|a?s)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    dt_obj: datetime | None = None
+    serial_candidate = str(data_raw or "").strip()
+    if re.fullmatch(r"\d+(?:[\.,]\d+)?", serial_candidate):
+        try:
+            serial_value = float(serial_candidate.replace(",", "."))
+            if 30000 <= serial_value <= 80000:
+                dt_obj = datetime(1899, 12, 30) + timedelta(days=serial_value)
+                time_match = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(hora_raw or ""))
+                if time_match:
+                    dt_obj = dt_obj.replace(
+                        hour=int(time_match.group(1)),
+                        minute=int(time_match.group(2)),
+                        second=int(time_match.group(3) or "0"),
+                    )
+        except Exception:
+            dt_obj = None
+    for fmt in (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt_obj = datetime.strptime(cleaned[: len(datetime.now().strftime(fmt))], fmt)
+            break
+        except Exception:
+            pass
+    if dt_obj is None:
+        match_br = re.search(r"(\d{2}/\d{2}/\d{4})(?:\D+(\d{1,2}:\d{2})(?::(\d{2}))?)?", cleaned)
+        match_iso = re.search(r"(\d{4}-\d{2}-\d{2})(?:\D+(\d{1,2}:\d{2})(?::(\d{2}))?)?", cleaned)
+        try:
+            if match_br:
+                hora = match_br.group(2) or "00:00"
+                segundo = match_br.group(3) or "00"
+                dt_obj = datetime.strptime(f"{match_br.group(1)} {hora}:{segundo}", "%d/%m/%Y %H:%M:%S")
+            elif match_iso:
+                hora = match_iso.group(2) or "00:00"
+                segundo = match_iso.group(3) or "00"
+                dt_obj = datetime.strptime(f"{match_iso.group(1)} {hora}:{segundo}", "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            dt_obj = None
+    if dt_obj is None:
+        return None
+
+    data_venda = dt_obj.strftime("%d/%m/%Y")
+    if data_venda != data_br:
+        return None
+    return f"{data_venda} às {dt_obj.strftime('%H:%M')}", dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _cielo_status_is_approved(status_raw: str) -> bool:
+    status_norm = _normalize_ascii_text(status_raw)
+    if any(marker in status_norm for marker in ("cancel", "estorn", "negad", "recus", "falh", "desfeit", "devol", "chargeback")):
+        return False
+    if not status_norm:
+        return True
+    return any(marker in status_norm for marker in ("aprov", "autor", "captur", "confirm", "conclu", "finaliz", "liquid", "pago"))
+
+
+def _cielo_card_key_from_row(normalized_row: dict[str, str]) -> str | None:
+    product_raw = _pick_normalized_row_value(normalized_row, _CIELO_PRODUCT_FIELDS)
+    row_text = _normalize_ascii_text(" ".join([product_raw, *normalized_row.values()]))
+    if "debito" in row_text or "debit" in row_text:
+        return "cartao_debito_caixa"
+    if "credito" in row_text or "credit" in row_text or "parcelado" in row_text:
+        return "cartao_credito_caixa"
+    return None
+
+
+def _build_card_reports_from_cielo(caminho: str, data_br: str) -> dict[str, dict]:
+    suffix = _effective_local_report_suffix(caminho)
+    if suffix == ".csv":
+        rows = _collect_card_rows_from_cielo_csv(caminho)
+        origem = "cielo_cartoes_csv"
+    elif suffix == ".xlsx":
+        rows = _collect_card_rows_from_cielo_xlsx(caminho)
+        origem = "cielo_cartoes_xlsx"
+    else:
+        rows = []
+        origem = "cielo_cartoes"
+
+    buckets = {
+        "cartao_credito_caixa": [],
+        "cartao_debito_caixa": [],
+    }
+    all_items: dict[str, list[dict]] = {
+        "cartao_credito_caixa": [],
+        "cartao_debito_caixa": [],
+    }
+
+    for row in rows:
+        normalized_row = {_normalize_ascii_text(key): str(value or "").strip() for key, value in row.items()}
+        parsed_dt = _parse_cielo_card_datetime(normalized_row, data_br)
+        if not parsed_dt:
+            continue
+        key = _cielo_card_key_from_row(normalized_row)
+        if not key:
+            continue
+        valor_raw = _pick_normalized_row_value(normalized_row, _CIELO_VALUE_FIELDS)
+        if not valor_raw:
+            continue
+        status_raw = _pick_normalized_row_value(normalized_row, _CIELO_STATUS_FIELDS)
+        numero = _pick_normalized_row_value(normalized_row, _CIELO_NUMBER_FIELDS)
+        data_venda, ordem = parsed_dt
+        item = {
+            "numero": numero,
+            "numero_exibicao": str(numero or "").lstrip("0") or numero or "-",
+            "data_venda": data_venda,
+            "ordem": ordem,
+            "valor_bruto": round(parse_number(valor_raw), 2),
+            "status": status_raw,
+        }
+        all_items[key].append(item)
+        if _cielo_status_is_approved(status_raw):
+            buckets[key].append(
+                {
+                    "numero": item["numero"],
+                    "numero_exibicao": item["numero_exibicao"],
+                    "data_venda": item["data_venda"],
+                    "ordem": item["ordem"],
+                    "valor_bruto": item["valor_bruto"],
+                }
+            )
+
+    reports: dict[str, dict] = {}
+    periodo = f"{data_br} - {data_br}"
+    meta_by_key = {
+        "cartao_credito_caixa": {
+            "tab_title": "Cartão de Crédito Cielo",
+            "menu_text": "Abrir cartão de crédito Cielo",
+            "summary_label": "Cartão de crédito Cielo",
+            "total_label": "Total cartão de crédito Cielo",
+            "section_label": "Transações em cartão de crédito na Cielo",
+            "empty_message": "Nenhuma transação em cartão de crédito da Cielo encontrada para este dia.",
+        },
+        "cartao_debito_caixa": {
+            "tab_title": "Cartão de Débito Cielo",
+            "menu_text": "Abrir cartão de débito Cielo",
+            "summary_label": "Cartão de débito Cielo",
+            "total_label": "Total cartão de débito Cielo",
+            "section_label": "Transações em cartão de débito na Cielo",
+            "empty_message": "Nenhuma transação em cartão de débito da Cielo encontrada para este dia.",
+        },
+    }
+
+    for key, itens in buckets.items():
+        itens.sort(key=lambda item: (item.get("ordem", ""), item.get("numero", "")))
+        total = round(sum(float(item.get("valor_bruto", 0.0)) for item in itens), 2)
+        meta = meta_by_key[key]
+        reports[key] = {
+            "arquivo": os.path.basename(caminho),
+            "caminho": caminho,
+            "periodo": periodo,
+            "quantidade_autorizados": len(itens),
+            "total_autorizado": total,
+            "itens_autorizados": itens,
+            "quantidade_relatorio": len(itens),
+            "total_relatorio": total,
+            "consistente": True,
+            "origem": origem,
+            "mensagem": None if itens else meta["empty_message"],
+            "categoria": key,
+            "tab_title": meta["tab_title"],
+            "menu_text": meta["menu_text"],
+            "summary_label": meta["summary_label"],
+            "total_label": meta["total_label"],
+            "section_label": meta["section_label"],
+            "empty_message": meta["empty_message"],
+            "itens_todos": all_items[key],
+            "table_headers": ("Comprovante", "Data", "Valor"),
+            "table_mode": "numero_data_valor",
+        }
+    return reports
+
+
+def _find_local_cielo_card_report(data_br: str, *, company: str = "MVA") -> dict[str, object]:
+    matches: list[Path] = []
+    avisos: list[str] = []
+    company_norm = _normalize_ascii_text(company) or "mva"
+    patterns = ("*.csv", "*.xlsx", "*.crdownload")
+
+    for directory in _candidate_local_report_dirs():
+        for pattern in patterns:
+            for path in directory.glob(pattern):
+                try:
+                    effective_suffix = _effective_local_report_suffix(path)
+                    if effective_suffix not in {".csv", ".xlsx"}:
+                        continue
+                    normalized_path = Path(_finalize_local_report_path(path))
+                    if effective_suffix == ".csv":
+                        text = _read_text_file(normalized_path)
+                    else:
+                        text = _read_excel_text(normalized_path)
+                    name_norm = _normalize_ascii_text(normalized_path.name)
+                    text_norm = _normalize_ascii_text(text[:6000])
+                    if "cielo" not in name_norm and "cielo" not in text_norm:
+                        continue
+                    detected_date = _extract_local_report_date_br(text)
+                    if detected_date and detected_date != data_br:
+                        avisos.append(
+                            f'O arquivo "{normalized_path.name}" foi identificado como relatório Cielo, mas o conteúdo é de {detected_date} e não de {data_br}. Ele foi ignorado.'
+                        )
+                        continue
+                    reports = _build_card_reports_from_cielo(str(normalized_path), data_br)
+                    if any((report.get("itens_autorizados") or []) for report in reports.values()):
+                        matches.append(normalized_path)
+                    else:
+                        avisos.append(
+                            f'O arquivo "{normalized_path.name}" não trouxe transações Cielo aprovadas para {data_br} e foi ignorado.'
+                        )
+                except Exception as exc:
+                    if "cielo" in _normalize_ascii_text(path.name):
+                        avisos.append(f'Não foi possível ler o relatório Cielo "{path.name}": {exc}')
+                    continue
+
+    def _score(item: Path) -> tuple[int, float]:
+        name = item.stem.casefold()
+        if f"_{company_norm}_auto" in name:
+            company_score = 3
+        elif "_auto" in name:
+            company_score = 1
+        else:
+            company_score = 0
+        return (company_score, item.stat().st_mtime)
+
+    return {
+        "cartoes": str(max(matches, key=_score)) if matches else None,
+        "avisos": list(dict.fromkeys(avisos)),
+    }
+
+
+MVA_CIELO_AUTO_MIN_PENDING_CARD_COUNT = 15
+
+
+def _payment_report_total(report: dict | None) -> float:
+    return round(float((report or {}).get("total_autorizado", 0.0) or 0.0), 2)
+
+
+def _mva_cielo_needed_card_keys(relatorio_fechamento: dict) -> list[str]:
+    relatorios_pagamento = relatorio_fechamento.get("relatorios_pagamento") or {}
+    needed: list[str] = []
+    for external_key, internal_key in (
+        ("cartao_credito_caixa", "cartao_credito"),
+        ("cartao_debito_caixa", "cartao_debito"),
+    ):
+        report_fechamento = relatorios_pagamento.get(internal_key) or {}
+        report_externo = relatorios_pagamento.get(external_key) or {}
+        total_fechamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
+        total_externo = round(float(report_externo.get("total_autorizado", 0.0) or 0.0), 2)
+        if total_fechamento > 0.009 and total_externo + 0.01 < total_fechamento:
+            needed.append(external_key)
+    return needed
+
+
+def _mva_cielo_pending_card_count(relatorio_fechamento: dict, needed_keys: list[str] | None = None) -> int:
+    relatorios_pagamento = relatorio_fechamento.get("relatorios_pagamento") or {}
+    needed = set(needed_keys or _mva_cielo_needed_card_keys(relatorio_fechamento))
+    pending_count = 0
+    for external_key, internal_key in (
+        ("cartao_credito_caixa", "cartao_credito"),
+        ("cartao_debito_caixa", "cartao_debito"),
+    ):
+        if external_key not in needed:
+            continue
+        report_fechamento = relatorios_pagamento.get(internal_key) or {}
+        report_externo = relatorios_pagamento.get(external_key) or {}
+        total_fechamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
+        total_externo = round(float(report_externo.get("total_autorizado", 0.0) or 0.0), 2)
+        if total_fechamento <= 0.009 or total_externo + 0.01 >= total_fechamento:
+            continue
+
+        itens_fechamento = list(report_fechamento.get("itens_autorizados") or [])
+        itens_externos = list(report_externo.get("itens_autorizados") or [])
+        if itens_fechamento:
+            try:
+                _matched, _externos_sem_fechamento, fechamento_sem_externo = _multiset_match_by_value(
+                    itens_externos,
+                    itens_fechamento,
+                    campo_esquerda="valor_bruto",
+                    campo_direita="valor_bruto",
+                )
+                pending_count += len(fechamento_sem_externo)
+                continue
+            except Exception:
+                pass
+
+        quantidade_fechamento = int(report_fechamento.get("quantidade_autorizados") or len(itens_fechamento) or 0)
+        quantidade_externo = int(report_externo.get("quantidade_autorizados") or len(itens_externos) or 0)
+        pending_count += max(1, quantidade_fechamento - quantidade_externo)
+    return pending_count
+
+
+def _mva_caixa_reports_refresh_needs(relatorio_fechamento: dict) -> dict[str, object]:
+    relatorios_pagamento = relatorio_fechamento.get("relatorios_pagamento") or {}
+    reasons: list[str] = []
+    need_cartoes = False
+
+    for external_key, internal_key, label in (
+        ("cartao_credito_caixa", "cartao_credito", "cartao_credito"),
+        ("cartao_debito_caixa", "cartao_debito", "cartao_debito"),
+    ):
+        internal_total = _payment_report_total(relatorios_pagamento.get(internal_key))
+        external_total = _payment_report_total(relatorios_pagamento.get(external_key))
+        if internal_total > 0.009 and external_total + 0.01 < internal_total:
+            need_cartoes = True
+            reasons.append(f"{label}: fechamento={internal_total:.2f}, caixa/cielo={external_total:.2f}")
+
+    pix_fechamento_total = _payment_report_total(relatorios_pagamento.get("pix_fechamento"))
+    pix_caixa_total = _payment_report_total(
+        relatorios_pagamento.get("pix_caixa")
+        or relatorios_pagamento.get("pagamentos_digitais_nfce")
+    )
+    need_pix = pix_fechamento_total > 0.009 and pix_caixa_total + 0.01 < pix_fechamento_total
+    if need_pix:
+        reasons.append(f"pix: fechamento={pix_fechamento_total:.2f}, caixa={pix_caixa_total:.2f}")
+
+    return {
+        "need_cartoes": need_cartoes,
+        "need_pix": need_pix,
+        "reasons": reasons,
+    }
+
+
+def _refresh_mva_caixa_reports_if_needed(
+    relatorio_fechamento: dict,
+    data_br: str,
+    *,
+    avisos_usuario: list[str] | None = None,
+    auto_download_missing: bool = False,
+    force_refresh_payments: bool = False,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+    token_callback=None,
+    company: str = "MVA",
+) -> tuple[dict, list[str], bool]:
+    avisos = list(avisos_usuario or relatorio_fechamento.get("avisos_usuario") or [])
+    if _normalize_ascii_text(company) != "mva" or not data_br:
+        return relatorio_fechamento, avisos, False
+    if not auto_download_missing or force_refresh_payments:
+        return relatorio_fechamento, avisos, False
+
+    refresh_needs = _mva_caixa_reports_refresh_needs(relatorio_fechamento)
+    need_pix = bool(refresh_needs.get("need_pix"))
+    need_cartoes = bool(refresh_needs.get("need_cartoes"))
+    if not (need_pix or need_cartoes):
+        return relatorio_fechamento, avisos, False
+
+    tipos = []
+    if need_pix:
+        tipos.append("PIX")
+    if need_cartoes:
+        tipos.append("cartoes")
+    try:
+        _emit_pix_status(
+            on_status,
+            f"Relatorios {'/'.join(tipos)} da Caixa/Azulzinha vieram abaixo do fechamento; baixando novamente...",
+        )
+        baixados = baixar_relatorios_caixa_eh_azulzinha(
+            data_br,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            token_callback=token_callback,
+            need_pix=need_pix,
+            need_cartoes=need_cartoes,
+            company=company,
+        )
+        avisos.extend(list(baixados.get("avisos") or []))
+        relatorio_fechamento, _relatorio_pix, avisos_integracao = _integrate_local_payment_reports(
+            relatorio_fechamento,
+            data_br,
+            avisos_usuario=avisos,
+            company=company,
+        )
+        avisos.extend(list(avisos_integracao or []))
+        avisos = list(dict.fromkeys(avisos))
+        if avisos:
+            relatorio_fechamento["avisos_usuario"] = avisos
+        return relatorio_fechamento, avisos, True
+    except Exception as exc:
+        if str(exc).strip() == "__cancelled__":
+            raise
+        avisos.append(f"Nao foi possivel revalidar os relatorios da Caixa/Azulzinha: {exc}")
+        relatorio_fechamento["avisos_usuario"] = list(dict.fromkeys(avisos))
+        return relatorio_fechamento, avisos, False
+
+
+def _merge_card_machine_report(existing: dict | None, extra: dict) -> dict:
+    if not existing or not (existing.get("itens_autorizados") or []):
+        return dict(extra)
+    if not extra or not (extra.get("itens_autorizados") or []):
+        return dict(existing)
+
+    merged = dict(existing)
+    existing_items = [dict(item) for item in existing.get("itens_autorizados") or []]
+    extra_items = [dict(item) for item in extra.get("itens_autorizados") or []]
+    items = existing_items + extra_items
+    items.sort(key=lambda item: (item.get("ordem", "") or item.get("data_venda", ""), item.get("numero", "")))
+    total = round(sum(float(item.get("valor_bruto", 0.0) or 0.0) for item in items), 2)
+
+    categoria = str(extra.get("categoria") or existing.get("categoria") or "")
+    is_credit = categoria == "cartao_credito_caixa"
+    label = "Cartão de crédito" if is_credit else "Cartão de débito"
+    label_title = "Cartão de Crédito" if is_credit else "Cartão de Débito"
+    empty = f"Nenhuma transação em {label} da CAIXA/Cielo encontrada para este dia."
+
+    merged.update(
+        {
+            "arquivo": " + ".join([str(existing.get("arquivo") or "").strip(), str(extra.get("arquivo") or "").strip()]).strip(" + "),
+            "caminho": " + ".join([str(existing.get("caminho") or "").strip(), str(extra.get("caminho") or "").strip()]).strip(" + "),
+            "quantidade_autorizados": len(items),
+            "total_autorizado": total,
+            "itens_autorizados": items,
+            "quantidade_relatorio": len(items),
+            "total_relatorio": total,
+            "consistente": True,
+            "origem": "caixa_cielo_cartoes",
+            "mensagem": None if items else empty,
+            "tab_title": f"{label_title} CAIXA/Cielo",
+            "menu_text": f"Abrir {label} CAIXA/Cielo",
+            "summary_label": f"{label} CAIXA/Cielo",
+            "total_label": f"Total {label} CAIXA/Cielo",
+            "section_label": f"Transações em {label} na CAIXA/Cielo",
+            "empty_message": empty,
+            "table_headers": ("Comprovante", "Data", "Valor"),
+            "table_mode": "numero_data_valor",
+        }
+    )
+    merged["itens_todos"] = [dict(item) for item in existing.get("itens_todos") or existing_items] + [
+        dict(item) for item in extra.get("itens_todos") or extra_items
+    ]
+    return merged
+
+
+def _merge_cielo_reports_into_payment_reports(relatorios_pagamento: dict, cielo_reports: dict[str, dict]) -> bool:
+    merged_any = False
+    for key, report in cielo_reports.items():
+        if key not in {"cartao_credito_caixa", "cartao_debito_caixa"}:
+            continue
+        if not (report.get("itens_autorizados") or []):
+            continue
+        relatorios_pagamento[key] = _merge_card_machine_report(relatorios_pagamento.get(key), report)
+        merged_any = True
+    return merged_any
+
+
+def _integrate_cielo_card_reports_if_needed(
+    relatorio_fechamento: dict,
+    data_br: str,
+    *,
+    avisos_usuario: list[str] | None = None,
+    auto_download_missing: bool = False,
+    force_refresh_payments: bool = False,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+    token_callback=None,
+    company: str = "MVA",
+) -> tuple[dict, list[str]]:
+    avisos = list(avisos_usuario or [])
+    if _normalize_ascii_text(company) != "mva" or not data_br:
+        return relatorio_fechamento, avisos
+
+    cielo_decision_log_path: Path | None = None
+
+    def cielo_decision_log(event: str, **details) -> None:
+        nonlocal cielo_decision_log_path
+        if not CIELO_DEBUG_LOGS_ENABLED:
+            return
+        if cielo_decision_log_path is None:
+            cielo_decision_log_path = _new_cielo_debug_log_path(data_br, company)
+        _write_cielo_debug_log(cielo_decision_log_path, event, **details)
+
+    needed_keys = _mva_cielo_needed_card_keys(relatorio_fechamento)
+    if not needed_keys and not force_refresh_payments:
+        return relatorio_fechamento, avisos
+    cielo_decision_log(
+        "integration_start",
+        needed_keys=needed_keys,
+        auto_download_missing=auto_download_missing,
+        force_refresh_payments=force_refresh_payments,
+    )
+
+    scope_windows = _report_scope_windows(relatorio_fechamento)
+    relatorios_pagamento = dict(relatorio_fechamento.get("relatorios_pagamento") or {})
+
+    def _read_and_merge(path_like: str | None, source_label: str) -> bool:
+        if not path_like:
+            return False
+        try:
+            cielo_reports = _build_card_reports_from_cielo(str(path_like), data_br)
+            cielo_reports = {
+                key: _filter_payment_report_to_scope(report, scope_windows)
+                for key, report in cielo_reports.items()
+            }
+            return _merge_cielo_reports_into_payment_reports(relatorios_pagamento, cielo_reports)
+        except Exception as exc:
+            avisos.append(f"Não foi possível processar o relatório de cartões da Cielo ({source_label}): {exc}")
+            return False
+
+    local_cielo = _find_local_cielo_card_report(data_br, company=company)
+    avisos.extend(local_cielo.get("avisos") or [])
+    cielo_decision_log(
+        "integration_local_search",
+        found=bool(local_cielo.get("cartoes")),
+        warnings_count=len(local_cielo.get("avisos") or []),
+    )
+    local_merged = _read_and_merge(local_cielo.get("cartoes"), "arquivo local")
+    cielo_decision_log("integration_local_merge", merged=local_merged)
+
+    relatorio_fechamento["relatorios_pagamento"] = relatorios_pagamento
+    needed_keys = _mva_cielo_needed_card_keys(relatorio_fechamento)
+    pending_card_count = _mva_cielo_pending_card_count(relatorio_fechamento, needed_keys)
+    same_day_report = str(data_br or "").strip() == datetime.now().strftime("%d/%m/%Y")
+    should_auto_download_cielo = force_refresh_payments or (
+        pending_card_count >= MVA_CIELO_AUTO_MIN_PENDING_CARD_COUNT
+    )
+    cielo_decision_log(
+        "integration_decision",
+        needed_keys=needed_keys,
+        pending_card_count=pending_card_count,
+        threshold=MVA_CIELO_AUTO_MIN_PENDING_CARD_COUNT,
+        auto_download_missing=auto_download_missing,
+        force_refresh_payments=force_refresh_payments,
+        same_day_report=same_day_report,
+        should_auto_download_cielo=should_auto_download_cielo,
+    )
+    if (needed_keys or force_refresh_payments) and auto_download_missing and should_auto_download_cielo:
+        try:
+            baixado = baixar_relatorio_cielo_mva(
+                data_br,
+                on_status=on_status,
+                cancel_event=cancel_event,
+                token_callback=token_callback,
+            )
+            cielo_decision_log(
+                "integration_download_result",
+                has_card_report=bool(baixado.get("cartoes")),
+                warnings_count=len(baixado.get("avisos") or []),
+                download_debug_log=baixado.get("debug_log"),
+            )
+            avisos.extend(list(baixado.get("avisos") or []))
+            if _read_and_merge(baixado.get("cartoes"), "download automático"):
+                relatorio_fechamento["relatorios_pagamento"] = relatorios_pagamento
+        except Exception as exc:
+            if str(exc).strip() == "__cancelled__":
+                raise
+            cielo_decision_log("integration_download_error", error=str(exc), error_type=type(exc).__name__)
+            avisos.append(f"Não foi possível baixar automaticamente o relatório de cartões da Cielo: {exc}")
+    elif needed_keys and auto_download_missing and pending_card_count < MVA_CIELO_AUTO_MIN_PENDING_CARD_COUNT:
+        cielo_decision_log(
+            "integration_auto_download_skipped",
+            reason="pending_card_count_below_threshold",
+            pending_card_count=pending_card_count,
+            threshold=MVA_CIELO_AUTO_MIN_PENDING_CARD_COUNT,
+        )
+
+    relatorio_fechamento["relatorios_pagamento"] = relatorios_pagamento
+    avisos = list(dict.fromkeys(avisos))
+    if avisos:
+        relatorio_fechamento["avisos_usuario"] = avisos
+    return relatorio_fechamento, avisos
+
+
 def _build_generic_aux_report(
     *,
     categoria: str,
@@ -7390,15 +11671,14 @@ def _build_eh_alerts_report(
         if row and row[0] not in {"CF sem Transação Bancária", "Transação Bancária sem CF/NF"}
     ]
     observacao_rows = [row for row in observacao_rows if row and row[0] not in tipos_alerta_exibidos]
-    total_rows = (
+    bank_pending_rows = (
         len(pix_fechamento_rows)
         + len(pix_maquina_rows)
         + len(cartao_fechamento_rows)
         + len(cartao_maquina_rows)
-        + len(cancelados_rows)
-        + len(observacao_rows)
     )
-    if total_rows <= 0 and not allow_empty:
+    display_rows = bank_pending_rows + len(cancelados_rows) + len(observacao_rows)
+    if display_rows <= 0 and not allow_empty:
         return None
 
     table_rows: list[tuple[str, ...]] = []
@@ -7424,11 +11704,6 @@ def _build_eh_alerts_report(
                 continue
             valor = row[-1]
             total += parse_number(valor)
-    for row in cancelados_rows:
-        if not row:
-            continue
-        total += parse_number(row[-1])
-
     report = _build_generic_aux_report(
         categoria="alertas_eh",
         tab_title="Conciliação Bancária",
@@ -7439,7 +11714,7 @@ def _build_eh_alerts_report(
         headers=("Tipo", "Detalhe", "Valor"),
         rows=table_rows,
         periodo=periodo,
-        quantidade=total_rows,
+        quantidade=bank_pending_rows,
         total=total,
         empty_message="Nenhum alerta encontrado.",
     )
@@ -7453,12 +11728,15 @@ def _build_eh_alerts_report(
     return report
 
 
+def _is_cancelled_coupon_alert_row(row: tuple[str, ...] | list[str] | None) -> bool:
+    return bool(row) and str(row[0] or "").strip() == "Cupom cancelado"
+
+
 def _count_visible_alert_rows(report: dict | None) -> int:
     report = report or {}
     return sum(
         len(report.get(key) or [])
         for key in (
-            "cancelados_rows",
             "pix_fechamento_rows",
             "cartao_fechamento_rows",
             "pix_maquina_rows",
@@ -8008,6 +12286,60 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
             avisos_usuario=avisos,
             company=company,
         )
+        report, avisos, refreshed_caixa_payments = _refresh_mva_caixa_reports_if_needed(
+            report,
+            data_br,
+            avisos_usuario=report.get("avisos_usuario") or avisos,
+            auto_download_missing=auto_download_missing,
+            force_refresh_payments=force_refresh_payments,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            token_callback=token_callback,
+            company=company,
+        )
+        report, avisos = _integrate_cielo_card_reports_if_needed(
+            report,
+            data_br,
+            avisos_usuario=report.get("avisos_usuario") or avisos,
+            auto_download_missing=auto_download_missing,
+            force_refresh_payments=force_refresh_payments,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            token_callback=token_callback,
+            company=company,
+        )
+        remaining_card_pending = _mva_cielo_pending_card_count(report)
+        refresh_needs = _mva_caixa_reports_refresh_needs(report)
+        if (
+            auto_download_missing
+            and not force_refresh_payments
+            and not refreshed_caixa_payments
+            and remaining_card_pending >= MVA_CIELO_AUTO_MIN_PENDING_CARD_COUNT
+            and (refresh_needs.get("need_cartoes") or refresh_needs.get("need_pix"))
+        ):
+            report, avisos, refreshed_after_cielo = _refresh_mva_caixa_reports_if_needed(
+                report,
+                data_br,
+                avisos_usuario=report.get("avisos_usuario") or avisos,
+                auto_download_missing=auto_download_missing,
+                force_refresh_payments=force_refresh_payments,
+                on_status=on_status,
+                cancel_event=cancel_event,
+                token_callback=token_callback,
+                company=company,
+            )
+            if refreshed_after_cielo:
+                report, avisos = _integrate_cielo_card_reports_if_needed(
+                    report,
+                    data_br,
+                    avisos_usuario=report.get("avisos_usuario") or avisos,
+                    auto_download_missing=False,
+                    force_refresh_payments=False,
+                    on_status=on_status,
+                    cancel_event=cancel_event,
+                    token_callback=token_callback,
+                    company=company,
+                )
     return report
 
 
@@ -10593,7 +14925,11 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         sum(float(item.get("valor", 0.0)) for item in registros if item.get("valor") not in (None, "")),
         2,
     )
-    valor_faltantes = round(valor_registros_pendentes + valor_canceladas_pendentes, 2)
+    valor_banco_pendente = round(
+        sum(float(item.get("valor", 0.0)) for item in pix_fechamento_only + card_fechamento_only + pix_machine_only + card_machine_only),
+        2,
+    )
+    valor_faltantes = round(valor_registros_pendentes + valor_banco_pendente, 2)
     total_caixa = round(float(relatorio_caixa.get("total_caixa", 0.0)), 2)
     total_resumo = round(float(relatorio_nfce.get("total_nfce", 0.0)), 2)
 
@@ -10629,11 +14965,11 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         alertas_report["summary_items"] = [
             ("Período", str(relatorio_caixa.get("periodo") or "Não identificado")),
             ("Pendências", str(_count_visible_alert_rows(alertas_report))),
-            ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
+            ("Total Pendências", f"R$ {format_number_br(valor_banco_pendente)}"),
         ]
         alertas_report["correlacao_rows"] = correlacao_rows
         alertas_report["valor_total_vendas"] = total_caixa
-        alertas_report["valor_pendente"] = valor_faltantes
+        alertas_report["valor_pendente"] = valor_banco_pendente
         alertas_report["hidden_pending_count"] = 0
         alertas_report["hidden_pending_value"] = 0.0
         alertas_report["texto_informativo"] = ""
@@ -10649,8 +14985,9 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
             if relatorios_pagamento.get(key):
                 relatorios_pagamento[key]["hidden_in_menu"] = True
 
+    pending_alert_rows = [row for row in alert_rows if not _is_cancelled_coupon_alert_row(row)]
     status = "Confere"
-    if registros or alert_rows:
+    if registros or pending_alert_rows:
         status = "Faltante"
     if alertas_report:
         alertas_report["status"] = status
@@ -10684,8 +15021,8 @@ def _comparar_caixa_resumo_nfce_eh(relatorio_caixa: dict, relatorio_nfce: dict) 
         "status": status,
         "canceladas_ignoradas_count": len(pedidos_cancelados),
         "canceladas_ignoradas_valor": valor_canceladas_pendentes,
-        "canceladas_pendentes_count": len(pedidos_cancelados),
-        "canceladas_pendentes_valor": valor_canceladas_pendentes,
+        "canceladas_pendentes_count": 0,
+        "canceladas_pendentes_valor": 0.0,
         "escopo_relatorio": escopo_relatorio,
         "escopo_horario_aplicado": escopo_horario_aplicado,
         "avisos_usuario": list(relatorio_nfce.get("avisos_usuario") or []),
@@ -10863,7 +15200,37 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
     else:
         avisos_minhas_notas = []
 
+    def _register_cancelled_payment_item(titulo_pagamento: str, item_cancelado: dict) -> None:
+        numero_cancelado = str(item_cancelado.get("numero") or "")
+        if not numero_cancelado:
+            return
+        numero_exibicao = (
+            item_cancelado.get("numero_exibicao")
+            or _display_fiscal_number(numero_cancelado)
+        )
+        valor = item_cancelado.get("valor")
+        if numero_cancelado not in cancelados_pagamento_map:
+            cancelados_pagamento_map[numero_cancelado] = {
+                "numero": numero_cancelado,
+                "numero_exibicao": numero_exibicao,
+                "valor": valor,
+                "observacao": "Cupom cancelado",
+            }
+            alert_rows.append(
+                (
+                    "Cupom cancelado",
+                    f"{titulo_pagamento}: CF {numero_exibicao} cancelado permaneceu no fechamento",
+                    f"R$ {format_number_br(valor or 0.0)}",
+                )
+            )
+
     dinheiro_report = relatorios_pagamento.get("dinheiro") or {}
+    _dinheiro_itens_ativos, dinheiro_cancelados = _split_cancelled_payment_items(
+        list(dinheiro_report.get("itens_autorizados") or []),
+        fiscal_status_map_mva,
+    )
+    for item_cancelado in dinheiro_cancelados:
+        _register_cancelled_payment_item("Dinheiro", item_cancelado)
     dinheiro_total = round(float(dinheiro_report.get("total_autorizado", 0.0) or 0.0), 2)
     correlacao_rows.append(
         (
@@ -10902,21 +15269,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             fiscal_status_map_mva,
         )
         for item_cancelado in itens_fechamento_cancelados:
-            numero_cancelado = str(item_cancelado.get("numero") or "")
-            if numero_cancelado not in cancelados_pagamento_map:
-                cancelados_pagamento_map[numero_cancelado] = {
-                    "numero": numero_cancelado,
-                    "numero_exibicao": item_cancelado.get("numero_exibicao") or _display_fiscal_number(numero_cancelado),
-                    "valor": item_cancelado.get("valor"),
-                    "observacao": "Cupom cancelado",
-                }
-                alert_rows.append(
-                    (
-                        "Cupom cancelado",
-                        f"{titulo_pagamento}: CF {cancelados_pagamento_map[numero_cancelado]['numero_exibicao']} cancelado permaneceu no fechamento",
-                        f"R$ {format_number_br(item_cancelado.get('valor', 0.0))}",
-                    )
-                )
+            _register_cancelled_payment_item(titulo_pagamento, item_cancelado)
         itens_externos = list((report_externo or {}).get("itens_autorizados") or [])
         total_fechamento = round(float(report_fechamento.get("total_autorizado", 0.0) or 0.0), 2)
         total_externo = round(float((report_externo or {}).get("total_autorizado", 0.0) or 0.0), 2)
@@ -11009,19 +15362,6 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         )
 
     cancelados_visiveis = list(cancelados_pagamento_map.values())
-    numeros_cancelados_registro = {
-        str(item.get("numero") or "")
-        for item in cupons_cancelados
-        if str(item.get("numero") or "")
-    }
-    valor_cancelados_pagamento_adicionais = round(
-        sum(
-            float(item.get("valor", 0.0) or 0.0)
-            for item in cancelados_visiveis
-            if str(item.get("numero") or "") not in numeros_cancelados_registro
-        ),
-        2,
-    )
 
     alertas_report = _build_eh_alerts_report(
         relatorio_caixa.get("periodo"),
@@ -11049,14 +15389,14 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
     total_caixa = round(float(relatorio_caixa.get("total_caixa", 0.0)), 2)
     total_resumo = round(float(relatorio_fechamento.get("total_nfce", 0.0)), 2)
     valor_davs_pendentes = round(
-        sum(float(item.get("valor", 0.0)) for item in registros if item.get("valor") not in (None, "")),
+        sum(float(item.get("valor", 0.0)) for item in registros_alerta if item.get("valor") not in (None, "")),
         2,
     )
     valor_banco_pendente = round(
         sum(float(item.get("valor", 0.0)) for item in pix_fechamento_only + card_fechamento_only + pix_machine_only + card_machine_only),
         2,
     )
-    valor_faltantes = round(valor_davs_pendentes + valor_banco_pendente + valor_cancelados_pagamento_adicionais, 2)
+    valor_faltantes = round(valor_davs_pendentes + valor_banco_pendente, 2)
 
     if alertas_report:
         alertas_report["hidden_in_menu"] = True
@@ -11064,7 +15404,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         alertas_report["summary_items"] = [
             ("Período", str(relatorio_caixa.get("periodo") or "Não identificado")),
             ("Pendências", str(len(alert_rows))),
-            ("Total Pendências", f"R$ {format_number_br(valor_faltantes)}"),
+            ("Total Pendências", f"R$ {format_number_br(valor_banco_pendente)}"),
         ]
         alertas_report["summary_items"][1] = (
             str(alertas_report["summary_items"][1][0]),
@@ -11072,7 +15412,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         )
         alertas_report["correlacao_rows"] = correlacao_rows
         alertas_report["valor_total_vendas"] = total_caixa
-        alertas_report["valor_pendente"] = valor_faltantes
+        alertas_report["valor_pendente"] = valor_banco_pendente
         alertas_report["texto_informativo"] = ""
         relatorios_pagamento[alertas_report["categoria"]] = alertas_report
         for key in (
@@ -11086,16 +15426,14 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
             if relatorios_pagamento.get(key):
                 relatorios_pagamento[key]["hidden_in_menu"] = True
 
-    status = "Confere" if not registros and not alert_rows else "Faltante"
+    pending_alert_rows = [row for row in alert_rows if not _is_cancelled_coupon_alert_row(row)]
+    status = "Confere" if not registros_alerta and not pending_alert_rows else "Faltante"
     if alertas_report:
         alertas_report["status"] = status
     visible_alert_count = _count_visible_alert_rows(alertas_report)
 
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
-    cupons_cancelados = [
-        item for item in registros
-        if item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado"
-    ]
+    cupons_cancelados = list(cancelados_visiveis)
     subtitle = str(relatorio_fechamento.get("subtitle") or "").strip()
     if cupons_cancelados:
         subtitle = (
@@ -11122,7 +15460,7 @@ def _comparar_caixa_fechamento_mva_com_pagamentos(relatorio_caixa: dict, relator
         "total_caixa_titulo": "Total DAVs finalizados",
         "total_resumo_nfce": total_resumo,
         "total_resumo_titulo": relatorio_fechamento.get("total_resumo_titulo") or "Total Fechamento de caixa",
-        "nfces_faltantes_count": len(registros),
+        "nfces_faltantes_count": len(registros_alerta),
         "faltantes_titulo": "DAVs/CF faltantes",
         "valor_faltantes": valor_faltantes,
         "status": status,
@@ -11214,13 +15552,17 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         sum(float(item.get("valor", 0.0) or 0.0) for item in cupons_cancelados),
         2,
     )
+    registros_alerta = [
+        item for item in registros
+        if not (item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado")
+    ]
     if nfes_identificadas:
         valor_faltantes = round(
-            sum(float(item.get("valor", 0.0)) for item in davs_sem_cupom) + valor_cupons_cancelados,
+            sum(float(item.get("valor", 0.0)) for item in registros_alerta if item.get("valor") not in (None, "")),
             2,
         )
     else:
-        valor_faltantes = round(total_caixa - total_resumo, 2)
+        valor_faltantes = round(total_caixa - total_resumo - valor_cupons_cancelados, 2)
     status = "Confere" if abs(valor_faltantes) < 0.01 else "Faltante"
     periodo_unico, _ = _extract_period_range(relatorio_caixa.get("periodo", ""))
     subtitle = (
@@ -11244,10 +15586,6 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         or []
     )
 
-    registros_alerta = [
-        item for item in registros
-        if not (item.get("origem") == "CF" and str(item.get("observacao") or "").strip() == "Cupom cancelado")
-    ]
     alert_rows = _build_mva_conferencia_observation_rows(registros_alerta)
     if erro_minhas_notas:
         alert_rows.append(("Minhas Notas", "Consulta indisponível nesta análise.", "-"))
@@ -11291,7 +15629,7 @@ def _comparar_caixa_resumo_nfce_mva(relatorio_caixa: dict, relatorio_nfce: dict)
         "total_caixa_titulo": "Total DAVs para cupom",
         "total_resumo_nfce": total_resumo,
         "total_resumo_titulo": "Total Cupons",
-        "nfces_faltantes_count": len(registros),
+        "nfces_faltantes_count": len(registros_alerta),
         "faltantes_titulo": "DAVs/CF faltantes",
         "valor_faltantes": valor_faltantes,
         "nfes_identificadas_count": len(nfes_identificadas),

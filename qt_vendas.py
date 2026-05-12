@@ -1532,7 +1532,6 @@ class CaixaReportDialog(QtWidgets.QDialog):
         pendencias_count = sum(
             len(report.get(key) or [])
             for key in (
-                "cancelados_rows",
                 "pix_fechamento_rows",
                 "cartao_fechamento_rows",
                 "pix_maquina_rows",
@@ -1597,28 +1596,28 @@ class CaixaReportDialog(QtWidgets.QDialog):
                 "Correlação de Valores",
                 ("Pagamento", "Caixa", "Pagamentos", "Status"),
                 correlation_rows,
-                [180, 92, 76, 92],
+                [150, 92, 96, 92],
                 "Nenhuma correlação de valores disponível.",
             ),
             (
                 "CF sem Transação Bancária - PIX",
                 ("CF", "Valor"),
                 pix_rows,
-                [180, 100],
+                [180, 120],
                 "Nenhum CF PIX sem transação bancária encontrado.",
             ),
             (
                 "CF sem Transação Bancária - Cartão",
                 ("CF", "Valor"),
                 cartao_rows,
-                [180, 100],
+                [180, 120],
                 "Nenhum CF de cartão sem transação bancária encontrado.",
             ),
             (
                 "Transações Bancárias sem CF/NF",
                 ("Origem", "Detalhe", "Valor"),
                 bank_rows,
-                [76, 220, 100],
+                [76, 220, 105],
                 "Nenhuma transação bancária sem CF/NF encontrada.",
             ),
         ]
@@ -3498,14 +3497,22 @@ class MainWindow(QtWidgets.QMainWindow):
             note = corrigir_texto(self._automation_last_status or "Automação desligada.")
         self._set_status_card("automation", value, note)
 
-        pending_prints = len(self._pending_print_jobs_for_company("EH")) + len(self._pending_print_jobs_for_company("MVA"))
-        pending_eh_scopes = int(bool(self._eh_pending_runs.get("morning"))) + int(bool(self._eh_pending_runs.get("afternoon")))
-        pending_mva_scopes = int(bool(self._mva_pending_runs.get("morning"))) + int(bool(self._mva_pending_runs.get("afternoon")))
-        pending_total = pending_prints + pending_eh_scopes + pending_mva_scopes
+        pending_eh = (
+            bool(self._pending_print_jobs_for_company("EH"))
+            or bool(self._eh_pending_runs.get("morning"))
+            or bool(self._eh_pending_runs.get("afternoon"))
+        )
+        pending_mva = (
+            bool(self._pending_print_jobs_for_company("MVA"))
+            or bool(self._mva_pending_runs.get("morning"))
+            or bool(self._mva_pending_runs.get("afternoon"))
+        )
+        pending_labels = [label for label, enabled in (("EH", pending_eh), ("MVA", pending_mva)) if enabled]
+        pending_total = len(pending_labels)
         self._set_status_card(
             "pending",
             str(pending_total),
-            "" if pending_total == 0 else f"Impressões: {pending_prints} | EH aguardando: {pending_eh_scopes} | MVA aguardando: {pending_mva_scopes}",
+            " | ".join(pending_labels),
         )
 
         file_text = corrigir_texto(self.label_files.text() or "Nenhum arquivo carregado")

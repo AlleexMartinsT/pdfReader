@@ -5,6 +5,7 @@ gmail_oauth_client.json
 gmail_oauth_token.json
 body_email.txt
 azulzinha_browser/
+cielo_browser/
 feedback_blacklist.json
 data/credenciaisAPI.json
 data/credenciaisDB.json
@@ -36,6 +37,8 @@ debug_*.html
 debug_*.json
 azulzinha_*.html
 azulzinha_*.json
+cielo_*.html
+cielo_*.json
 portal_*.html
 test_*.txt
 status_*.txt
@@ -45,6 +48,9 @@ found_html.txt
 Relatorio_de_Vendas_Pix_*.csv
 Relatorio_de_Vendas_Pix_*.xlsx
 Relatorio_Simplificado_de_Vendas_Historico_de_Vendas_*.xlsx
+Historico_Simplificado_de_vendas_*.xlsx
+cielo_cartoes_*.csv
+cielo_cartoes_*.xlsx
 relatório pix.pdf
 relatório cartoes.pdf
 

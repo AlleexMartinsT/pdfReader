@@ -2390,6 +2390,8 @@ _AZULZINHA_DEBUG_ARTIFACT_PATTERNS = (
     "azulzinha_export_popup_*.html",
     "azulzinha_export_state_*.json",
     "azulzinha_export_debug_*.html",
+    "azulzinha_sales_entry_debug.html",
+    "azulzinha_sales_before_settle.html",
 )
 
 
@@ -4441,17 +4443,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                                 await asyncio.sleep(1.0)
                                 return
                             except Exception:
-                                try:
-                                    html_debug = await eval_js(
-                                        session_id,
-                                        "document.documentElement ? document.documentElement.outerHTML : ''",
-                                        timeout=15.0,
-                                    )
-                                    if html_debug:
-                                        debug_path = artifacts_dir / "azulzinha_export_popup_cartoes.html"
-                                        debug_path.write_text(str(html_debug), encoding="utf-8")
-                                except Exception:
-                                    pass
                                 continue
                 clicked = await eval_js(
                     session_id,
@@ -6667,8 +6658,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         description=f"A Caixa nao abriu o Relatorio de vendas para {context_label}",
                     )
                     _emit_pix_status(on_status, f"Estado do portal apos abrir Relatorio de vendas: {state_after_click or 'desconhecido'}.")
-                    if state_after_click == "sales":
-                        await capture_portal_html_debug_v2(session_id, "azulzinha_sales_entry_debug.html")
                     if state_after_click != "home":
                         return state_after_click
 
@@ -6680,8 +6669,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     description=f"A Caixa nao abriu a area de vendas para {context_label}",
                 )
                 _emit_pix_status(on_status, f"Estado do portal apos abrir a URL da area de vendas: {state_after_navigation or 'desconhecido'}.")
-                if state_after_navigation == "sales":
-                    await capture_portal_html_debug_v2(session_id, "azulzinha_sales_entry_debug.html")
                 return state_after_navigation
 
             async def ensure_authenticated_sales_area(session_id: str, kind: str, context_label: str) -> None:
@@ -6729,7 +6716,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                         last_state = state or last_state
 
                     if state == "sales":
-                        await capture_portal_html_debug_v2(session_id, "azulzinha_sales_before_settle.html")
                         try:
                             await wait_for_portal_settle(
                                 session_id,
@@ -6761,7 +6747,6 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     state = await open_sales_area_from_home_v2(session_id, context_label)
                     last_state = state
                     if state == "sales":
-                        await capture_portal_html_debug_v2(session_id, "azulzinha_sales_before_settle.html")
                         try:
                             await wait_for_portal_settle(
                                 session_id,
@@ -12040,6 +12025,8 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
     avisos_usuario: list[str] | None = None,
     auto_download_missing: bool = False,
     force_refresh_payments: bool = False,
+    scope_mode: str | None = None,
+    filter_opening_date_br: str | None = None,
     on_status=None,
     cancel_event: threading.Event | None = None,
     token_callback=None,
@@ -12258,6 +12245,27 @@ def analisar_pdf_fechamento_caixa_mva_clipp(
         "fiscal_status_map": {},
     }
     data_br = _extract_period_range(periodo or "")[0]
+    opening_filter_date = str(filter_opening_date_br or "").strip()
+    if opening_filter_date:
+        opening_windows = [
+            window
+            for window in fechamento_janelas
+            if str(window.get("abertura") or "").strip().startswith(opening_filter_date)
+        ]
+        if opening_windows:
+            report = _filter_fechamento_report_to_scope(report, opening_windows)
+            report["periodo"] = f"{opening_filter_date} - {opening_filter_date}"
+            report["fechamento_data_abertura_filtrada"] = opening_filter_date
+            for payment_report in (report.get("relatorios_pagamento") or {}).values():
+                if isinstance(payment_report, dict):
+                    payment_report["periodo"] = report["periodo"]
+            data_br = opening_filter_date
+    requested_scope_windows = _scope_windows_for_mode(fechamento_janelas, scope_mode)
+    if opening_filter_date:
+        requested_scope_windows = _scope_windows_for_mode(report.get("fechamento_janelas"), scope_mode)
+    if requested_scope_windows and _normalize_ascii_text(scope_mode or "") not in {"", "daily", "diario"}:
+        report = _filter_fechamento_report_to_scope(report, requested_scope_windows)
+        report["escopo_relatorio"] = _scope_mode_label(scope_mode)
     avisos = list(avisos_usuario or [])
     if data_br and auto_download_missing:
         local_payment_reports = _find_eh_local_payment_reports(data_br, company=company)
@@ -12681,6 +12689,28 @@ def _scope_window_datetimes(window: dict) -> tuple[datetime | None, datetime | N
     return _parse_scope_datetime(window.get("abertura")), _parse_scope_datetime(window.get("fechamento"))
 
 
+def _is_overnight_afternoon_window(window: dict) -> bool:
+    opening_dt, closing_dt = _scope_window_datetimes(window)
+    return bool(
+        opening_dt
+        and closing_dt
+        and opening_dt.date() < closing_dt.date()
+        and opening_dt.hour >= 12
+    )
+
+
+def _is_afternoon_scope_window(window: dict) -> bool:
+    opening_dt, closing_dt = _scope_window_datetimes(window)
+    return bool(
+        opening_dt
+        and closing_dt
+        and (
+            _is_overnight_afternoon_window(window)
+            or (opening_dt.date() == closing_dt.date() and opening_dt.hour >= 12)
+        )
+    )
+
+
 def _is_partial_scope_windows(windows: object) -> bool:
     normalized = _normalize_scope_windows(windows)
     if not normalized:
@@ -12716,6 +12746,8 @@ def _scope_windows_for_mode(windows: object, mode: str | None) -> list[dict]:
     if mode_norm in {"morning", "manha"}:
         return normalized[:1]
     if mode_norm in {"afternoon", "tarde"}:
+        if len(normalized) == 1 and _is_afternoon_scope_window(normalized[0]):
+            return normalized
         return normalized[1:] if len(normalized) > 1 else []
     return normalized
 
@@ -12727,6 +12759,8 @@ def _detect_closing_scope_kind(report: dict | None) -> str:
     if len(windows) > 1:
         return "daily"
     opening_dt, closing_dt = _scope_window_datetimes(windows[0])
+    if _is_afternoon_scope_window(windows[0]):
+        return "afternoon"
     if opening_dt and closing_dt and closing_dt.hour < 15:
         return "morning"
     return "partial"
@@ -12737,12 +12771,16 @@ def describe_closing_scope(report: dict | None) -> dict:
     detected = _detect_closing_scope_kind(report)
     available_modes = ["daily"]
     if windows:
-        available_modes = ["morning"] if len(windows) == 1 else ["daily", "afternoon", "morning"]
+        if len(windows) == 1:
+            available_modes = [detected] if detected in {"morning", "afternoon"} else ["daily"]
+        else:
+            available_modes = ["daily", "afternoon", "morning"]
     return {
         "detected": detected,
         "windows": windows,
         "available_modes": available_modes,
         "has_morning_only": detected == "morning",
+        "has_afternoon_only": detected == "afternoon",
         "has_full_day": len(windows) > 1,
     }
 
@@ -12971,6 +13009,122 @@ def _filter_fechamento_report_to_scope(relatorio_fechamento: dict, windows: list
             "fechamento_parcial": _is_partial_scope_windows(normalized_windows),
             "totalizadores": totalizadores or dict(relatorio_fechamento.get("totalizadores") or {}),
             "escopo_horario_aplicado": list(normalized_windows),
+        }
+    )
+    return filtered
+
+
+def _zweb_fechamento_has_sales_outside_date(relatorio_fechamento: dict, data_br: str) -> bool:
+    target_date = str(data_br or "").strip()
+    if not target_date:
+        return False
+
+    dates: set[str] = set()
+    for item in list((relatorio_fechamento or {}).get("nfces") or []):
+        data_venda = str((item or {}).get("data_venda") or "").strip()
+        if data_venda:
+            dates.add(data_venda)
+
+    for report in dict((relatorio_fechamento or {}).get("relatorios_pagamento") or {}).values():
+        if not isinstance(report, dict):
+            continue
+        for item in list(report.get("itens_autorizados") or []):
+            data_venda = str((item or {}).get("data_venda") or "").strip()
+            if data_venda:
+                dates.add(data_venda)
+
+    return bool(dates and any(data_venda != target_date for data_venda in dates))
+
+
+def _filter_zweb_fechamento_to_sales_date(relatorio_fechamento: dict, data_br: str) -> dict:
+    target_date = str(data_br or "").strip()
+    if not target_date:
+        return relatorio_fechamento
+
+    filtered = dict(relatorio_fechamento or {})
+    nfces = [
+        dict(item)
+        for item in list((relatorio_fechamento or {}).get("nfces") or [])
+        if str(item.get("data_venda") or "").strip() == target_date
+    ]
+    relatorios_pagamento = {}
+    relevant_scope_keys: set[tuple[str, str]] = set()
+
+    for item in nfces:
+        key = _scope_window_key(
+            {
+                "abertura": item.get("scope_abertura"),
+                "fechamento": item.get("scope_fechamento"),
+            }
+        )
+        if any(key):
+            relevant_scope_keys.add(key)
+
+    for report_key, report in dict((relatorio_fechamento or {}).get("relatorios_pagamento") or {}).items():
+        if not isinstance(report, dict):
+            continue
+        report_copy = dict(report)
+        items = [
+            dict(item)
+            for item in list(report.get("itens_autorizados") or [])
+            if str(item.get("data_venda") or "").strip() == target_date
+        ]
+        for item in items:
+            key = _scope_window_key(
+                {
+                    "abertura": item.get("scope_abertura"),
+                    "fechamento": item.get("scope_fechamento"),
+                }
+            )
+            if any(key):
+                relevant_scope_keys.add(key)
+        report_copy["itens_autorizados"] = items
+        report_copy["quantidade_autorizados"] = len(items)
+        report_copy["quantidade_relatorio"] = len(items)
+        total = round(sum(float(item.get("valor_bruto", 0.0) or 0.0) for item in items), 2)
+        report_copy["total_autorizado"] = total
+        report_copy["total_relatorio"] = total
+        if total <= 0.009 and report_copy.get("empty_message"):
+            report_copy["mensagem"] = report_copy.get("empty_message")
+        relatorios_pagamento[report_key] = report_copy
+
+    original_windows = _normalize_scope_windows((relatorio_fechamento or {}).get("fechamento_janelas"))
+    if relevant_scope_keys:
+        fechamento_janelas = [
+            window
+            for window in original_windows
+            if _scope_window_key(window) in relevant_scope_keys
+        ]
+    else:
+        fechamento_janelas = []
+
+    totalizadores = {}
+    for report in relatorios_pagamento.values():
+        titulo = str(report.get("forma_pagamento") or report.get("summary_label") or "").strip()
+        if titulo:
+            totalizadores[titulo] = round(float(report.get("total_autorizado", 0.0) or 0.0), 2)
+
+    filtered.update(
+        {
+            "periodo": f"{target_date} - {target_date}",
+            "quantidade_nfce": len(nfces),
+            "total_nfce": round(sum(float(item.get("valor", 0.0) or 0.0) for item in nfces), 2),
+            "total_geral": round(sum(float(item.get("valor", 0.0) or 0.0) for item in nfces), 2),
+            "nfces": sorted(
+                nfces,
+                key=lambda item: (
+                    str(item.get("data_venda") or ""),
+                    str(item.get("numero") or ""),
+                ),
+            ),
+            "nfces_faltantes_sequencia": _find_missing_fiscal_numbers(
+                [_normalize_fiscal_number(item.get("numero", "")) for item in nfces]
+            ),
+            "relatorios_pagamento": relatorios_pagamento,
+            "fechamento_janelas": fechamento_janelas,
+            "fechamento_parcial": _is_partial_scope_windows(fechamento_janelas),
+            "totalizadores": totalizadores,
+            "fechamento_data_venda_filtrada": target_date,
         }
     )
     return filtered
@@ -13272,6 +13426,10 @@ def gerar_relatorios_caixa_eh_zweb(
     cancel_event: threading.Event | None = None,
     token_callback=None,
     force_refresh_payments: bool = False,
+    fechamento_data_inicio_br: str | None = None,
+    fechamento_data_fim_br: str | None = None,
+    filtrar_fechamento_por_data_venda: bool = False,
+    scope_mode: str | None = None,
 ) -> tuple[dict, dict, dict]:
     cancel_event = cancel_event or threading.Event()
 
@@ -13287,6 +13445,14 @@ def gerar_relatorios_caixa_eh_zweb(
         data_iso = datetime.strptime(str(data_br or "").strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
     except ValueError as exc:
         raise ValueError("A data do Caixa EH e invalida.") from exc
+
+    fechamento_data_inicio_br = str(fechamento_data_inicio_br or data_br or "").strip()
+    fechamento_data_fim_br = str(fechamento_data_fim_br or fechamento_data_inicio_br or "").strip()
+    try:
+        datetime.strptime(fechamento_data_inicio_br, "%d/%m/%Y")
+        datetime.strptime(fechamento_data_fim_br, "%d/%m/%Y")
+    except ValueError as exc:
+        raise ValueError("A data do Fechamento de caixa do Zweb e invalida.") from exc
 
     local_payment_reports = _find_eh_local_payment_reports(data_br)
     local_pix_pdf = local_payment_reports.get("pix")
@@ -13510,8 +13676,15 @@ def gerar_relatorios_caixa_eh_zweb(
                     timeout=30.0,
                 )
 
-            async def set_modal_period(session_id: str, from_selector: str, to_selector: str) -> None:
+            async def set_modal_period(
+                session_id: str,
+                from_selector: str,
+                to_selector: str,
+                start_date_br: str,
+                end_date_br: str | None = None,
+            ) -> None:
                 _check_cancelled()
+                end_date_br = end_date_br or start_date_br
                 preenchido = await eval_js(
                     session_id,
                     f"""
@@ -13526,8 +13699,8 @@ def gerar_relatorios_caixa_eh_zweb(
                             input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
                             return true;
                         }};
-                        const okFrom = setValue({from_selector!r}, {data_br!r});
-                        const okTo = setValue({to_selector!r}, {data_br!r});
+                        const okFrom = setValue({from_selector!r}, {start_date_br!r});
+                        const okTo = setValue({to_selector!r}, {end_date_br!r});
                         return okFrom && okTo;
                     }})()
                     """,
@@ -13652,14 +13825,20 @@ def gerar_relatorios_caixa_eh_zweb(
                     await open_route(session_id, credenciais["document_reports_url"], "PEDIDOS IMPORTADOS")
                     await click_report_button(session_id, "Pedidos importados")
                     await wait_modal(session_id, "Pedidos importados")
-                    await set_modal_period(session_id, "#from_date input.dp__input", "#to_date input.dp__input")
+                    await set_modal_period(session_id, "#from_date input.dp__input", "#to_date input.dp__input", data_br, data_br)
                     await ensure_html_format(session_id)
                 else:
                     _emit_pix_status(on_status, "Gerando Fechamento de caixa...")
                     await open_route(session_id, credenciais["finance_reports_url"], "FECHAMENTO DE CAIXA")
                     await click_report_button(session_id, "Fechamento de caixa")
                     await wait_modal(session_id, "Fechamento de caixa")
-                    await set_modal_period(session_id, "#fromDate input.dp__input", "#toDate input.dp__input")
+                    await set_modal_period(
+                        session_id,
+                        "#fromDate input.dp__input",
+                        "#toDate input.dp__input",
+                        fechamento_data_inicio_br,
+                        fechamento_data_fim_br,
+                    )
                     await ensure_html_format(session_id)
                     await prepare_fechamento_filters(session_id)
 
@@ -13934,6 +14113,24 @@ def gerar_relatorios_caixa_eh_zweb(
     relatorio["caminho"] = caminho_html_pedidos
     _emit_pix_status(on_status, "Processando Fechamento de caixa...")
     relatorio_fechamento = _analisar_html_fechamento_caixa_eh(html_fechamento, arquivo=os.path.basename(caminho_html_fechamento))
+    should_filter_sales_date = (
+        filtrar_fechamento_por_data_venda
+        or _zweb_fechamento_has_sales_outside_date(relatorio_fechamento, data_br)
+    )
+    if should_filter_sales_date:
+        relatorio_fechamento = _filter_zweb_fechamento_to_sales_date(relatorio_fechamento, data_br)
+        relatorio_fechamento["fechamento_data_consulta"] = (
+            f"{fechamento_data_inicio_br} - {fechamento_data_fim_br}"
+            if fechamento_data_inicio_br != fechamento_data_fim_br
+            else fechamento_data_inicio_br
+        )
+    requested_scope_windows = _scope_windows_for_mode(
+        relatorio_fechamento.get("fechamento_janelas"),
+        scope_mode,
+    )
+    if requested_scope_windows and _normalize_ascii_text(scope_mode or "") not in {"", "daily", "diario"}:
+        relatorio_fechamento = _filter_fechamento_report_to_scope(relatorio_fechamento, requested_scope_windows)
+        relatorio_fechamento["escopo_relatorio"] = _scope_mode_label(scope_mode)
     relatorio_fechamento["caminho"] = caminho_html_fechamento
     for report_pagamento in (relatorio_fechamento.get("relatorios_pagamento") or {}).values():
         if not isinstance(report_pagamento, dict):

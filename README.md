@@ -57,6 +57,7 @@ Desktop application for reconciling sales reports from two business flows:
 - EH cancelled coupons now remain visible for audit without counting toward `Pendências`, `Total Pendências`, or `Faltante` status.
 - Auto-generated EH reports such as downloaded Caixa/Azulzinha files and saved Zweb HTML exports are now deleted automatically when the app closes, so the workspace does not accumulate `_auto` files between sessions.
 - Temporary Azulzinha export debug files are cleaned automatically after the flow finishes.
+- Azulzinha HTML debug snapshots are now written only on failure paths; successful sales-area navigation no longer leaves `azulzinha_*.html` files in the workspace.
 - The main window now includes a cashier automation controller beside `Cancel`; while enabled, it runs the same-day morning flow at `13:30` and the same-day afternoon flow at `18:10`, and it still sends only the resulting `Fechamento de Caixa` reports straight to the Windows default printer.
 - The main window now uses an operations-dashboard layout with a grouped sidebar, status cards, a dedicated control strip, and a stacked content area for tables/graphs.
 - The dashboard headings, helper text, and status-card copy are now centered to keep the main flow visually guided.
@@ -70,6 +71,11 @@ Desktop application for reconciling sales reports from two business flows:
 - The `Workspace` status card now turns `Pronto` only when the main PDF table has data; loading the online spreadsheets alone no longer marks the workspace as ready.
 - Dashboard text labels such as `Hub operacional`, `Pendências`, `Workspace`, and status notes now render with transparent backgrounds so their text blocks blend into the cards instead of showing darker text rectangles.
 - The `Pendências` dashboard card now shows only `EH`, `MVA`, or `EH | MVA` as its detail text, without print counters or `awaiting` labels.
+- Report generation loading dialogs now use a timer-driven Qt event loop instead of manual `processEvents` polling, reducing UI reentrancy freezes while Caixa/EH/MVA reports are generated.
+- When the Horizonte next-day closing setting is enabled, `Caixa > EH` fetches the Zweb closing through the next day and asks for the desired scope before reconciliation.
+- EH Zweb closings that contain sales from more than one date are now filtered to the requested sale date before payment reconciliation, avoiding overnight values from yesterday in today's morning report.
+- When the MVA next-day closing setting is enabled, the report is filtered by the cashier opening date and the `Diário` / `Tarde` scope is chosen before Caixa/Azulzinha and Cielo payment validation.
+- The main page now has a report settings button with separate next-day closing checkboxes for Horizonte and MVA before generating cashier reports.
 - The main dashboard no longer spends vertical space on the automation helper sentence above `Cancelar`, and the whole right-side work area now scrolls like a page when `Resumo principal` / `Planilhas online` need more height.
 - The `Planilhas online` dashboard card now renders without its extra small heading, leaving more vertical space for the spreadsheet tables themselves.
 - Online spreadsheet tables now use an even smaller data font, shorten `Clientes Atendidos` to `Clientes`, keep their column headers hidden until data is loaded, and prioritize the `Vendedor` column width over the numeric columns, reducing name truncation without growing the card.
@@ -261,6 +267,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - A impressao automatica do caixa agora volta a sair em pagina A4 pelo mesmo caminho estavel do `QTextDocument.print_`, evitando o relatorio minusculo na impressao silenciosa.
   - Relatorios automaticos da EH, como downloads da Caixa/Azulzinha e HTMLs exportados do Zweb, agora sao excluidos automaticamente ao fechar o app, para que o workspace nao acumule arquivos `_auto` entre sessoes.
   - Os arquivos temporarios de debug da exportacao da Azulzinha sao limpos automaticamente ao final do fluxo.
+  - Os HTMLs de debug da Azulzinha agora so sao gravados em caminhos de falha; a navegacao bem-sucedida da area de vendas nao deixa mais `azulzinha_*.html` no workspace.
   - Relatorios automaticos da EH com nome `_auto` agora ficam disponiveis depois do parse para o usuario abrir, e apenas sobras parciais como `.crdownload` sao limpas.
   - Os downloads brutos da Caixa/Azulzinha agora primeiro caem em uma pasta temporaria isolada por empresa e so depois sao salvos como `..._eh_auto` ou `..._mva_auto`, evitando colisao entre arquivos da EH e da MVA que venham com o mesmo nome original.
   - Os relatorios automaticos locais da Caixa/Azulzinha agora ficam presos a sua propria empresa no reaproveitamento, entao a EH nunca reutiliza arquivos `_mva_auto` e a MVA nunca reutiliza arquivos `_eh_auto` de uma execucao anterior.
@@ -303,6 +310,11 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - O card `Modo atual` foi removido do painel principal do dashboard para simplificar a leitura e deixar apenas `Automação`, `Pendências` e `Workspace`.
 - O card `Pendências` agora deixa a linha de detalhe vazia quando o total está em `0`, exibindo observações abaixo do número apenas quando há algo pendente para informar.
 - O card `Pendências` agora mostra apenas `EH`, `MVA` ou `EH | MVA` no detalhe, sem contador de impressões nem texto `aguardando`.
+- Os diálogos de geração de relatórios agora usam o loop de eventos do Qt com `QTimer` em vez de polling manual com `processEvents`, reduzindo travadas por reentrância durante a geração Caixa/EH/MVA.
+- Quando a configuração de fechamento no dia seguinte da Horizonte está marcada, o `Caixa > EH` busca o fechamento do Zweb até o dia seguinte e pergunta o escopo desejado antes da conciliação.
+- Fechamentos `EH` do Zweb que misturam vendas de mais de uma data agora são filtrados pela data de venda solicitada antes da conciliação, evitando valores da madrugada/ontem no relatório da manhã de hoje.
+- Quando a configuração de fechamento no dia seguinte da MVA está marcada, o relatório é filtrado pela data de abertura do caixa e a escolha `Diário` / `Tarde` acontece antes da validação de pagamentos da Caixa/Azulzinha e Cielo.
+- A página principal agora tem um botão de configurações de relatório com caixas separadas de fechamento no dia seguinte para Horizonte e MVA antes de gerar o Caixa.
 - Quando a tabela principal entra em modo de edição, as linhas horizontais e verticais do grid agora ganham um vermelho suave para sinalizar visualmente que a edição está ativa.
 - No modo de edição da tabela principal, o destaque da linha agora segue o mouse e o clique no mesmo comportamento visual, mantendo apenas uma linha iluminada por vez na posição onde o cursor parou.
 - Os cards de topo do dashboard (`Automação`, `Pendências` e `Workspace`) agora usam largura uniforme mais comprimida e deixam sobra lateral na linha, em vez de se esticarem até as bordas do painel.

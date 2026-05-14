@@ -9,6 +9,7 @@ from utils import (
     _build_card_reports_from_cielo,
     _classify_caixa_document,
     _find_eh_local_payment_reports,
+    _filter_zweb_fechamento_to_sales_date,
     _is_eh_counter_client,
     _merge_card_machine_report,
     _mva_caixa_reports_refresh_needs,
@@ -17,6 +18,10 @@ from utils import (
     _normalize_fiscal_number,
     _refresh_mva_caixa_reports_if_needed,
     _wait_for_cielo_downloaded_report,
+    _zweb_fechamento_has_sales_outside_date,
+    analisar_pdf_fechamento_caixa_mva_clipp,
+    aplicar_escopo_relatorio_caixa,
+    describe_closing_scope,
 )
 
 def test_parse_number():
@@ -387,6 +392,243 @@ def test_mva_refresh_retries_zero_pix_without_cielo(monkeypatch):
     assert avisos == []
     assert calls == [{"data_br": "08/05/2026", "need_pix": True, "need_cartoes": False}]
     assert result["relatorios_pagamento"]["pix_caixa"]["total_autorizado"] == 250.0
+
+
+def test_mva_clipp_scope_is_applied_before_payment_refresh(monkeypatch):
+    texto = """
+    MVA COMERCIO
+    FECHAMENTO DE CAIXA
+    DOCUMENTOS GERADOS
+    PERIODO ANALISADO, DE 06/05/2026 ATE 06/05/2026
+    1 - Abertura : 06/05/2026 08:00:00 - Fechamento : 06/05/2026 13:00:00
+    2 - Abertura : 06/05/2026 13:00:01 - Fechamento : 06/05/2026 18:00:00
+    CARTAO DE DEBITO: 1100,00
+    PAGAMENTO INSTANTANEO (PIX): 0,00
+    000001 NFCE 09:00:00 CLIENTE A CARTAO DE DEBITO 1000,00
+    000002 NFCE 14:00:00 CLIENTE B CARTAO DE DEBITO 100,00
+    """
+    download_calls = []
+
+    def fake_find_reports(data_br, **kwargs):
+        return {"pix": "pix.csv", "cartoes": "card.xlsx", "avisos": []}
+
+    def fake_integrate(report, data_br, **kwargs):
+        assert report["relatorios_pagamento"]["cartao_debito"]["total_autorizado"] == 100.0
+        report = dict(report)
+        relatorios = dict(report.get("relatorios_pagamento") or {})
+        relatorios["cartao_debito_caixa"] = {"total_autorizado": 100.0}
+        report["relatorios_pagamento"] = relatorios
+        return report, None, []
+
+    def fail_download(*args, **kwargs):
+        download_calls.append((args, kwargs))
+        raise AssertionError("payment download should not run after scoped totals match")
+
+    monkeypatch.setattr(utils, "_read_pdf_text", lambda _path: texto)
+    monkeypatch.setattr(utils, "_find_eh_local_payment_reports", fake_find_reports)
+    monkeypatch.setattr(utils, "_integrate_local_payment_reports", fake_integrate)
+    monkeypatch.setattr(utils, "_find_local_cielo_card_report", lambda *args, **kwargs: {"cartoes": None, "avisos": []})
+    monkeypatch.setattr(utils, "baixar_relatorios_caixa_eh_azulzinha", fail_download)
+    monkeypatch.setattr(utils, "baixar_relatorio_cielo_mva", fail_download)
+
+    report = analisar_pdf_fechamento_caixa_mva_clipp(
+        "fechamento.pdf",
+        auto_download_missing=True,
+        scope_mode="afternoon",
+    )
+
+    assert report["relatorios_pagamento"]["cartao_debito"]["total_autorizado"] == 100.0
+    assert report["relatorios_pagamento"]["cartao_debito_caixa"]["total_autorizado"] == 100.0
+    assert _mva_caixa_reports_refresh_needs(report)["need_cartoes"] is False
+    assert describe_closing_scope(report)["has_afternoon_only"] is True
+    assert download_calls == []
+
+
+def test_mva_next_day_closing_filter_keeps_target_opening_date(monkeypatch):
+    texto = """
+    MVA COMERCIO
+    FECHAMENTO DE CAIXA
+    DOCUMENTOS GERADOS
+    PERIODO ANALISADO, DE 14/05/2026 ATE 14/05/2026
+    1 - Abertura : 13/05/2026 13:27:54 - Fechamento : 14/05/2026 08:00:30
+    2 - Abertura : 14/05/2026 08:02:09 - Fechamento : 14/05/2026 13:26:29
+    CARTAO DE DEBITO: 300,00
+    PAGAMENTO INSTANTANEO (PIX): 0,00
+    000001 NFCE 07:50:00 CLIENTE A CARTAO DE DEBITO 100,00
+    000002 NFCE 09:00:00 CLIENTE B CARTAO DE DEBITO 200,00
+    """
+    monkeypatch.setattr(utils, "_read_pdf_text", lambda _path: texto)
+
+    report = analisar_pdf_fechamento_caixa_mva_clipp(
+        "fechamento.pdf",
+        auto_download_missing=False,
+        filter_opening_date_br="14/05/2026",
+    )
+
+    assert report["periodo"] == "14/05/2026 - 14/05/2026"
+    assert report["quantidade_nfce"] == 1
+    assert report["total_nfce"] == 200.0
+    assert report["fechamento_janelas"] == [
+        {"abertura": "14/05/2026 08:02:09", "fechamento": "14/05/2026 13:26:29"}
+    ]
+    assert report["relatorios_pagamento"]["cartao_debito"]["total_autorizado"] == 200.0
+
+
+def test_eh_next_day_closing_filter_keeps_target_sales_and_afternoon_scope():
+    fechamento = {
+        "periodo": "13/05/2026 - 14/05/2026",
+        "fechamento_janelas": [
+            {"abertura": "13/05/2026 08:00:00", "fechamento": "13/05/2026 12:00:00"},
+            {"abertura": "13/05/2026 18:00:00", "fechamento": "14/05/2026 08:00:00"},
+            {"abertura": "14/05/2026 08:00:00", "fechamento": "14/05/2026 12:00:00"},
+        ],
+        "nfces": [
+            {
+                "numero": "000001",
+                "data_venda": "13/05/2026",
+                "valor": 10.0,
+                "scope_abertura": "13/05/2026 08:00:00",
+                "scope_fechamento": "13/05/2026 12:00:00",
+            },
+            {
+                "numero": "000002",
+                "data_venda": "13/05/2026",
+                "valor": 20.0,
+                "scope_abertura": "13/05/2026 18:00:00",
+                "scope_fechamento": "14/05/2026 08:00:00",
+            },
+            {
+                "numero": "000003",
+                "data_venda": "14/05/2026",
+                "valor": 30.0,
+                "scope_abertura": "14/05/2026 08:00:00",
+                "scope_fechamento": "14/05/2026 12:00:00",
+            },
+        ],
+        "relatorios_pagamento": {
+            "pix_fechamento": {
+                "forma_pagamento": "PIX",
+                "summary_label": "PIX",
+                "itens_autorizados": [
+                    {
+                        "numero": "000001",
+                        "data_venda": "13/05/2026",
+                        "valor_bruto": 10.0,
+                        "scope_abertura": "13/05/2026 08:00:00",
+                        "scope_fechamento": "13/05/2026 12:00:00",
+                    },
+                    {
+                        "numero": "000002",
+                        "data_venda": "13/05/2026",
+                        "valor_bruto": 20.0,
+                        "scope_abertura": "13/05/2026 18:00:00",
+                        "scope_fechamento": "14/05/2026 08:00:00",
+                    },
+                    {
+                        "numero": "000003",
+                        "data_venda": "14/05/2026",
+                        "valor_bruto": 30.0,
+                        "scope_abertura": "14/05/2026 08:00:00",
+                        "scope_fechamento": "14/05/2026 12:00:00",
+                    },
+                ],
+            }
+        },
+    }
+    relatorio_caixa = {
+        "caixa_modelo": "EH",
+        "periodo": "13/05/2026 - 13/05/2026",
+        "itens_caixa": [
+            {"pedido": "000001", "valor": 10.0, "cliente": "BALCAO"},
+            {"pedido": "000002", "valor": 20.0, "cliente": "BALCAO"},
+            {"pedido": "000003", "valor": 30.0, "cliente": "BALCAO"},
+        ],
+        "itens_excluidos": [],
+    }
+
+    filtrado = _filter_zweb_fechamento_to_sales_date(fechamento, "13/05/2026")
+
+    assert filtrado["periodo"] == "13/05/2026 - 13/05/2026"
+    assert [item["numero"] for item in filtrado["nfces"]] == ["000001", "000002"]
+    assert len(filtrado["fechamento_janelas"]) == 2
+    assert describe_closing_scope(filtrado)["has_full_day"] is True
+    assert filtrado["relatorios_pagamento"]["pix_fechamento"]["total_autorizado"] == 30.0
+
+    relatorio_tarde, fechamento_tarde, _ = aplicar_escopo_relatorio_caixa(
+        relatorio_caixa,
+        filtrado,
+        None,
+        scope_mode="afternoon",
+    )
+
+    assert [item["pedido"] for item in relatorio_tarde["itens_caixa"]] == ["000002"]
+    assert [item["numero"] for item in fechamento_tarde["nfces"]] == ["000002"]
+
+    somente_tarde = _filter_zweb_fechamento_to_sales_date(
+        {**fechamento, "nfces": [fechamento["nfces"][1]], "relatorios_pagamento": {}},
+        "13/05/2026",
+    )
+    assert describe_closing_scope(somente_tarde)["has_afternoon_only"] is True
+
+
+def test_eh_same_day_closing_filter_drops_previous_day_overnight_values():
+    fechamento = {
+        "periodo": "14/05/2026 - 14/05/2026",
+        "fechamento_janelas": [
+            {"abertura": "13/05/2026 13:27:54", "fechamento": "14/05/2026 08:00:30"},
+            {"abertura": "14/05/2026 08:02:09", "fechamento": "14/05/2026 13:26:29"},
+        ],
+        "nfces": [
+            {
+                "numero": "000001",
+                "data_venda": "13/05/2026",
+                "valor": 100.0,
+                "scope_abertura": "13/05/2026 13:27:54",
+                "scope_fechamento": "14/05/2026 08:00:30",
+            },
+            {
+                "numero": "000002",
+                "data_venda": "14/05/2026",
+                "valor": 200.0,
+                "scope_abertura": "14/05/2026 08:02:09",
+                "scope_fechamento": "14/05/2026 13:26:29",
+            },
+        ],
+        "relatorios_pagamento": {
+            "pix_fechamento": {
+                "forma_pagamento": "PIX",
+                "summary_label": "PIX",
+                "itens_autorizados": [
+                    {
+                        "numero": "000001",
+                        "data_venda": "13/05/2026",
+                        "valor_bruto": 100.0,
+                        "scope_abertura": "13/05/2026 13:27:54",
+                        "scope_fechamento": "14/05/2026 08:00:30",
+                    },
+                    {
+                        "numero": "000002",
+                        "data_venda": "14/05/2026",
+                        "valor_bruto": 200.0,
+                        "scope_abertura": "14/05/2026 08:02:09",
+                        "scope_fechamento": "14/05/2026 13:26:29",
+                    },
+                ],
+            }
+        },
+    }
+
+    assert _zweb_fechamento_has_sales_outside_date(fechamento, "14/05/2026") is True
+
+    filtrado = _filter_zweb_fechamento_to_sales_date(fechamento, "14/05/2026")
+
+    assert [item["numero"] for item in filtrado["nfces"]] == ["000002"]
+    assert filtrado["total_nfce"] == 200.0
+    assert filtrado["relatorios_pagamento"]["pix_fechamento"]["total_autorizado"] == 200.0
+    assert filtrado["fechamento_janelas"] == [
+        {"abertura": "14/05/2026 08:02:09", "fechamento": "14/05/2026 13:26:29"}
+    ]
+    assert describe_closing_scope(filtrado)["has_morning_only"] is True
 
 
 def test_mva_clipp_cancelled_cash_coupons_are_visible(monkeypatch):

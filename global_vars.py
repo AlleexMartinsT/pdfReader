@@ -1,6 +1,6 @@
 from library import re
 
-APP_VERSION = "3.0.2"
+APP_VERSION = "3.0.3"
 GITHUB_REPO = "AlleexMartinsT/pdfReader"
 MINHAS_NOTAS_LOGIN = "mvacomercio@gmail.com"
 MINHAS_NOTAS_PASSWORD = "Mva@0134"

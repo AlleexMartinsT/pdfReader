@@ -105,6 +105,7 @@ Desktop application for reconciling sales reports from two business flows:
 - EH and MVA bank reconciliation now expose canceled coupons in a dedicated `Cupons Cancelados` section instead of mixing them into `CF sem Transação Bancária`.
 - Canceled coupons now leave the EH/MVA payment-matching pool before value-only bank reconciliation, so same-value active coupons keep priority and the canceled CF goes to `Cupons Cancelados`.
 - EH partial/daily closing generation no longer crashes when a canceled coupon is promoted into the dedicated `Cupons Cancelados` section during bank reconciliation.
+- EH now also shows canceled NFC-e found only in `Fiscal > NFC-e`, and scope filtering keeps the canceled-coupon count/value instead of resetting it to zero.
 - Runs `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
 - MVA closing screens now mirror the EH sectioned `Fechamento de Caixa` structure in the app and in A4 printing, including the same reconciliation sections and observations block.
 - When MVA uses the newer Clipp closing file, the app now also attempts to auto-download missing Caixa/Azulzinha PIX and card reports with the local MVA credentials before reconciling payments.
@@ -264,6 +265,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - A conciliacao bancaria da EH e da MVA agora tambem separa cupons cancelados em uma secao dedicada `Cupons Cancelados`, em vez de misturar esses CFs em `CF sem Transacao Bancaria`.
 - Os cupons cancelados da EH continuam visíveis para auditoria, mas não entram em `Pendências`, `Total Pendências` nem no status `Faltante`.
 - A geracao do fechamento parcial/diario da EH nao quebra mais quando um cupom cancelado e promovido para a secao dedicada `Cupons Cancelados` durante a conciliacao bancaria.
+- A EH agora tambem exibe NFC-e cancelada encontrada apenas em `Fiscal > NFC-e`, e o filtro de escopo mantem a quantidade/valor de cupons cancelados em vez de zerar o resumo.
 - A impressao automatica do caixa agora volta a sair em pagina A4 pelo mesmo caminho estavel do `QTextDocument.print_`, evitando o relatorio minusculo na impressao silenciosa.
   - Relatorios automaticos da EH, como downloads da Caixa/Azulzinha e HTMLs exportados do Zweb, agora sao excluidos automaticamente ao fechar o app, para que o workspace nao acumule arquivos `_auto` entre sessoes.
   - Os arquivos temporarios de debug da exportacao da Azulzinha sao limpos automaticamente ao final do fluxo.

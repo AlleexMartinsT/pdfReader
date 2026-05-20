@@ -631,6 +631,81 @@ def test_eh_same_day_closing_filter_drops_previous_day_overnight_values():
     assert describe_closing_scope(filtrado)["has_morning_only"] is True
 
 
+def test_eh_cancelled_fiscal_coupons_absent_from_orders_are_visible():
+    relatorio = {
+        "caixa_modelo": "EH",
+        "periodo": "14/05/2026 - 14/05/2026",
+        "pedidos_caixa": 2,
+        "pedidos_excluidos": 0,
+        "pedidos_excluidos_cancelados": 0,
+        "total_documento": 150.0,
+        "total_excluido": 0.0,
+        "total_excluido_cancelados": 0.0,
+        "total_caixa": 150.0,
+        "itens_caixa": [
+            {"pedido": "000103230", "cliente": "CLIENTE BALCÃO", "documento": "NFC-e", "valor": 50.0},
+            {"pedido": "000103244", "cliente": "CLIENTE BALCÃO", "documento": "NFC-e", "valor": 100.0},
+        ],
+        "itens_excluidos": [],
+    }
+    fiscal_status_map = {
+        "000103230": {"cancelada": True, "valor": 50.0},
+        "000103231": {"cancelada": True, "valor": 12.5},
+        "000103244": {"cancelada": False, "valor": 100.0},
+    }
+
+    filtrado = utils._aplicar_filtro_canceladas_pedidos_eh(relatorio, fiscal_status_map)
+
+    assert filtrado["pedidos_caixa"] == 1
+    assert filtrado["pedidos_excluidos"] == 2
+    assert filtrado["pedidos_excluidos_cancelados"] == 2
+    assert filtrado["total_caixa"] == 100.0
+    assert filtrado["total_excluido"] == 62.5
+    assert filtrado["total_excluido_cancelados"] == 62.5
+    assert filtrado["total_documento"] == 162.5
+    assert [item["pedido"] for item in filtrado["itens_caixa"]] == ["000103244"]
+    assert {item["pedido"] for item in filtrado["itens_excluidos"]} == {"000103230", "000103231"}
+
+
+def test_eh_scope_filter_recalculates_cancelled_coupon_totals():
+    window = {"abertura": "14/05/2026 08:02:09", "fechamento": "14/05/2026 13:26:29"}
+    relatorio_caixa = {
+        "caixa_modelo": "EH",
+        "periodo": "14/05/2026 - 14/05/2026",
+        "itens_caixa": [
+            {"pedido": "000103231", "cliente": "CLIENTE BALCÃO", "valor": 100.0},
+        ],
+        "itens_excluidos": [
+            {
+                "pedido": "000103230",
+                "cliente": "CLIENTE BALCÃO",
+                "documento": "NFC-e cancelada",
+                "motivo": "Cupom cancelado",
+                "valor": 50.0,
+            },
+            {
+                "pedido": "000103260",
+                "cliente": "CLIENTE BALCÃO",
+                "documento": "NFC-e cancelada",
+                "motivo": "Cupom cancelado",
+                "valor": 10.0,
+            },
+        ],
+    }
+    relatorio_fechamento = {
+        "nfces": [
+            {"numero": "000103229", "scope_abertura": window["abertura"], "scope_fechamento": window["fechamento"]},
+            {"numero": "000103231", "scope_abertura": window["abertura"], "scope_fechamento": window["fechamento"]},
+        ],
+    }
+
+    filtrado = utils._filter_eh_caixa_report_to_scope(relatorio_caixa, relatorio_fechamento, [window])
+
+    assert filtrado["pedidos_excluidos_cancelados"] == 1
+    assert filtrado["total_excluido_cancelados"] == 50.0
+    assert [item["pedido"] for item in filtrado["itens_excluidos"]] == ["000103230"]
+
+
 def test_mva_clipp_cancelled_cash_coupons_are_visible(monkeypatch):
     status_map = {
         "000388060": {

@@ -767,8 +767,14 @@ def _aplicar_filtro_canceladas_pedidos_eh(relatorio: dict, fiscal_status_map: di
 
     itens_caixa_filtrados = []
     itens_excluidos = [{**item} for item in relatorio.get("itens_excluidos", [])]
+    numeros_presentes = {
+        _normalize_fiscal_number(item.get("pedido", ""))
+        for item in list(relatorio.get("itens_caixa") or []) + itens_excluidos
+    }
     cancelados_count = 0
     cancelados_valor = 0.0
+    cancelados_presentes_valor = 0.0
+    cancelados_ausentes_valor = 0.0
 
     for item in relatorio.get("itens_caixa", []):
         numero = _normalize_fiscal_number(item.get("pedido", ""))
@@ -777,6 +783,7 @@ def _aplicar_filtro_canceladas_pedidos_eh(relatorio: dict, fiscal_status_map: di
             valor = round(float(item.get("valor", 0.0)), 2)
             cancelados_count += 1
             cancelados_valor = round(cancelados_valor + valor, 2)
+            cancelados_presentes_valor = round(cancelados_presentes_valor + valor, 2)
             itens_excluidos.append(
                 {
                     "pedido": item.get("pedido", ""),
@@ -789,11 +796,33 @@ def _aplicar_filtro_canceladas_pedidos_eh(relatorio: dict, fiscal_status_map: di
             continue
         itens_caixa_filtrados.append({**item})
 
+    for numero, fiscal_info in sorted((fiscal_status_map or {}).items()):
+        numero_normalizado = _normalize_fiscal_number(numero)
+        if not numero_normalizado or numero_normalizado in numeros_presentes:
+            continue
+        if not (fiscal_info or {}).get("cancelada"):
+            continue
+        valor = round(float((fiscal_info or {}).get("valor", 0.0) or 0.0), 2)
+        cancelados_count += 1
+        cancelados_valor = round(cancelados_valor + valor, 2)
+        cancelados_ausentes_valor = round(cancelados_ausentes_valor + valor, 2)
+        itens_excluidos.append(
+            {
+                "pedido": numero_normalizado,
+                "cliente": "CLIENTE BALCÃO",
+                "documento": "NFC-e cancelada",
+                "motivo": "Cupom cancelado",
+                "valor": valor,
+            }
+        )
+        numeros_presentes.add(numero_normalizado)
+
     if not cancelados_count:
         return relatorio
 
     total_excluido = round(float(relatorio.get("total_excluido", 0.0)) + cancelados_valor, 2)
-    total_caixa = round(float(relatorio.get("total_documento", 0.0)) - total_excluido, 2)
+    total_caixa = round(float(relatorio.get("total_caixa", 0.0)) - cancelados_presentes_valor, 2)
+    total_documento = round(float(relatorio.get("total_documento", 0.0)) + cancelados_ausentes_valor, 2)
 
     return {
         **relatorio,
@@ -805,6 +834,7 @@ def _aplicar_filtro_canceladas_pedidos_eh(relatorio: dict, fiscal_status_map: di
             float(relatorio.get("total_excluido_cancelados", 0.0)) + cancelados_valor,
             2,
         ),
+        "total_documento": total_documento,
         "total_caixa": total_caixa,
         "itens_caixa": sorted(
             itens_caixa_filtrados,
@@ -12864,6 +12894,12 @@ def _derive_scope_numbers(items: list[dict]) -> set[str]:
     return numbers
 
 
+def _is_eh_cancelled_excluded_item(item: dict) -> bool:
+    motivo = corrigir_texto(str((item or {}).get("motivo", ""))).casefold()
+    documento = _normalize_caixa_client((item or {}).get("documento", ""))
+    return "cupom cancelado" in motivo or "CANCELADA" in documento
+
+
 def _filter_eh_caixa_report_to_scope(relatorio_caixa: dict, relatorio_fechamento: dict, windows: list[dict]) -> dict:
     filtered = dict(relatorio_caixa or {})
     scoped_nfces = list(relatorio_fechamento.get("nfces") or [])
@@ -12909,6 +12945,8 @@ def _filter_eh_caixa_report_to_scope(relatorio_caixa: dict, relatorio_fechamento
     )
     total_caixa = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_caixa), 2)
     total_excluido = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_excluidos), 2)
+    itens_cancelados = [item for item in itens_excluidos if _is_eh_cancelled_excluded_item(item)]
+    total_cancelados = round(sum(float(item.get("valor", 0.0) or 0.0) for item in itens_cancelados), 2)
 
     filtered.update(
         {
@@ -12918,8 +12956,10 @@ def _filter_eh_caixa_report_to_scope(relatorio_caixa: dict, relatorio_fechamento
             "pedidos_excluidos": len(itens_excluidos),
             "pedidos_excluidos_cliente": pedidos_excluidos_cliente,
             "pedidos_excluidos_documento": pedidos_excluidos_documento,
+            "pedidos_excluidos_cancelados": len(itens_cancelados),
             "total_documento": round(total_caixa + total_excluido, 2),
             "total_excluido": total_excluido,
+            "total_excluido_cancelados": total_cancelados,
             "total_caixa": total_caixa,
             "itens_caixa": sorted(
                 itens_caixa,

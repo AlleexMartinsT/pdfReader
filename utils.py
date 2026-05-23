@@ -383,11 +383,15 @@ def _poll_queue(root, tree, progress_var, progress_bar, label_files_var=None, pa
 def _project_base_dir() -> str:
     import sys
 
-    candidates = [
-        Path(r"D:\pdfReader"),
-    ]
     if getattr(sys, "frozen", False):
-        candidates.append(Path(os.path.dirname(os.path.abspath(sys.executable))))
+        candidates = [
+            Path(os.path.dirname(os.path.abspath(sys.executable))),
+            Path(r"D:\pdfReader"),
+        ]
+    else:
+        candidates = [
+            Path(r"D:\pdfReader"),
+        ]
     candidates.append(Path(os.path.dirname(os.path.abspath(__file__))))
 
     for candidate in candidates:

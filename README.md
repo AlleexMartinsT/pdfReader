@@ -106,6 +106,8 @@ Desktop application for reconciling sales reports from two business flows:
 - Canceled coupons now leave the EH/MVA payment-matching pool before value-only bank reconciliation, so same-value active coupons keep priority and the canceled CF goes to `Cupons Cancelados`.
 - EH partial/daily closing generation no longer crashes when a canceled coupon is promoted into the dedicated `Cupons Cancelados` section during bank reconciliation.
 - EH now also shows canceled NFC-e found only in `Fiscal > NFC-e`, and scope filtering keeps the canceled-coupon count/value instead of resetting it to zero.
+- In the packaged app, runtime credentials and Gmail OAuth files now resolve from the executable folder before any local development checkout.
+- The local `credenciais.txt` now carries the Zweb, Cielo, and Caixa/Azulzinha credentials needed by the packaged app.
 - Runs `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
 - MVA closing screens now mirror the EH sectioned `Fechamento de Caixa` structure in the app and in A4 printing, including the same reconciliation sections and observations block.
 - When MVA uses the newer Clipp closing file, the app now also attempts to auto-download missing Caixa/Azulzinha PIX and card reports with the local MVA credentials before reconciling payments.

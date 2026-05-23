@@ -12,6 +12,7 @@ from utils import (
     _filter_zweb_fechamento_to_sales_date,
     _is_eh_counter_client,
     _merge_card_machine_report,
+    _project_base_dir,
     _mva_caixa_reports_refresh_needs,
     _mva_cielo_pending_card_count,
     _mva_cielo_needed_card_keys,
@@ -63,6 +64,18 @@ def test_active_report_dir_prefers_frozen_executable_folder(tmp_path, monkeypatc
     monkeypatch.setattr("sys.executable", str(exe_path))
 
     assert _active_report_dir() == str(app_dir)
+
+
+def test_project_base_dir_prefers_frozen_executable_folder(tmp_path, monkeypatch):
+    app_dir = tmp_path / "dist" / "Relatorio de Clientes"
+    app_dir.mkdir(parents=True)
+    exe_path = app_dir / "Relatorio de Clientes.exe"
+    exe_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("sys.executable", str(exe_path))
+
+    assert _project_base_dir() == str(app_dir)
 
 
 def test_build_card_reports_from_cielo_csv(tmp_path):

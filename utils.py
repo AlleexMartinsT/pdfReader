@@ -1245,6 +1245,62 @@ def _extract_local_report_date_br(text: str) -> str | None:
     return None
 
 
+def _path_name_contains_br_date(path_like: str | Path, data_br: str) -> bool:
+    if not data_br:
+        return False
+    date_tokens = {
+        data_br,
+        data_br.replace("/", "-"),
+        data_br.replace("/", ""),
+    }
+    name_norm = _normalize_ascii_text(Path(path_like).name)
+    return any(_normalize_ascii_text(token) in name_norm for token in date_tokens)
+
+
+def _caixa_rows_include_date(rows: list[dict[str, str]], data_br: str) -> bool:
+    if not data_br:
+        return True
+    saw_any_date = False
+    for row in rows:
+        normalized_row = {_normalize_ascii_text(key): str(value or "").strip() for key, value in row.items()}
+        data_raw = normalized_row.get("data da venda", "")
+        match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", _normalize_ascii_text(data_raw))
+        if not match:
+            continue
+        saw_any_date = True
+        if match.group(1) == data_br:
+            return True
+    return not saw_any_date
+
+
+def _caixa_xlsx_rows_have_sales_headers(rows: list[dict[str, str]]) -> bool:
+    for row in rows:
+        keys = {_normalize_ascii_text(key) for key in row.keys()}
+        if "data da venda" in keys and "valor bruto" in keys and "status" in keys:
+            return True
+    return False
+
+
+def _looks_like_caixa_pix_xlsx(path_like: str | Path, data_br: str, text: str = "") -> bool:
+    path = Path(path_like)
+    text_norm = _normalize_ascii_text(text)
+    name_suggests_pix = "pix" in _normalize_ascii_text(path.name)
+    title_suggests_pix = "relatorio de vendas pix" in text_norm
+    if not name_suggests_pix and not title_suggests_pix:
+        return False
+    if title_suggests_pix and "valor total de vendas finalizadas" in text_norm:
+        return True
+    try:
+        rows = _collect_card_rows_from_caixa_xlsx(str(path))
+    except Exception:
+        return False
+    if not rows or not _caixa_xlsx_rows_have_sales_headers(rows):
+        return False
+    if _path_name_contains_br_date(path, data_br):
+        return True
+    return _caixa_rows_include_date(rows, data_br)
+
+
 def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict[str, object]:
     pix_csv_matches: list[Path] = []
     pix_xlsx_matches: list[Path] = []
@@ -1278,7 +1334,7 @@ def _find_eh_local_payment_reports(data_br: str, *, company: str = "EH") -> dict
                 normalized_path = Path(_finalize_local_report_path(path))
                 if effective_suffix == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm:
                     report_kind = "pix_csv"
-                elif effective_suffix == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm:
+                elif effective_suffix == ".xlsx" and _looks_like_caixa_pix_xlsx(normalized_path, data_br, text):
                     report_kind = "pix_xlsx"
                 elif "extrato pix" in text_norm:
                     report_kind = "pix_pdf"
@@ -1557,6 +1613,79 @@ def _gmail_oauth_token_path() -> Path:
     return Path(_runtime_user_dir()) / "gmail_oauth_token.json"
 
 
+def get_gmail_oauth_status() -> dict[str, object]:
+    client_path = Path(_runtime_user_dir()) / "gmail_oauth_client.json"
+    token_path = _gmail_oauth_token_path()
+    if not _load_gmail_oauth_client_credentials():
+        return {
+            "ok": False,
+            "needs_auth": True,
+            "status": "missing_client",
+            "title": "Gmail não configurado",
+            "message": "O arquivo gmail_oauth_client.json não foi encontrado ou está inválido.",
+            "client_path": str(client_path),
+            "token_path": str(token_path),
+        }
+    if not token_path.is_file():
+        return {
+            "ok": False,
+            "needs_auth": True,
+            "status": "missing_token",
+            "title": "Gmail não autenticado",
+            "message": "O arquivo gmail_oauth_token.json ainda não existe. Autorize o Gmail antes de gerar relatórios que precisam ler tokens por e-mail.",
+            "client_path": str(client_path),
+            "token_path": str(token_path),
+        }
+
+    try:
+        from google.oauth2.credentials import Credentials
+
+        creds = Credentials.from_authorized_user_file(
+            str(token_path),
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "needs_auth": True,
+            "status": "invalid_token",
+            "title": "Gmail precisa de nova autenticação",
+            "message": f"O token OAuth do Gmail está inválido: {exc}",
+            "client_path": str(client_path),
+            "token_path": str(token_path),
+        }
+
+    if creds.valid:
+        return {
+            "ok": True,
+            "needs_auth": False,
+            "status": "valid",
+            "title": "Gmail autenticado",
+            "message": "O token OAuth do Gmail está válido.",
+            "client_path": str(client_path),
+            "token_path": str(token_path),
+        }
+    if creds.expired and getattr(creds, "refresh_token", None):
+        return {
+            "ok": True,
+            "needs_auth": False,
+            "status": "refreshable",
+            "title": "Gmail autenticado",
+            "message": "O token OAuth do Gmail expirou, mas pode ser renovado automaticamente.",
+            "client_path": str(client_path),
+            "token_path": str(token_path),
+        }
+    return {
+        "ok": False,
+        "needs_auth": True,
+        "status": "needs_auth",
+        "title": "Gmail precisa de nova autenticação",
+        "message": "O token OAuth do Gmail expirou ou não possui permissão de renovação automática.",
+        "client_path": str(client_path),
+        "token_path": str(token_path),
+    }
+
+
 def _load_gmail_oauth_client_credentials() -> tuple[str, str] | None:
     client_id = str(GMAIL_OAUTH_CLIENT_ID or "").strip()
     client_secret = str(GMAIL_OAUTH_CLIENT_SECRET or "").strip()
@@ -1588,7 +1717,69 @@ def _load_gmail_oauth_client_credentials() -> tuple[str, str] | None:
     return None
 
 
-def _get_gmail_api_credentials(on_status=None):
+def _raise_if_oauth_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("__cancelled__")
+
+
+def _sleep_with_cancel(seconds: float, cancel_event: threading.Event | None = None) -> None:
+    deadline = time.time() + max(0.0, float(seconds or 0.0))
+    while time.time() < deadline:
+        _raise_if_oauth_cancelled(cancel_event)
+        time.sleep(min(0.25, max(0.0, deadline - time.time())))
+    _raise_if_oauth_cancelled(cancel_event)
+
+
+def _run_gmail_oauth_local_server(flow, *, on_status=None, cancel_event: threading.Event | None = None):
+    import webbrowser
+    import wsgiref.simple_server
+
+    from google_auth_oauthlib.flow import _RedirectWSGIApp, _WSGIRequestHandler
+
+    _raise_if_oauth_cancelled(cancel_event)
+
+    success_message = "Autorizacao do Gmail concluida. Pode voltar ao aplicativo."
+    wsgi_app = _RedirectWSGIApp(success_message)
+    wsgiref.simple_server.WSGIServer.allow_reuse_address = False
+    local_server = wsgiref.simple_server.make_server(
+        "127.0.0.1",
+        0,
+        wsgi_app,
+        handler_class=_WSGIRequestHandler,
+    )
+
+    try:
+        flow.redirect_uri = f"http://127.0.0.1:{local_server.server_port}/"
+        auth_url, _ = flow.authorization_url()
+        try:
+            webbrowser.get().open(auth_url, new=1, autoraise=True)
+            _emit_pix_status(
+                on_status,
+                "Se o Gmail abrir no perfil errado, copie o link de autorizacao para o perfil correto ou clique em Cancelar.",
+            )
+        except Exception:
+            _emit_pix_status(on_status, "Nao foi possivel abrir o navegador automaticamente. Copie o link de autorizacao abaixo:")
+            _emit_pix_status(on_status, auth_url)
+
+        local_server.timeout = 0.5
+        deadline = time.time() + 180.0
+        while not wsgi_app.last_request_uri:
+            _raise_if_oauth_cancelled(cancel_event)
+            if time.time() >= deadline:
+                raise TimeoutError("Autorizacao do Gmail expirou. Tente novamente e selecione o perfil correto.")
+            local_server.handle_request()
+
+        _raise_if_oauth_cancelled(cancel_event)
+        authorization_response = wsgi_app.last_request_uri.replace("http", "https", 1)
+        flow.fetch_token(authorization_response=authorization_response)
+        _raise_if_oauth_cancelled(cancel_event)
+        return flow.credentials
+    finally:
+        local_server.server_close()
+
+
+def _get_gmail_api_credentials(on_status=None, cancel_event: threading.Event | None = None):
+    _raise_if_oauth_cancelled(cancel_event)
     client_credentials = _load_gmail_oauth_client_credentials()
     if not client_credentials:
         return None
@@ -1613,6 +1804,7 @@ def _get_gmail_api_credentials(on_status=None):
 
     if creds and creds.expired and creds.refresh_token:
         try:
+            _raise_if_oauth_cancelled(cancel_event)
             creds.refresh(Request())
             token_path.write_text(creds.to_json(), encoding="utf-8")
         except Exception:
@@ -1634,13 +1826,7 @@ def _get_gmail_api_credentials(on_status=None):
         },
         scopes=scopes,
     )
-    creds = flow.run_local_server(
-        host="127.0.0.1",
-        port=0,
-        authorization_prompt_message="Abra o link abaixo no navegador para autorizar o Gmail, se ele não abrir sozinho:\n{url}",
-        success_message="Autorizacao do Gmail concluida. Pode voltar ao aplicativo.",
-        open_browser=True,
-    )
+    creds = _run_gmail_oauth_local_server(flow, on_status=on_status, cancel_event=cancel_event)
     if creds:
         token_path.write_text(creds.to_json(), encoding="utf-8")
     return creds
@@ -1769,8 +1955,8 @@ def _is_likely_cielo_token_email(sender: str, subject: str, body: str) -> bool:
     )
 
 
-def _cielo_gmail_session(on_status=None) -> requests.Session:
-    creds = _get_gmail_api_credentials(on_status=on_status)
+def _cielo_gmail_session(on_status=None, cancel_event: threading.Event | None = None) -> requests.Session:
+    creds = _get_gmail_api_credentials(on_status=on_status, cancel_event=cancel_event)
     if not creds:
         raise RuntimeError("Credenciais OAuth do Gmail indisponiveis.")
     session = requests.Session()
@@ -1778,11 +1964,16 @@ def _cielo_gmail_session(on_status=None) -> requests.Session:
     return session
 
 
-def _refresh_cielo_gmail_session_if_needed(session: requests.Session, response, on_status=None) -> bool:
+def _refresh_cielo_gmail_session_if_needed(
+    session: requests.Session,
+    response,
+    on_status=None,
+    cancel_event: threading.Event | None = None,
+) -> bool:
     if response.status_code != 401:
         return False
     try:
-        creds = _get_gmail_api_credentials(on_status=on_status)
+        creds = _get_gmail_api_credentials(on_status=on_status, cancel_event=cancel_event)
         if not creds or not getattr(creds, "refresh_token", None):
             return False
         from google.auth.transport.requests import Request
@@ -1836,7 +2027,9 @@ def _fetch_cielo_token_from_gmail(
     ignored_message_ids: set[str] | None = None,
     min_internal_ts: float | None = None,
     debug_info: dict | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str | None:
+    _raise_if_oauth_cancelled(cancel_event)
     ignored_tokens_normalized = {
         str(token or "").strip()
         for token in (ignored_tokens or set())
@@ -1850,8 +2043,9 @@ def _fetch_cielo_token_from_gmail(
     deadline = time.time() + timeout
     last_error = None
     try:
-        session = _cielo_gmail_session(on_status=on_status)
+        session = _cielo_gmail_session(on_status=on_status, cancel_event=cancel_event)
         while time.time() < deadline:
+            _raise_if_oauth_cancelled(cancel_event)
             _emit_pix_status(on_status, "Consultando codigo recente da Cielo no Gmail...")
             response = session.get(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
@@ -1863,12 +2057,13 @@ def _fetch_cielo_token_from_gmail(
                 },
                 timeout=15.0,
             )
-            if _refresh_cielo_gmail_session_if_needed(session, response, on_status=on_status):
+            if _refresh_cielo_gmail_session_if_needed(session, response, on_status=on_status, cancel_event=cancel_event):
                 continue
             response.raise_for_status()
             messages = (response.json() or {}).get("messages") or []
             candidates: list[tuple[float, str, str, str]] = []
             for item in messages:
+                _raise_if_oauth_cancelled(cancel_event)
                 msg_id = str(item.get("id") or "").strip()
                 if not msg_id:
                     continue
@@ -1898,6 +2093,7 @@ def _fetch_cielo_token_from_gmail(
                 debug_info["min_internal_ts"] = min_internal_ts
             candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
             for _msg_ts, msg_id, subject, sender in candidates:
+                _raise_if_oauth_cancelled(cancel_event)
                 msg_resp = session.get(
                     f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
                     params={"format": "full", "fields": "id,internalDate,payload,snippet"},
@@ -1919,7 +2115,11 @@ def _fetch_cielo_token_from_gmail(
                         debug_info["selected_subject"] = subject
                     _emit_pix_status(on_status, "Codigo da Cielo encontrado no Gmail.")
                     return token
-            time.sleep(5.0)
+            _sleep_with_cancel(5.0, cancel_event)
+    except RuntimeError as exc:
+        if str(exc).strip() == "__cancelled__":
+            raise
+        last_error = exc
     except Exception as exc:
         last_error = exc
 
@@ -1998,7 +2198,9 @@ def _fetch_fiserv_token_from_gmail(
     on_status=None,
     ignored_tokens: set[str] | None = None,
     allow_recent_fallback: bool = True,
+    cancel_event: threading.Event | None = None,
 ) -> str | None:
+    _raise_if_oauth_cancelled(cancel_event)
     credenciais = _load_gmail_token_credentials()
     if not credenciais:
         return None
@@ -2047,12 +2249,13 @@ def _fetch_fiserv_token_from_gmail(
         return 10.0
 
     try:
-        creds = _get_gmail_api_credentials(on_status=on_status)
+        creds = _get_gmail_api_credentials(on_status=on_status, cancel_event=cancel_event)
         if not creds:
             raise RuntimeError("Credenciais OAuth do Gmail indisponíveis.")
         session = requests.Session()
         session.headers.update({"Authorization": f"Bearer {creds.token}"})
         while time.time() < deadline:
+            _raise_if_oauth_cancelled(cancel_event)
             _emit_pix_status(on_status, "Consultando e-mails recentes no Gmail via API...")
             response = session.get(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
@@ -2067,6 +2270,7 @@ def _fetch_fiserv_token_from_gmail(
             if response.status_code == 401 and getattr(creds, "refresh_token", None):
                 try:
                     from google.auth.transport.requests import Request
+                    _raise_if_oauth_cancelled(cancel_event)
                     creds.refresh(Request())
                     _gmail_oauth_token_path().write_text(creds.to_json(), encoding="utf-8")
                     session.headers.update({"Authorization": f"Bearer {creds.token}"})
@@ -2092,6 +2296,7 @@ def _fetch_fiserv_token_from_gmail(
                 "",
             ]
             for item in messages:
+                _raise_if_oauth_cancelled(cancel_event)
                 msg_id = str(item.get("id") or "").strip()
                 if not msg_id:
                     continue
@@ -2118,6 +2323,7 @@ def _fetch_fiserv_token_from_gmail(
                 for msg_ts, _msg_id, subject, sender in candidates[:gmail_debug_limit]
             ]
             for msg_ts, msg_id, subject, sender in candidates[:gmail_debug_limit]:
+                _raise_if_oauth_cancelled(cancel_event)
                 if msg_id in checked_full_ids:
                     continue
                 msg_resp = session.get(
@@ -2195,7 +2401,12 @@ def _fetch_fiserv_token_from_gmail(
                 on_status,
                 f"Nenhum token novo ainda. Nova tentativa em {int(wait_seconds)}s.",
             )
-            time.sleep(wait_seconds)
+            _sleep_with_cancel(wait_seconds, cancel_event)
+    except RuntimeError as exc:
+        if str(exc).strip() == "__cancelled__":
+            raise
+        last_error = exc
+        _emit_pix_status(on_status, f"Não foi possível ler o token no Gmail via OAuth: {exc}")
     except Exception as exc:
         last_error = exc
         _emit_pix_status(on_status, f"Não foi possível ler o token no Gmail via OAuth: {exc}")
@@ -2387,7 +2598,7 @@ def _wait_for_downloaded_report(
                         continue
                     if kind == "pix" and (
                         (effective_suffix == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm)
-                        or (effective_suffix == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm)
+                        or (effective_suffix == ".xlsx" and _looks_like_caixa_pix_xlsx(path, data_br, text))
                     ):
                         normalized_path = _finalize_local_report_path(path)
                         if effective_suffix == ".xlsx":
@@ -2782,7 +2993,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                     if kind == "pix":
                         if safe_suffix.lower() == ".csv" and "data da venda" in text_norm and "valor bruto" in text_norm:
                             return str(target)
-                        if safe_suffix.lower() == ".xlsx" and "relatorio de vendas pix" in text_norm and "valor total de vendas finalizadas" in text_norm:
+                        if safe_suffix.lower() == ".xlsx" and _looks_like_caixa_pix_xlsx(target, data_br, text):
                             converted = _convert_pix_xlsx_to_csv(str(target))
                             return converted or str(target)
                         if safe_suffix.lower() == ".pdf" and "valor bruto" in text_norm and "pix" in text_norm:
@@ -3744,6 +3955,73 @@ def baixar_relatorios_caixa_eh_azulzinha(
                 except Exception:
                     pass
                 await asyncio.sleep(0.8)
+                for _attempt in range(3):
+                    period_ok = await eval_js(
+                        session_id,
+                        f"""
+                        (() => {{
+                            const expected = {data_br!r};
+                            const norm = (v) => (v || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .replace(/\\s+/g, ' ')
+                                .trim();
+                            const period = norm(document.querySelector('[data-testid="generic-calendar-periodo-calendar"]')?.innerText || '');
+                            const body = norm(document.body?.innerText || '');
+                            return period.includes(expected) || body.includes('Periodo ' + expected + ' - ' + expected);
+                        }})()
+                        """,
+                        timeout=10.0,
+                    )
+                    if period_ok:
+                        break
+                    await eval_js(
+                        session_id,
+                        """
+                        (() => {
+                            const norm = (v) => (v || '')
+                                .normalize('NFD')
+                                .replace(/[\\u0300-\\u036f]/g, '')
+                                .replace(/\\s+/g, ' ')
+                                .trim()
+                                .toUpperCase();
+                            const visible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                            };
+                            const button = document.querySelector('[data-testid="generic-calendar-button-aplicar"]')
+                                || [...document.querySelectorAll('button, a, [role="button"], div.btn')]
+                                    .filter(visible)
+                                    .find((el) => {
+                                        const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                                        return text === 'APLICAR' || text.includes('MOSTRAR RESULTADOS');
+                                    });
+                            if (!button || !visible(button)) return false;
+                            button.scrollIntoView({ block: 'center', inline: 'center' });
+                            button.click();
+                            return true;
+                        })()
+                        """,
+                        timeout=10.0,
+                    )
+                    await asyncio.sleep(1.5)
+                else:
+                    try:
+                        html_debug = await eval_js(
+                            session_id,
+                            "document.documentElement ? document.documentElement.outerHTML : ''",
+                            timeout=15.0,
+                        )
+                        if html_debug:
+                            debug_path = artifacts_dir / f"azulzinha_date_not_applied_{kind}.html"
+                            debug_path.write_text(str(html_debug), encoding="utf-8")
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"A Caixa nao confirmou o periodo {data_br} antes da exportacao do relatorio de {'PIX' if kind == 'pix' else 'cartoes'}."
+                    )
 
             async def ensure_all_establishments_selected(
                 session_id: str,
@@ -5184,6 +5462,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             on_status,
                             tokens_descartados,
                             tentativa_token == 0,
+                            cancel_event,
                         )
                         or ""
                     ).strip()
@@ -5928,6 +6207,7 @@ def baixar_relatorios_caixa_eh_azulzinha(
                             on_status,
                             tokens_descartados_globais_v2,
                             allow_recent_fallback if first_chunk else False,
+                            cancel_event,
                         )
                         or ""
                     ).strip()
@@ -7438,6 +7718,40 @@ def baixar_relatorio_cielo_mva(
                 value = result.get("result") or {}
                 return value.get("value")
 
+            async def save_cielo_page_snapshot(session_id: str, label: str) -> None:
+                if not CIELO_DEBUG_LOGS_ENABLED:
+                    return
+                safe_label = re.sub(r"[^a-z0-9_]+", "_", _normalize_ascii_text(label)).strip("_") or "snapshot"
+                safe_date = re.sub(r"\D", "", str(data_br or "")) or datetime.now().strftime("%Y%m%d")
+                base_path = Path(_active_report_dir()) / f"cielo_snapshot_{safe_date}_{safe_label}_{datetime.now().strftime('%H%M%S')}"
+                html_path = base_path.with_suffix(".html")
+                png_path = base_path.with_suffix(".png")
+                saved: dict[str, str] = {}
+                try:
+                    html_text = await eval_js(
+                        session_id,
+                        "document.documentElement ? document.documentElement.outerHTML : ''",
+                        timeout=10.0,
+                    )
+                    html_path.write_text(str(html_text or ""), encoding="utf-8")
+                    saved["html"] = str(html_path)
+                except Exception as exc:
+                    saved["html_error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    screenshot = await cdp(
+                        "Page.captureScreenshot",
+                        {"format": "png", "captureBeyondViewport": False},
+                        session_id=session_id,
+                        timeout=15.0,
+                    )
+                    raw_png = base64.b64decode(str(screenshot.get("data") or ""))
+                    if raw_png:
+                        png_path.write_bytes(raw_png)
+                        saved["png"] = str(png_path)
+                except Exception as exc:
+                    saved["png_error"] = f"{type(exc).__name__}: {exc}"
+                cielo_log("page_snapshot_saved", label=label, saved=saved)
+
             async def dispatch_cielo_native_click(session_id: str, click_result: dict | None) -> bool:
                 if not isinstance(click_result, dict):
                     return False
@@ -8456,11 +8770,21 @@ def baixar_relatorio_cielo_mva(
                   if (!chosen) return {clicked: false, candidates: summary};
                   const target = chosen.clickTarget;
                   target.scrollIntoView({block: 'center', inline: 'center'});
+                  const clickRect = target.getBoundingClientRect();
+                  const clickX = Math.round(clickRect.left + clickRect.width / 2);
+                  const clickY = Math.round(clickRect.top + clickRect.height / 2);
                   target.focus && target.focus();
-                  target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
-                  target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
-                  target.click();
-                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, inOverlay: chosen.inOverlay, href: location.href, candidates: summary};
+                  return {
+                    clicked: true,
+                    targetText: chosen.text,
+                    tag: chosen.tag,
+                    role: chosen.role,
+                    inOverlay: chosen.inOverlay,
+                    href: location.href,
+                    clickX,
+                    clickY,
+                    candidates: summary
+                  };
                 })()
                 """
                 result = await eval_js(session_id, script, timeout=10.0)
@@ -8486,6 +8810,76 @@ def baixar_relatorio_cielo_mva(
                   const norm = s => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
                   const bodyText = norm(document.body?.innerText || '');
                   const href = norm(location.href || '');
+                  const requestedDate = __DATA_BR__;
+                  const parseDate = value => {
+                    const match = String(value || '').match(/([0-9]{2})[/]([0-9]{2})[/]([0-9]{4})/);
+                    if (!match) return null;
+                    return Number(`${match[3]}${match[2]}${match[1]}`);
+                  };
+                  const requestedDateValue = parseDate(requestedDate);
+                  const rowMatchesRequestedDate = rowText => {
+                    if (rowText.includes(__DATA_BR__) || rowText.includes(__DATA_DASH__) || rowText.includes(__DATA_ISO__)) return true;
+                    const dates = [...rowText.matchAll(/\b[0-9]{2}[/][0-9]{2}[/][0-9]{4}\b/g)]
+                      .map(match => parseDate(match[0]))
+                      .filter(Boolean);
+                    if (!requestedDateValue || dates.length < 2) return false;
+                    for (let index = 0; index < dates.length - 1; index += 1) {
+                      const start = dates[index];
+                      const end = dates[index + 1];
+                      if (start <= requestedDateValue && requestedDateValue <= end) return true;
+                    }
+                    return false;
+                  };
+                  const directIconMatches = [...document.querySelectorAll('i[name="download"], [name="download"].icon-download, .icon-download')]
+                    .filter(visible)
+                    .map(icon => {
+                      const row = icon.closest('tr,[role=row],li,section,article') || icon.closest('div');
+                      if (!row) return null;
+                      const rect = icon.getBoundingClientRect();
+                      const rowRect = row.getBoundingClientRect();
+                      const rowText = norm(row.innerText || row.textContent || '');
+                      if (!rowText || rowText.length > 700) return null;
+                      if (!rowMatchesRequestedDate(rowText)) return null;
+                      if (!/vendas cielo|historico|hist.rico/.test(rowText)) return null;
+                      const ready = !/processando|gerando|aguarde|pendente|em andamento|solicitado/.test(rowText);
+                      const detailBonus = /historico detalhado|hist.rico detalhado|detalhado/.test(rowText) ? 5000 : 0;
+                      const summaryPenalty = /historico resumo|hist.rico resumo/.test(rowText) ? 1200 : 0;
+                      return {
+                        e: icon,
+                        text: norm(icon.getAttribute('name') || icon.className || 'download'),
+                        rowText: rowText.slice(0, 260),
+                        score: (ready ? 3000 : -1500) + detailBonus - summaryPenalty + Math.max(0, 1600 - rowRect.top) + Math.max(0, rect.left),
+                        tag: icon.tagName,
+                        role: icon.getAttribute('role') || '',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                        rowY: Math.round(rowRect.y),
+                        clickX: Math.round(rect.left + rect.width / 2),
+                        clickY: Math.round(rect.top + rect.height / 2),
+                        source: 'direct-icon'
+                      };
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => b.score - a.score);
+                  const directIconChosen = directIconMatches[0];
+                  if (directIconChosen) {
+                    directIconChosen.e.scrollIntoView({block: 'center', inline: 'center'});
+                    directIconChosen.e.focus && directIconChosen.e.focus();
+                    return {
+                      clicked: true,
+                      method: 'direct_download_icon',
+                      targetText: directIconChosen.text,
+                      rowText: directIconChosen.rowText,
+                      tag: directIconChosen.tag,
+                      role: directIconChosen.role,
+                      href: location.href,
+                      clickX: directIconChosen.clickX,
+                      clickY: directIconChosen.clickY,
+                      candidates: directIconMatches.slice(0, 8).map(({text, rowText, tag, role, x, y, w, h, rowY, score, source, clickX, clickY}) => ({text, rowText, tag, role, x, y, w, h, rowY, score, source, clickX, clickY}))
+                    };
+                  }
                   const reportsAreaText = /meus relatorios|seus relatorios|relatorios solicitados|central de relatorios|historico de relatorios|relatorios gerados|arquivos gerados|baixar relatorio|download do relatorio|relatorio pronto|tipo de relatorio|data da solicitacao|relatorio inicio|vendas cielo historico resumo|vendas cielo historico detalhado/.test(bodyText);
                   const strongReportsArea = /tipo de relatorio|data da solicitacao|relatorio inicio|vendas cielo historico resumo|vendas cielo historico detalhado/.test(bodyText);
                   const onReportsArea = /\\/site\\/relatorio|\\/relatorios|\\/reports/.test(href) || reportsAreaText;
@@ -8493,7 +8887,7 @@ def baixar_relatorio_cielo_mva(
                     return {clicked: false, wrongPage: true, processing: /processando|gerando|aguarde|pendente|em andamento|solicitado/.test(bodyText), candidates: [], bodyText: bodyText.slice(0, 500), href: location.href};
                   }
                   const seen = new Set();
-                  const reportRows = [...document.querySelectorAll('tr,li,[role=row],section,article,div')]
+                  let reportRows = [...document.querySelectorAll('tr,li,[role=row],section,article,div')]
                     .filter(visible)
                     .map(row => {
                       const rect = row.getBoundingClientRect();
@@ -8503,11 +8897,11 @@ def baixar_relatorio_cielo_mva(
                     .filter(({rect, rowText}) => {
                       if (!rowText || rowText.length > 260) return false;
                       if (rect.top < 90 || rect.height < 28 || rect.height > 140 || rect.width < 220) return false;
-                      if (!(rowText.includes(__DATA_BR__) || rowText.includes(__DATA_DASH__) || rowText.includes(__DATA_ISO__))) return false;
+                      if (!rowMatchesRequestedDate(rowText)) return false;
                       return /vendas cielo|historico resumo|historico detalhado|histórico resumo|histórico detalhado|csv|xls|xlsx/.test(rowText);
                     })
                     .map(({row, rect, rowText}) => {
-                      const controls = [...row.querySelectorAll('button,a,[role=button],svg,i')]
+                      const controls = [...row.querySelectorAll('button,a,[role=button],svg,i,img,[name="download"],[class*="download"],[class*="Download"],[class*="icon-download"],[aria-label*="download" i],[title*="download" i],[aria-label*="baixar" i],[title*="baixar" i]')]
                         .map(e => e.closest('button,a,[role=button]') || e)
                         .filter((e, index, arr) => arr.indexOf(e) === index)
                         .filter(visible)
@@ -8538,8 +8932,71 @@ def baixar_relatorio_cielo_mva(
                     })
                     .filter(Boolean)
                     .sort((a, b) => b.score - a.score);
+                  if (!reportRows.length) {
+                    const fallbackSeen = new Set();
+                    const fallbackRows = [...document.querySelectorAll('p,span,td,div')]
+                      .filter(visible)
+                      .map(e => {
+                        const text = norm(e.innerText || e.textContent || '');
+                        if (!text || text.length > 180) return null;
+                        if (!/vendas cielo|historico|hist.rico|detalhado|resumo/.test(text)) return null;
+                        const row = e.closest('tr,[role=row],li,section,article') || e.parentElement;
+                        if (!row) return null;
+                        const rect = row.getBoundingClientRect();
+                        const rowText = norm(row.innerText || row.textContent || '');
+                        if (!rowText || rowText.length > 700) return null;
+                        if (rect.bottom <= 0 || rect.height < 10 || rect.height > 260 || rect.width < 120) return null;
+                        if (rect.top >= (window.innerHeight || document.documentElement.clientHeight || 0)) return null;
+                        if (!rowMatchesRequestedDate(rowText)) return null;
+                        if (!/vendas cielo|historico|hist.rico|detalhado|resumo|csv|xls|xlsx/.test(rowText)) return null;
+                        const key = [Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), rowText.slice(0, 120)].join(':');
+                        if (fallbackSeen.has(key)) return null;
+                        fallbackSeen.add(key);
+                        const controls = [...row.querySelectorAll('button,a,[role=button],svg,i,img,[name="download"],[class*="download"],[class*="Download"],[class*="icon-download"],[aria-label*="download" i],[title*="download" i],[aria-label*="baixar" i],[title*="baixar" i]')]
+                          .map(node => node.closest('button,a,[role=button]') || node)
+                          .filter((node, index, arr) => arr.indexOf(node) === index)
+                          .filter(visible)
+                          .sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+                        const target = controls.find(node => {
+                          const attrs = norm([
+                            node.innerText || '',
+                            node.value || '',
+                            node.getAttribute('aria-label') || '',
+                            node.getAttribute('title') || '',
+                            node.getAttribute('name') || '',
+                            node.className || ''
+                          ].join(' '));
+                          return /download|baixar|icon-download/.test(attrs);
+                        }) || controls[0] || row;
+                        const targetRect = target === row ? null : target.getBoundingClientRect();
+                        const ready = !/processando|gerando|aguarde|pendente|em andamento|solicitado/.test(rowText);
+                        const detailBonus = /historico detalhado|hist.rico detalhado|detalhado/.test(rowText) ? 5000 : 0;
+                        const summaryPenalty = /historico resumo|hist.rico resumo/.test(rowText) ? 1200 : 0;
+                        const clickX = targetRect ? Math.round(targetRect.left + targetRect.width / 2) : Math.round(rect.right - 22);
+                        const clickY = targetRect ? Math.round(targetRect.top + targetRect.height / 2) : Math.round(rect.top + rect.height / 2);
+                        return {
+                          e: target,
+                          text: target === row ? 'row-right-edge' : norm(target.innerText || target.value || target.getAttribute('aria-label') || target.getAttribute('title') || target.getAttribute('name') || 'download'),
+                          rowText: rowText.slice(0, 260),
+                          score: (ready ? 3000 : -1500) + detailBonus - summaryPenalty + Math.max(0, 1600 - rect.top) + Math.max(0, clickX) + (target === row ? 0 : 800),
+                          tag: target.tagName,
+                          role: target.getAttribute('role') || '',
+                          x: targetRect ? Math.round(targetRect.x) : Math.round(rect.right - 44),
+                          y: targetRect ? Math.round(targetRect.y) : Math.round(rect.y),
+                          w: targetRect ? Math.round(targetRect.width) : 44,
+                          h: targetRect ? Math.round(targetRect.height) : Math.round(rect.height),
+                          rowY: Math.round(rect.y),
+                          clickX,
+                          clickY,
+                          source: 'text-fallback'
+                        };
+                      })
+                      .filter(Boolean)
+                      .sort((a, b) => b.score - a.score);
+                    reportRows = fallbackRows;
+                  }
                   const iconChosen = reportRows[0];
-                  const iconSummary = reportRows.slice(0, 8).map(({text, rowText, tag, role, x, y, w, h, rowY, score}) => ({text, rowText, tag, role, x, y, w, h, rowY, score}));
+                  const iconSummary = reportRows.slice(0, 8).map(({text, rowText, tag, role, x, y, w, h, rowY, score, source, clickX, clickY}) => ({text, rowText, tag, role, x, y, w, h, rowY, score, source, clickX, clickY}));
                   if (iconChosen) {
                     iconChosen.e.scrollIntoView({block: 'center', inline: 'center'});
                     iconChosen.e.focus && iconChosen.e.focus();
@@ -8552,8 +9009,8 @@ def baixar_relatorio_cielo_mva(
                       tag: iconChosen.tag,
                       role: iconChosen.role,
                       href: location.href,
-                      clickX: Math.round(clickRect.left + clickRect.width / 2),
-                      clickY: Math.round(clickRect.top + clickRect.height / 2),
+                      clickX: Math.round(Number.isFinite(iconChosen.clickX) ? iconChosen.clickX : clickRect.left + clickRect.width / 2),
+                      clickY: Math.round(Number.isFinite(iconChosen.clickY) ? iconChosen.clickY : clickRect.top + clickRect.height / 2),
                       candidates: iconSummary
                     };
                   }
@@ -8680,7 +9137,17 @@ def baixar_relatorio_cielo_mva(
                   chosen.e.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
                   chosen.e.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
                   chosen.e.click();
-                  return {clicked: true, targetText: chosen.text, tag: chosen.tag, role: chosen.role, href: location.href, candidates: summary};
+                  const clickRect = chosen.e.getBoundingClientRect();
+                  return {
+                    clicked: true,
+                    targetText: chosen.text,
+                    tag: chosen.tag,
+                    role: chosen.role,
+                    href: location.href,
+                    clickX: Math.round(clickRect.left + clickRect.width / 2),
+                    clickY: Math.round(clickRect.top + clickRect.height / 2),
+                    candidates: summary
+                  };
                 })()
                 """
                 result = await eval_js(session_id, script, timeout=10.0)
@@ -8773,6 +9240,72 @@ def baixar_relatorio_cielo_mva(
                 return result if isinstance(result, dict) else {"clicked": bool(result)}
 
             async def download_cielo_generated_report_from_reports_area(session_id: str, started_at: float) -> str | None:
+                async def navigate_cielo_reports_area(reason: str) -> bool:
+                    cielo_log(
+                        "export_reports_direct_navigate_skipped",
+                        reason=reason,
+                        reason_detail="direct_reports_url_redirects_to_login_on_cielo",
+                    )
+                    return False
+                    report_urls = (
+                        "https://minhaconta2.cielo.com.br/site/relatorios",
+                        "https://minhaconta2.cielo.com.br/site/relatorios/vendas",
+                    )
+                    markers = (
+                        "meus relatorios",
+                        "seus relatorios",
+                        "relatorios solicitados",
+                        "central de relatorios",
+                        "historico de relatorios",
+                        "relatorios gerados",
+                        "arquivos gerados",
+                        "tipo de relatorio",
+                        "data da solicitacao",
+                        "relatorio inicio",
+                        "vendas cielo historico",
+                    )
+                    for url in report_urls:
+                        _check_cancelled()
+                        try:
+                            cielo_log("export_reports_direct_navigate_start", reason=reason, url=url)
+                            await cdp("Page.navigate", {"url": url}, session_id=session_id, timeout=10.0)
+                            await asyncio.sleep(7.0)
+                            state = await eval_js(
+                                session_id,
+                                """
+                                (() => ({
+                                  href: location.href,
+                                  text: (document.body?.innerText || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 900)
+                                }))()
+                                """,
+                                timeout=10.0,
+                            )
+                            state = state if isinstance(state, dict) else {"state": state}
+                            state_text = str(state.get("text", ""))
+                            current_url = str(state.get("href", ""))
+                            opened = "/relatorio" in current_url or "/relatorios" in current_url or any(
+                                marker in state_text for marker in markers
+                            )
+                            cielo_log(
+                                "export_reports_direct_navigate_result",
+                                reason=reason,
+                                requested_url=url,
+                                current_url=current_url,
+                                opened=opened,
+                                state=state,
+                            )
+                            if opened:
+                                return True
+                        except Exception as exc:
+                            cielo_log(
+                                "export_reports_direct_navigate_error",
+                                reason=reason,
+                                requested_url=url,
+                                error=str(exc),
+                                error_type=type(exc).__name__,
+                            )
+                    return False
+
                 reports_cta = {"clicked": False}
                 for cta_attempt in range(1, 16):
                     _check_cancelled()
@@ -8791,7 +9324,11 @@ def baixar_relatorio_cielo_mva(
                     if cta_attempt <= 3 or bool(reports_cta.get("clicked")) or cta_attempt % 5 == 0:
                         cielo_log("export_reports_cta_click", attempt=cta_attempt, result=reports_cta)
                     if bool(reports_cta.get("clicked")):
+                        await save_cielo_page_snapshot(session_id, "before_reports_cta_native")
+                        native_cta_clicked = await dispatch_cielo_native_click(session_id, reports_cta)
+                        cielo_log("export_reports_cta_native_click", attempt=cta_attempt, clicked=native_cta_clicked, result=reports_cta)
                         await asyncio.sleep(6.0)
+                        await save_cielo_page_snapshot(session_id, "after_reports_cta_native")
                         try:
                             reports_state = await eval_js(
                                 session_id,
@@ -8815,6 +9352,8 @@ def baixar_relatorio_cielo_mva(
                             second_cta = await click_cielo_reports_cta(session_id)
                             cielo_log("export_reports_cta_second_click", result=second_cta)
                             if bool(second_cta.get("clicked")):
+                                native_second_cta_clicked = await dispatch_cielo_native_click(session_id, second_cta)
+                                cielo_log("export_reports_cta_second_native_click", clicked=native_second_cta_clicked, result=second_cta)
                                 await asyncio.sleep(6.0)
                         if ("/vendas/resumo" in state_href or "/vendas/detalhado" in state_href) and not any(
                             marker in state_text
@@ -8834,7 +9373,48 @@ def baixar_relatorio_cielo_mva(
                             reports_tab = await click_cielo_sales_reports_tab(session_id)
                             cielo_log("export_reports_tab_click_after_cta", result=reports_tab)
                             if bool(reports_tab.get("clicked")):
+                                native_tab_clicked = await dispatch_cielo_native_click(session_id, reports_tab)
+                                cielo_log("export_reports_tab_native_click_after_cta", clicked=native_tab_clicked, result=reports_tab)
                                 await asyncio.sleep(8.0)
+                                await save_cielo_page_snapshot(session_id, "after_reports_tab_native")
+                                try:
+                                    tab_state = await eval_js(
+                                        session_id,
+                                        """
+                                        (() => ({
+                                          href: location.href,
+                                          text: (document.body?.innerText || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 700)
+                                        }))()
+                                        """,
+                                        timeout=10.0,
+                                    )
+                                except Exception as exc:
+                                    tab_state = {"error": str(exc)}
+                                cielo_log("export_reports_after_tab_click", state=tab_state)
+                                tab_href = str((tab_state or {}).get("href", "")) if isinstance(tab_state, dict) else ""
+                                tab_text = str((tab_state or {}).get("text", "")) if isinstance(tab_state, dict) else ""
+                                if (
+                                    "/vendas/resumo" in tab_href
+                                    or "/vendas/detalhado" in tab_href
+                                    or not any(
+                                        marker in tab_text
+                                        for marker in (
+                                            "meus relatorios",
+                                            "seus relatorios",
+                                            "relatorios solicitados",
+                                            "central de relatorios",
+                                            "historico de relatorios",
+                                            "relatorios gerados",
+                                            "arquivos gerados",
+                                            "tipo de relatorio",
+                                            "data da solicitacao",
+                                            "relatorio inicio",
+                                        )
+                                    )
+                                ):
+                                    await navigate_cielo_reports_area("cta_or_tab_stayed_on_sales")
+                            else:
+                                await navigate_cielo_reports_area("reports_tab_not_clicked_after_cta")
                         break
                     await asyncio.sleep(3.0)
                 if not bool(reports_cta.get("clicked")):
@@ -8843,7 +9423,10 @@ def baixar_relatorio_cielo_mva(
                     reports_tab = await click_cielo_sales_reports_tab(session_id)
                     cielo_log("export_reports_tab_click", result=reports_tab)
                     if bool(reports_tab.get("clicked")):
+                        native_tab_clicked = await dispatch_cielo_native_click(session_id, reports_tab)
+                        cielo_log("export_reports_tab_native_click", clicked=native_tab_clicked, result=reports_tab)
                         await asyncio.sleep(8.0)
+                    await navigate_cielo_reports_area("cta_not_found")
 
                 latest_report_icon_clicked = False
                 wrong_page_count = 0
@@ -8877,17 +9460,26 @@ def baixar_relatorio_cielo_mva(
                     if wrong_page_count >= 4:
                         cielo_log("export_reports_wrong_page_abort", attempt=attempt, current_url=current_url, result=click_result)
                         return None
+                    click_body_text = _normalize_ascii_text(str(click_result.get("bodyText") or ""))
+                    missing_reports_panel = not (
+                        "tipo de relatorio" in click_body_text
+                        or "data da solicitacao" in click_body_text
+                        or "vendas cielo historico" in click_body_text
+                    )
                     if (
                         not bool(click_result.get("clicked"))
-                        and bool(click_result.get("wrongPage"))
+                        and (bool(click_result.get("wrongPage")) or missing_reports_panel)
                         and ("/vendas/resumo" in current_url or "/vendas/detalhado" in current_url)
-                        and attempt in {1, 5, 10, 15}
+                        and attempt in {1, 5, 10, 15, 20}
                     ):
                         reports_tab = await click_cielo_sales_reports_tab(session_id)
                         cielo_log("export_reports_tab_click_retry", attempt=attempt, result=reports_tab)
                         if bool(reports_tab.get("clicked")):
+                            native_tab_clicked = await dispatch_cielo_native_click(session_id, reports_tab)
+                            cielo_log("export_reports_tab_native_click_retry", attempt=attempt, clicked=native_tab_clicked, result=reports_tab)
                             await asyncio.sleep(8.0)
                             continue
+                        await navigate_cielo_reports_area("wrong_page_retry")
                     if bool(click_result.get("clicked")):
                         native_report_clicked = await dispatch_cielo_native_click(session_id, click_result)
                         cielo_log("export_reports_ready_download_native_click", attempt=attempt, clicked=native_report_clicked, result=click_result)
@@ -9266,6 +9858,7 @@ def baixar_relatorio_cielo_mva(
                             ignored_message_ids=ignored_token_message_ids,
                             min_internal_ts=token_lookup_min_ts,
                             debug_info=token_debug_info,
+                            cancel_event=cancel_event,
                         )
                         token_source = "gmail" if token else None
                         if not token:
@@ -11173,15 +11766,19 @@ def _find_local_cielo_card_report(data_br: str, *, company: str = "MVA") -> dict
                     if "cielo" not in name_norm and "cielo" not in text_norm:
                         continue
                     detected_date = _extract_local_report_date_br(text)
-                    if detected_date and detected_date != data_br:
-                        avisos.append(
-                            f'O arquivo "{normalized_path.name}" foi identificado como relatório Cielo, mas o conteúdo é de {detected_date} e não de {data_br}. Ele foi ignorado.'
-                        )
-                        continue
                     reports = _build_card_reports_from_cielo(str(normalized_path), data_br)
                     if any((report.get("itens_autorizados") or []) for report in reports.values()):
+                        if detected_date and detected_date != data_br:
+                            avisos.append(
+                                f'O arquivo "{normalized_path.name}" tem cabeçalho Cielo iniciando em {detected_date}, mas trouxe transações de {data_br}; ele foi usado.'
+                            )
                         matches.append(normalized_path)
                     else:
+                        if detected_date and detected_date != data_br:
+                            avisos.append(
+                                f'O arquivo "{normalized_path.name}" foi identificado como relatório Cielo, mas o conteúdo é de {detected_date} e não trouxe transações de {data_br}. Ele foi ignorado.'
+                            )
+                            continue
                         avisos.append(
                             f'O arquivo "{normalized_path.name}" não trouxe transações Cielo aprovadas para {data_br} e foi ignorado.'
                         )
@@ -12427,6 +13024,29 @@ def _mva_report_label(arquivo_tipo: str) -> str:
     if arquivo_tipo == "exportacao_dados_mva":
         return "Exportacao de dados"
     return "MVA"
+
+
+def criar_relatorio_orcamentos_mva_vazio(periodo: str | None = None) -> dict:
+    return {
+        "arquivo": "Orcamento ignorado",
+        "caixa_modelo": "MVA",
+        "arquivo_tipo": "orcamentos_mva",
+        "periodo": periodo,
+        "pedidos_total": 0,
+        "pedidos_balcao": 0,
+        "pedidos_caixa": 0,
+        "pedidos_excluidos": 0,
+        "pedidos_excluidos_cliente": 0,
+        "pedidos_excluidos_documento": 0,
+        "pedidos_editando": 0,
+        "pedidos_outros_status": 0,
+        "total_documento": 0.0,
+        "total_excluido": 0.0,
+        "total_caixa": 0.0,
+        "itens_caixa": [],
+        "itens_excluidos": [],
+        "orcamento_ignorado": True,
+    }
 
 
 def _normalize_mva_description(resto_linha: str) -> str:

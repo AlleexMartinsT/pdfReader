@@ -21,11 +21,13 @@ Desktop application for reconciling sales reports from two business flows:
   - Existing local PIX CSV/XLSX/PDF and card PDF/XLSX files are detected by content in the current execution folder.
   - If Caixa leaves a valid PIX/card download with a `.crdownload` suffix, the app now normalizes it and still uses the report.
   - If the Caixa PIX export arrives as XLSX, the app converts it to CSV automatically and continues the flow.
+  - Caixa PIX XLSX files with invalid workbook style XML are now parsed through the raw XML fallback, so completed downloads are not rejected while the app keeps waiting.
   - If PIX or card files are missing, the app attempts to download them from the Caixa/Azulzinha portal into the current execution folder.
   - If Caixa times out and returns to the login page while opening the PIX/card sales area, the app now reauthenticates and retries the report instead of waiting on a dead sales tab.
   - PIX export now waits longer for the results/export button, waits longer for the final file, and retries the report once when Caixa is slow to generate it.
   - If Caixa opens its generic `_error.html` page during automatic PIX/card export, the app now detects it, reloads the sales area, and retries the report once.
   - Automatic Caixa steps now include extra settle time after tab switches and date filters, and they wait for loading placeholders to disappear before continuing.
+  - Before clicking `Exportar`, the Caixa/Azulzinha automation now verifies that the visible period really matches the requested report date; if the portal keeps `Hoje`/`Ontem` selected, the app reapplies the filter instead of downloading a wrong-date file.
   - The Caixa/Azulzinha automation now follows an explicit portal-state flow (`login`, `device`, `token`, `sales`), so real screen transitions are treated as progress instead of false login failures.
   - The portal-state classifier now distinguishes the `/Login` sub-screens by visible content, so device and token pages are no longer mistaken for the CNPJ/password login form or for authenticated `Home`.
   - The automation no longer treats `/MinhasVendas` or `/Home` in the URL alone as proof that the sales area is ready; it now requires the visible sales UI.
@@ -108,8 +110,11 @@ Desktop application for reconciling sales reports from two business flows:
 - EH now also shows canceled NFC-e found only in `Fiscal > NFC-e`, and scope filtering keeps the canceled-coupon count/value instead of resetting it to zero.
 - In the packaged app, runtime credentials and Gmail OAuth files now resolve from the executable folder before any local development checkout.
 - The local `credenciais.txt` now carries the Zweb, Cielo, and Caixa/Azulzinha credentials needed by the packaged app.
+- Gmail OAuth authorization now observes cancellation while waiting for the browser callback, so closing the wrong browser profile no longer leaves the loading dialog stuck on `Cancelando...`.
+- The dashboard now shows Gmail OAuth status and blocks Caixa automation with a clear pre-authentication prompt when Gmail is not authorized.
 - Runs `Caixa > MVA` with imported PDFs and `Minhas Notas` checks.
 - MVA closing screens now mirror the EH sectioned `Fechamento de Caixa` structure in the app and in A4 printing, including the same reconciliation sections and observations block.
+- The MVA budget PDF is optional: when it is not found, the manual flow offers `Ignore budget`, and scheduled MVA runs continue with only the DAV and closing files.
 - When MVA uses the newer Clipp closing file, the app now also attempts to auto-download missing Caixa/Azulzinha PIX and card reports with the local MVA credentials before reconciling payments.
 - In the packaged app, MVA `DAV`, budget, and closing PDF auto-discovery now uses the folder where the executable is running, avoiding stale PDFs from another workspace.
 - If the MVA card totals from Caixa/Azulzinha are missing or lower than the Clipp closing totals, the app now checks Cielo card reports as an additional source and merges Cielo transactions into the same card reconciliation.
@@ -134,9 +139,14 @@ Desktop application for reconciling sales reports from two business flows:
 - After opening the Cielo export modal, the automation now selects the `CSV` option explicitly and clicks the short `Avançar` action instead of the dialog container.
 - If the Cielo export modal advances to a second confirmation step, the automation now clicks only follow-up actions still inside the modal so it can finish the export without reopening the page-level `Exportar` button.
 - When Cielo sends the generated export to the `Relatórios` area instead of downloading immediately, the automation now waits for the visible reports CTA and falls back to the in-page `Relatórios` tab instead of using routes that redirect back to login.
-- In the Cielo `Relatórios` side panel, the automation now downloads the topmost matching `Vendas Cielo histórico resumo` item, since the newest generated reports appear from top to bottom and the download action is icon-only.
+- If the Cielo reports CTA or tab stays on the sales page, the automation now retries the in-page `Relatórios` tab with a native coordinate click and avoids direct report URLs that invalidate the session.
+- In the Cielo `Relatórios` side panel, the automation now downloads the topmost matching `Vendas Cielo histórico detalhado` item, since the newest generated reports appear from top to bottom and the download action is icon-only.
+- Cielo report rows whose displayed period is a range, such as `18/05/2026 até 24/05/2026`, now match any requested date inside that range before the download icon is clicked.
+- The Cielo reports side panel now also recognizes icon-only download controls such as `i[name="download"]` and falls back to the right edge of the matching row when the icon has no button wrapper.
+- If the Cielo reports side panel closes or the automation lands back on `Vendas > Detalhado` while waiting for the file, the app now reopens `Relatórios` and retries the download icon.
 - Cielo downloads are now accepted by the requested date embedded in the filename even before transaction parsing succeeds, preventing repeated clicks on the same report icon.
 - The Cielo historical date filter now prefers the portal calendar/datepicker selection over raw input value changes, and it no longer treats an unconfirmed date selection as a valid no-results response.
+- Local Cielo card CSV/XLSX files with a weekly header are now accepted when the transaction rows contain approved sales for the requested date.
 - If the Cielo `Consolidado de vendas` page is already open and shows no exportable results, the app now stops the Cielo fallback instead of probing alternate routes that can redirect back to login.
 - If the MVA `Fechamento de Caixa` PDF is actually a Clipp `Relatório de Vendas` or another unsupported layout, the app now warns that the file will be treated only as a local report and will not trigger automatic Azulzinha/Caixa payment downloads.
 - Manual `Caixa` flows now auto-detect the available closing scope: a single morning closing is generated directly, and when a full-day closing is detected the app lets the user choose between the daily report and an afternoon-only report.
@@ -191,11 +201,13 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - Arquivos locais de PIX em CSV/XLSX/PDF e cartões em PDF/XLSX são identificados pelo conteúdo na pasta atual de execução.
   - Se a Caixa deixar um download válido de PIX/cartões com sufixo `.crdownload`, o app agora normaliza esse arquivo e ainda usa o relatório.
   - Se o PIX da Caixa vier em XLSX, o app converte automaticamente para CSV e continua o fluxo.
+  - Arquivos XLSX de PIX da Caixa com XML de estilo inválido agora são lidos pelo fallback XML bruto, evitando que um download completo seja rejeitado enquanto o app continua esperando.
 - Se os arquivos de PIX ou cartões estiverem ausentes, o app tenta baixá-los no portal Caixa/Azulzinha para a pasta atual de execução.
   - Se a Caixa expirar e voltar para o login ao abrir a area de vendas de PIX/cartoes, o app agora refaz a autenticacao e tenta o relatorio de novo, em vez de ficar esperando uma aba de vendas morta.
   - A exportacao do PIX agora espera mais tempo pelos resultados e pelo arquivo final, e tenta o relatorio mais uma vez quando a Caixa demora para gerar o arquivo.
   - Se a Caixa abrir a pagina generica `_error.html` durante a exportacao automatica de PIX ou cartoes, o app agora detecta isso, recarrega a area de vendas e tenta o relatorio mais uma vez.
   - A automacao da Caixa agora inclui folgas extras apos troca de abas e filtro de data, e so continua quando os placeholders de carregamento somem da tela.
+  - Antes de clicar em `Exportar`, a automacao da Caixa/Azulzinha agora confirma que o periodo visivel realmente corresponde a data solicitada; se o portal mantiver `Hoje`/`Ontem`, o app reaplica o filtro em vez de baixar arquivo da data errada.
   - A automacao da Caixa/Azulzinha agora segue um fluxo explicito de estados do portal (`login`, `device`, `token`, `sales`), entao transicoes reais entre telas deixam de ser tratadas como falhas falsas de login.
   - O classificador de estados do portal agora distingue as subtelas dentro de `/Login` pelo conteudo visivel, para que dispositivo e token nao sejam confundidos com o formulario de CNPJ/senha nem com a `Home` autenticada.
   - A automacao nao trata mais `/MinhasVendas` ou `/Home` na URL, sozinhos, como prova de que a area de vendas esta pronta; agora ela exige a UI visivel de vendas.
@@ -207,6 +219,7 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
   - Se a Caixa/Azulzinha não estiver disponível e o PIX for confirmado por `Financeiro > Movimentações` no Zweb, o relatório sinaliza esse fallback de forma explícita.
 - Executa `Caixa > MVA` com PDFs importados e conferência no `Minhas Notas`.
 - O fechamento da MVA agora espelha a estrutura seccionada do `Fechamento de Caixa` da EH no aplicativo e na impressão A4, incluindo as mesmas seções de conciliação e observações.
+- O PDF de orçamento da MVA agora é opcional: quando ele não é encontrado, o fluxo manual oferece `Ignorar orçamento`, e a automação da MVA segue apenas com DAV e fechamento.
 - Quando a MVA usa o fechamento novo do Clipp, o app agora também tenta baixar automaticamente os relatórios PIX e cartões da Caixa/Azulzinha com as credenciais locais da MVA antes de conciliar os pagamentos.
 - No aplicativo empacotado, a busca automática dos PDFs de `DAV`, orçamento e fechamento da MVA agora usa a pasta onde o executável está rodando, evitando PDFs antigos de outro workspace.
 - Se os totais de cartão da MVA na Caixa/Azulzinha estiverem ausentes ou abaixo dos totais do fechamento Clipp, o app agora consulta relatórios da Cielo como fonte adicional e soma essas transações na mesma conciliação de cartões.
@@ -231,7 +244,10 @@ Aplicativo desktop para conciliar relatórios de venda em dois fluxos:
 - Depois de abrir o modal de exportação da Cielo, a automação agora seleciona explicitamente `CSV` e clica na ação curta `Avançar` em vez do container do diálogo.
 - Se o modal de exportação da Cielo avançar para uma segunda confirmação, a automação agora clica apenas em ações seguintes ainda dentro do modal, para finalizar a exportação sem reabrir o botão `Exportar` da página.
 - Quando a Cielo envia a exportação gerada para a área de `Relatórios` em vez de baixar imediatamente, a automação agora aguarda o CTA visível de relatórios e usa a aba `Relatórios` da própria página como fallback, sem acessar rotas que redirecionam de volta para login.
-- No painel lateral de `Relatórios` da Cielo, a automação agora baixa o primeiro item compatível com `Vendas Cielo histórico resumo`, já que os relatórios mais recentes aparecem de cima para baixo e a ação de download é apenas um ícone.
+- No painel lateral de `Relatórios` da Cielo, a automação agora baixa o primeiro item compatível com `Vendas Cielo histórico detalhado`, já que os relatórios mais recentes aparecem de cima para baixo e a ação de download é apenas um ícone.
+- Linhas de relatório da Cielo com período em intervalo, como `18/05/2026 até 24/05/2026`, agora são aceitas quando a data solicitada está dentro desse intervalo antes do clique no ícone de download.
+- O painel lateral de relatórios da Cielo agora também reconhece controles de download sem texto, como `i[name="download"]`, e usa a lateral direita da linha compatível quando o ícone não possui um botão ao redor.
+- Se o painel lateral de relatórios da Cielo fechar ou a automação voltar para `Vendas > Detalhado` enquanto aguarda o arquivo, o app agora reabre `Relatórios` e tenta novamente o ícone de download.
 - Os downloads da Cielo agora são aceitos pela data solicitada no nome do arquivo mesmo antes da validação completa das transações, evitando cliques repetidos no mesmo ícone de relatório.
 - O filtro histórico de data da Cielo agora prioriza a seleção pelo calendário/datepicker do portal em vez de apenas alterar o valor bruto do campo, e não trata seleção de data não confirmada como uma resposta válida sem resultados.
 - Se a página `Consolidado de vendas` da Cielo já estiver aberta e sem resultados exportáveis, o app agora encerra o fallback da Cielo em vez de testar rotas alternativas que podem redirecionar de volta para o login.

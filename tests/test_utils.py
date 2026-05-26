@@ -1,4 +1,8 @@
+import json
+import threading
 import time
+import zipfile
+from pathlib import Path
 
 import pytest
 import utils
@@ -10,6 +14,7 @@ from utils import (
     _classify_caixa_document,
     _find_eh_local_payment_reports,
     _filter_zweb_fechamento_to_sales_date,
+    get_gmail_oauth_status,
     _is_eh_counter_client,
     _merge_card_machine_report,
     _project_base_dir,
@@ -18,10 +23,12 @@ from utils import (
     _mva_cielo_needed_card_keys,
     _normalize_fiscal_number,
     _refresh_mva_caixa_reports_if_needed,
+    _run_gmail_oauth_local_server,
     _wait_for_cielo_downloaded_report,
     _zweb_fechamento_has_sales_outside_date,
     analisar_pdf_fechamento_caixa_mva_clipp,
     aplicar_escopo_relatorio_caixa,
+    criar_relatorio_orcamentos_mva_vazio,
     describe_closing_scope,
 )
 
@@ -78,6 +85,29 @@ def test_project_base_dir_prefers_frozen_executable_folder(tmp_path, monkeypatch
     assert _project_base_dir() == str(app_dir)
 
 
+def test_gmail_oauth_server_honors_pre_cancelled_event():
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(RuntimeError, match="__cancelled__"):
+        _run_gmail_oauth_local_server(object(), cancel_event=cancel_event)
+
+
+def test_gmail_oauth_status_reports_missing_token(tmp_path, monkeypatch):
+    (tmp_path / "gmail_oauth_client.json").write_text(
+        json.dumps({"installed": {"client_id": "client", "client_secret": "secret"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_ID", "")
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRET", "")
+    monkeypatch.setattr(utils, "_runtime_user_dir", lambda: str(tmp_path))
+
+    status = get_gmail_oauth_status()
+
+    assert status["needs_auth"] is True
+    assert status["status"] == "missing_token"
+
+
 def test_build_card_reports_from_cielo_csv(tmp_path):
     caminho = tmp_path / "relatorio_cielo.csv"
     caminho.write_text(
@@ -100,6 +130,31 @@ def test_build_card_reports_from_cielo_csv(tmp_path):
     assert reports["cartao_credito_caixa"]["total_autorizado"] == 100.50
     assert reports["cartao_debito_caixa"]["quantidade_autorizados"] == 1
     assert reports["cartao_debito_caixa"]["total_autorizado"] == 50.00
+
+
+def test_empty_mva_budget_report_combines_without_changing_davs():
+    davs = {
+        "arquivo": "dav.pdf",
+        "caixa_modelo": "MVA",
+        "arquivo_tipo": "exportacao_dados_mva",
+        "periodo": "25/05/2026 - 25/05/2026",
+        "pedidos_total": 1,
+        "pedidos_caixa": 1,
+        "pedidos_excluidos": 0,
+        "pedidos_editando": 0,
+        "pedidos_outros_status": 0,
+        "total_documento": 10.0,
+        "total_excluido": 0.0,
+        "total_caixa": 10.0,
+        "itens_caixa": [{"pedido": "123456", "valor": 10.0, "ordem": "2026-05-25 08:00:00"}],
+        "itens_excluidos": [],
+    }
+
+    combined = utils.combinar_relatorios_caixa_mva([davs, criar_relatorio_orcamentos_mva_vazio(davs["periodo"])])
+
+    assert combined["pedidos_total"] == 1
+    assert combined["total_caixa"] == 10.0
+    assert combined["periodo"] == "25/05/2026 - 25/05/2026"
 
 
 def test_build_card_reports_from_cielo_csv_prefers_transaction_header(tmp_path):
@@ -172,6 +227,133 @@ def test_wait_for_cielo_downloaded_report_accepts_detailed_when_required(tmp_pat
     found = _wait_for_cielo_downloaded_report(str(tmp_path), "30/04/2026", time.time() - 5, timeout=0.1, require_detailed=True)
 
     assert found == str(detalhado)
+
+
+def _write_caixa_pix_xlsx_with_invalid_styles(path: Path) -> None:
+    strings = [
+        "Relatorio de Vendas Pix",
+        "Data da venda",
+        "Cod. de autorizacao",
+        "Valor bruto",
+        "Terminal",
+        "Numero do estabelecimento",
+        "Status",
+        "23/05/2026 as 10:01",
+        "ABC123",
+        "10,50",
+        "POS1",
+        "91111977",
+        "APROVADA",
+    ]
+    shared_items = "".join(f"<si><t>{value}</t></si>" for value in strings)
+    sheet_rows = "\n".join(
+        [
+            '<row r="1"><c r="A1" t="s"><v>0</v></c></row>',
+            (
+                '<row r="2">'
+                '<c r="A2" t="s"><v>1</v></c>'
+                '<c r="B2" t="s"><v>2</v></c>'
+                '<c r="C2" t="s"><v>3</v></c>'
+                '<c r="D2" t="s"><v>4</v></c>'
+                '<c r="E2" t="s"><v>5</v></c>'
+                '<c r="F2" t="s"><v>6</v></c>'
+                "</row>"
+            ),
+            (
+                '<row r="3">'
+                '<c r="A3" t="s"><v>7</v></c>'
+                '<c r="B3" t="s"><v>8</v></c>'
+                '<c r="C3" t="s"><v>9</v></c>'
+                '<c r="D3" t="s"><v>10</v></c>'
+                '<c r="E3" t="s"><v>11</v></c>'
+                '<c r="F3" t="s"><v>12</v></c>'
+                "</row>"
+            ),
+        ]
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+                '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr(
+            "_rels/.rels",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '<sheets><sheet name="Pix" sheetId="1" r:id="rId1"/></sheets>'
+                "</workbook>"
+            ),
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
+                '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">'
+                f"{shared_items}</sst>"
+            ),
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<sheetData>{sheet_rows}</sheetData></worksheet>"
+            ),
+        )
+        archive.writestr("xl/styles.xml", "<styleSheet><broken></styleSheet>")
+
+
+def test_wait_for_downloaded_report_accepts_pix_xlsx_with_invalid_styles(tmp_path):
+    caminho = tmp_path / "Relatorio_de_Vendas_Pix_23-05-2026_1033.xlsx"
+    _write_caixa_pix_xlsx_with_invalid_styles(caminho)
+
+    found = utils._wait_for_downloaded_report(str(tmp_path), "23/05/2026", "pix", time.time() - 5, timeout=0.1)
+
+    assert found is not None
+    assert Path(found).suffix == ".csv"
+    assert "23/05/2026 as 10:01" in Path(found).read_text(encoding="utf-8-sig")
+
+
+def test_find_local_payment_reports_accepts_pix_xlsx_with_invalid_styles(tmp_path, monkeypatch):
+    caminho = tmp_path / "Relatorio_de_Vendas_Pix_23-05-2026_eh_auto.xlsx"
+    _write_caixa_pix_xlsx_with_invalid_styles(caminho)
+    monkeypatch.setattr(utils, "_candidate_local_report_dirs", lambda: [tmp_path])
+
+    found = _find_eh_local_payment_reports("23/05/2026", company="EH")
+
+    assert found["pix"] == str(caminho)
 
 
 def test_find_local_payment_reports_prefers_consolidated_company_card_xlsx(tmp_path, monkeypatch):

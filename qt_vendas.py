@@ -24,6 +24,7 @@ from utils import (
     analisar_pdf_fechamento_caixa_mva_clipp,
     combinar_relatorios_caixa_mva,
     comparar_caixa_resumo_nfce,
+    criar_relatorio_orcamentos_mva_vazio,
     aplicar_escopo_relatorio_caixa,
     describe_closing_scope,
     gerar_relatorios_caixa_eh_zweb,
@@ -53,7 +54,9 @@ from utils import (
     listar_vendedores_db,
     set_ui_refs,
     _active_report_dir,
+    _get_gmail_api_credentials,
     cleanup_generated_auto_reports,
+    get_gmail_oauth_status,
     list_generated_auto_reports,
     canonicalize_name,
 )
@@ -537,6 +540,62 @@ class InstructionDialog(QtWidgets.QDialog):
 
     def confirmed(self) -> bool:
         return self.exec() == QtWidgets.QDialog.Accepted
+
+
+class MvaBudgetMissingDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self._choice: str | None = None
+        self.setFont(_popup_font(self))
+        self.setWindowTitle("Caixa MVA - Passo 2 de 3")
+        self.setModal(True)
+        self.resize(520, 220)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(14)
+
+        label = QtWidgets.QLabel(
+            corrigir_texto(
+                "O app não encontrou um PDF de Orçamento da MVA.\n\n"
+                "Se não houve orçamento neste dia, clique em Ignorar orçamento para seguir apenas com os DAVs."
+            )
+        )
+        label.setWordWrap(True)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(label, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch()
+
+        btn_select = QtWidgets.QPushButton("Selecionar orçamento")
+        btn_select.setStyleSheet("text-align:center;")
+        btn_select.setMinimumWidth(150)
+        btn_select.clicked.connect(lambda: self._set_choice("select"))
+        buttons.addWidget(btn_select)
+
+        btn_ignore = QtWidgets.QPushButton("Ignorar orçamento")
+        btn_ignore.setStyleSheet("text-align:center;")
+        btn_ignore.setMinimumWidth(150)
+        btn_ignore.clicked.connect(lambda: self._set_choice("ignore"))
+        buttons.addWidget(btn_ignore)
+
+        btn_cancel = QtWidgets.QPushButton("Cancelar")
+        btn_cancel.setStyleSheet("text-align:center;")
+        btn_cancel.setMinimumWidth(120)
+        btn_cancel.clicked.connect(self.reject)
+        buttons.addWidget(btn_cancel)
+
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+    def _set_choice(self, value: str) -> None:
+        self._choice = value
+        self.accept()
+
+    def choice(self) -> str | None:
+        if self.exec() == QtWidgets.QDialog.Accepted:
+            return self._choice
+        return None
 
 
 class LoadingStatusDialog(QtWidgets.QDialog):
@@ -3175,6 +3234,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_print_jobs: dict[str, list[dict[str, str]]] = {"EH": [], "MVA": []}
         self._eh_special_closing_enabled = False
         self._mva_special_scope_enabled = False
+        self._gmail_status_cache: dict[str, object] | None = None
+        self._gmail_status_checked_at = 0.0
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -3340,6 +3401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, title in (
             ("automation", "Automação"),
             ("pending", "Pendências"),
+            ("gmail", "Gmail"),
             ("workspace", "Workspace"),
         ):
             frame, value_label, note_label = self._create_status_card(title, key)
@@ -3571,6 +3633,78 @@ class MainWindow(QtWidgets.QMainWindow):
                     style.polish(frame)
                 frame.update()
 
+    def _get_cached_gmail_status(self, *, force: bool = False) -> dict[str, object]:
+        now = time.time()
+        if (
+            not force
+            and self._gmail_status_cache is not None
+            and now - self._gmail_status_checked_at < 20.0
+        ):
+            return self._gmail_status_cache
+        try:
+            status = get_gmail_oauth_status()
+        except Exception as exc:
+            status = {
+                "ok": False,
+                "needs_auth": True,
+                "status": "error",
+                "title": "Gmail não verificado",
+                "message": f"Não foi possível verificar a autenticação do Gmail: {exc}",
+            }
+        self._gmail_status_cache = status
+        self._gmail_status_checked_at = now
+        return status
+
+    def _ensure_gmail_authenticated_for_caixa(self) -> bool:
+        status = self._get_cached_gmail_status(force=True)
+        if not bool(status.get("needs_auth")):
+            return True
+
+        title = corrigir_texto(str(status.get("title") or "Gmail não autenticado"))
+        message = corrigir_texto(str(status.get("message") or "O Gmail precisa ser autenticado."))
+        proceed = messagebox.askyesno(
+            title,
+            (
+                f"{message}\n\n"
+                "O Caixa usa o Gmail para ler os códigos enviados pela Caixa/Azulzinha e pela Cielo.\n\n"
+                "Deseja autenticar o Gmail agora, antes de continuar?"
+            ),
+        )
+        if not proceed:
+            return False
+
+        cancel_loading = threading.Event()
+
+        def worker(push_status: Callable[[str], None], result: dict) -> None:
+            push_status("Abrindo autorização do Gmail no navegador...")
+            creds = _get_gmail_api_credentials(on_status=push_status, cancel_event=cancel_loading)
+            result["ok"] = bool(creds and getattr(creds, "valid", False))
+
+        result, was_cancelled = self._run_loading_worker(
+            "Autenticação do Gmail",
+            "Autorize o Gmail no navegador para continuar.",
+            worker,
+            cancel_event=cancel_loading,
+        )
+        self._gmail_status_cache = None
+        self._gmail_status_checked_at = 0.0
+        self._refresh_dashboard_status_cards()
+
+        if was_cancelled:
+            messagebox.showwarning("Gmail", "Autenticação do Gmail cancelada.")
+            return False
+        if result.get("error"):
+            messagebox.showerror("Gmail", f"Não foi possível autenticar o Gmail:\n{result['error']}")
+            return False
+        status_after = self._get_cached_gmail_status(force=True)
+        if bool(status_after.get("needs_auth")):
+            messagebox.showwarning(
+                "Gmail",
+                corrigir_texto(str(status_after.get("message") or "O Gmail ainda não está autenticado.")),
+            )
+            return False
+        return True
+
     def _refresh_dashboard_status_cards(self) -> None:
         if not hasattr(self, "_status_cards"):
             return
@@ -3605,6 +3739,19 @@ class MainWindow(QtWidgets.QMainWindow):
             str(pending_total),
             " | ".join(pending_labels),
         )
+
+        gmail_status = self._get_cached_gmail_status()
+        gmail_status_key = str(gmail_status.get("status") or "")
+        if bool(gmail_status.get("needs_auth")):
+            gmail_value = "Atenção"
+            gmail_note = "Autenticar antes do Caixa"
+        elif gmail_status_key == "refreshable":
+            gmail_value = "OK"
+            gmail_note = "Renova automático"
+        else:
+            gmail_value = "OK"
+            gmail_note = "Autenticado"
+        self._set_status_card("gmail", gmail_value, gmail_note)
 
         file_text = corrigir_texto(self.label_files.text() or "Nenhum arquivo carregado")
         file_summary = file_text if len(file_text) <= 70 else f"{file_text[:67]}..."
@@ -4429,8 +4576,13 @@ class MainWindow(QtWidgets.QMainWindow):
             push_status("Lendo DAV MVA...")
             result["relatorio_davs"] = analisar_pdf_caixa(path_davs)
             _check_cancelled()
-            push_status("Lendo Orcamento...")
-            result["relatorio_orcamentos"] = analisar_pdf_caixa(path_orcamentos)
+            if path_orcamentos:
+                push_status("Lendo Orcamento...")
+                result["relatorio_orcamentos"] = analisar_pdf_caixa(path_orcamentos)
+            else:
+                push_status("Orcamento ignorado; seguindo apenas com DAV MVA...")
+                periodo_dav = (result.get("relatorio_davs") or {}).get("periodo")
+                result["relatorio_orcamentos"] = criar_relatorio_orcamentos_mva_vazio(periodo_dav)
             _check_cancelled()
             result["relatorio_cupons"] = None
             if path_cupons:
@@ -4584,8 +4736,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not path_davs:
             missing.append("DAV MVA")
-        if not path_orcamentos:
-            missing.append("Orcamento")
         if not path_cupons:
             missing.append("Fechamento de Caixa")
         if missing:
@@ -4613,17 +4763,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if not davs_ok:
             return None, None, [], davs_msg
 
-        orc_ok, orc_msg = validar_arquivo_caixa_mva(relatorio_orcamentos, "orcamentos_mva")
-        if not orc_ok:
-            return None, None, [], orc_msg
+        if path_orcamentos:
+            orc_ok, orc_msg = validar_arquivo_caixa_mva(relatorio_orcamentos, "orcamentos_mva")
+            if not orc_ok:
+                return None, None, [], orc_msg
 
-        if relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
+        if path_orcamentos and relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
             if relatorio_davs.get("periodo") != relatorio_orcamentos.get("periodo"):
                 return None, None, [], (
                     "A Exportação de dados e o relatório de Orçamento da MVA precisam ser do mesmo período."
                 )
 
-        relatorio = combinar_relatorios_caixa_mva([relatorio_davs, relatorio_orcamentos])
+        relatorios_mva = [relatorio_davs]
+        if path_orcamentos and relatorio_orcamentos:
+            relatorios_mva.append(relatorio_orcamentos)
+        relatorio = combinar_relatorios_caixa_mva(relatorios_mva)
         if relatorio.get("pedidos_total", 0) <= 0:
             return None, None, [], "Nenhum pedido foi encontrado nos arquivos da MVA."
 
@@ -5058,6 +5212,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._automation_running:
             return
 
+        gmail_status = self._get_cached_gmail_status(force=True)
+        if bool(gmail_status.get("needs_auth")):
+            message = (
+                "Gmail não autenticado. Autorize o Gmail antes de rodar a automação do Caixa.\n\n"
+                + corrigir_texto(str(gmail_status.get("message") or ""))
+            ).strip()
+            self._automation_last_status = message
+            self._refresh_automation_controls_ui()
+            if notify_user:
+                messagebox.showwarning("Automação bloqueada", message)
+            return
+
         self._automation_running = True
         self.btn_automation_power.setEnabled(False)
         self.btn_automation_test.setEnabled(False)
@@ -5198,6 +5364,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cnpj = CaixaCnpjDialog(self).choice()
         if not cnpj:
             return
+        if not self._ensure_gmail_authenticated_for_caixa():
+            return
 
         if cnpj == "MVA":
             auto_files = self._auto_find_mva_caixa_files()
@@ -5220,23 +5388,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
             path_orcamentos = auto_files.get("orcamentos", "")
             if not path_orcamentos:
-                if not InstructionDialog(
-                    self,
-                    "Caixa MVA - Passo 2 de 3",
-                    "Selecione agora o PDF Orcamento.\n\n"
-                    "O app tentou localizar automaticamente um arquivo com nome Orcamento e não encontrou.",
-                ).confirmed():
+                budget_choice = MvaBudgetMissingDialog(self).choice()
+                if budget_choice is None:
                     return
-                path_orcamentos = filedialog.askopenfilename(
-                    filetypes=[("Arquivos PDF", "*.pdf")],
-                    title="Caixa MVA - Passo 2 de 3: selecionar Orcamento",
-                )
-            if not path_orcamentos:
-                messagebox.showwarning(
-                    "Arquivo obrigatório",
-                    "O relatório de Orcamento da MVA precisa ser selecionado para continuar.",
-                )
-                return
+                if budget_choice == "select":
+                    path_orcamentos = filedialog.askopenfilename(
+                        filetypes=[("Arquivos PDF", "*.pdf")],
+                        title="Caixa MVA - Passo 2 de 3: selecionar Orcamento",
+                    )
+                    if not path_orcamentos:
+                        return
 
             path_cupons = auto_files.get("cupons", "")
             if not path_cupons:
@@ -5302,15 +5463,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 messagebox.showwarning("Arquivo inválido", davs_msg)
                 return
 
-            orc_ok, orc_msg = validar_arquivo_caixa_mva(
-                relatorio_orcamentos,
-                "orcamentos_mva",
-            )
-            if not orc_ok:
-                messagebox.showwarning("Arquivo inválido", orc_msg)
-                return
+            if path_orcamentos:
+                orc_ok, orc_msg = validar_arquivo_caixa_mva(
+                    relatorio_orcamentos,
+                    "orcamentos_mva",
+                )
+                if not orc_ok:
+                    messagebox.showwarning("Arquivo inválido", orc_msg)
+                    return
 
-            if relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
+            if path_orcamentos and relatorio_davs.get("periodo") and relatorio_orcamentos.get("periodo"):
                 if relatorio_davs.get("periodo") != relatorio_orcamentos.get("periodo"):
                     messagebox.showwarning(
                         "Período inválido",
@@ -5318,9 +5480,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     return
 
-            relatorio = combinar_relatorios_caixa_mva(
-                [relatorio_davs, relatorio_orcamentos]
-            )
+            relatorios_mva = [relatorio_davs]
+            if path_orcamentos and relatorio_orcamentos:
+                relatorios_mva.append(relatorio_orcamentos)
+            relatorio = combinar_relatorios_caixa_mva(relatorios_mva)
 
             if relatorio.get("pedidos_total", 0) <= 0:
                 messagebox.showwarning("Aviso", "Nenhum pedido foi encontrado neste PDF.")

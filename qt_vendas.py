@@ -11,6 +11,7 @@ import queue
 import threading
 import difflib
 import unicodedata
+import atexit
 from typing import Callable, List, Optional
 from pathlib import Path
 
@@ -71,6 +72,16 @@ from qt_adapters import (
 
 
 _LEXEND_REPORTLAB_FONT_NAME: str | None = None
+
+
+def _format_exception_message(exc: BaseException, fallback: str = "Falha inesperada.") -> str:
+    message = corrigir_texto(str(exc)).strip()
+    if message:
+        return message
+    exc_name = type(exc).__name__.strip()
+    if exc_name:
+        return f"{fallback} ({exc_name})"
+    return fallback
 
 
 def _center_message_box_buttons(box: QtWidgets.QMessageBox) -> None:
@@ -811,7 +822,7 @@ class CaixaScopeDialog(QtWidgets.QDialog):
         self.setFont(_popup_font(self))
         self.setWindowTitle(f"Caixa {company_label}")
         self.setModal(True)
-        self.resize(460, 220)
+        self.resize(560, 220)
         self._choice: str | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -833,11 +844,12 @@ class CaixaScopeDialog(QtWidgets.QDialog):
         buttons_row.addStretch()
 
         btn_daily = QtWidgets.QPushButton("Diário")
+        btn_morning = QtWidgets.QPushButton("Manhã")
         btn_afternoon = QtWidgets.QPushButton("Tarde")
         btn_cancel = QtWidgets.QPushButton("Cancelar")
-        for btn in (btn_daily, btn_afternoon, btn_cancel):
+        for btn in (btn_daily, btn_morning, btn_afternoon, btn_cancel):
             btn.setMinimumHeight(36)
-            btn.setMinimumWidth(116)
+            btn.setMinimumWidth(104)
             btn.setStyleSheet("text-align:center;")
             buttons_row.addWidget(btn)
 
@@ -845,6 +857,7 @@ class CaixaScopeDialog(QtWidgets.QDialog):
         layout.addLayout(buttons_row)
 
         btn_daily.clicked.connect(lambda: self._set_choice("daily"))
+        btn_morning.clicked.connect(lambda: self._set_choice("morning"))
         btn_afternoon.clicked.connect(lambda: self._set_choice("afternoon"))
         btn_cancel.clicked.connect(self.reject)
 
@@ -4476,7 +4489,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if str(exc).strip() == "__cancelled__":
                     result["cancelled"] = True
                 else:
-                    result["error"] = str(exc)
+                    result["error"] = _format_exception_message(exc, "Falha ao processar a etapa em segundo plano.")
 
         dialog = LoadingStatusDialog(self, title, message)
         if cancel_event is not None:
@@ -4563,6 +4576,7 @@ class MainWindow(QtWidgets.QMainWindow):
         path_cupons: str,
         *,
         force_refresh_payments: bool = False,
+        allow_cielo_fallback: bool = True,
         scope_mode: str | None = None,
         filter_opening_date_br: str | None = None,
     ) -> tuple[dict | None, dict | None, dict | None, str | None]:
@@ -4584,29 +4598,58 @@ class MainWindow(QtWidgets.QMainWindow):
                 periodo_dav = (result.get("relatorio_davs") or {}).get("periodo")
                 result["relatorio_orcamentos"] = criar_relatorio_orcamentos_mva_vazio(periodo_dav)
             _check_cancelled()
+            if path_orcamentos and result["relatorio_davs"].get("periodo") and result["relatorio_orcamentos"].get("periodo"):
+                if result["relatorio_davs"].get("periodo") != result["relatorio_orcamentos"].get("periodo"):
+                    raise RuntimeError(
+                        "A Exportacao de dados e o relatorio de Orcamento da MVA precisam ser do mesmo periodo."
+                    )
+
             result["relatorio_cupons"] = None
             if path_cupons:
-                push_status("Lendo Fechamento de Caixa...")
-                relatorio_cupons = analisar_pdf_fechamento_caixa_mva_clipp(
-                    path_cupons,
-                    auto_download_missing=True,
-                    force_refresh_payments=force_refresh_payments,
-                    scope_mode=scope_mode,
-                    filter_opening_date_br=filter_opening_date_br,
-                    on_status=push_status,
-                    cancel_event=cancel_loading,
-                )
-                _check_cancelled()
-                avisos_cupons = list(relatorio_cupons.get("avisos_usuario") or [])
-                if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
-                    relatorio_cupons = analisar_pdf_resumo_nfce(path_cupons)
-                    if avisos_cupons:
-                        relatorio_cupons["avisos_usuario"] = list(
-                            dict.fromkeys(
-                                list(relatorio_cupons.get("avisos_usuario") or [])
-                                + avisos_cupons
+                def _read_mva_closing(*, auto_download_missing: bool) -> dict:
+                    relatorio_lido = analisar_pdf_fechamento_caixa_mva_clipp(
+                        path_cupons,
+                        auto_download_missing=auto_download_missing,
+                        force_refresh_payments=force_refresh_payments,
+                        allow_cielo_fallback=allow_cielo_fallback,
+                        scope_mode=scope_mode,
+                        filter_opening_date_br=filter_opening_date_br,
+                        on_status=push_status if auto_download_missing else None,
+                        cancel_event=cancel_loading,
+                    )
+                    avisos_lidos = list(relatorio_lido.get("avisos_usuario") or [])
+                    if relatorio_lido.get("quantidade_nfce", 0) <= 0:
+                        relatorio_lido = analisar_pdf_resumo_nfce(path_cupons)
+                        if avisos_lidos:
+                            relatorio_lido["avisos_usuario"] = list(
+                                dict.fromkeys(
+                                    list(relatorio_lido.get("avisos_usuario") or [])
+                                    + avisos_lidos
+                                )
                             )
-                        )
+                    return relatorio_lido
+
+                push_status("Lendo Fechamento de Caixa...")
+                relatorio_cupons_previo = _read_mva_closing(auto_download_missing=False)
+                _check_cancelled()
+                periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
+                    result["relatorio_davs"],
+                    relatorio_cupons_previo,
+                    titulo_secundario="relatorio de Cupons",
+                )
+                if not periodo_ok:
+                    raise RuntimeError(periodo_msg)
+
+                push_status("Validando pagamentos da MVA...")
+                relatorio_cupons = _read_mva_closing(auto_download_missing=True)
+                _check_cancelled()
+                periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
+                    result["relatorio_davs"],
+                    relatorio_cupons,
+                    titulo_secundario="relatorio de Cupons",
+                )
+                if not periodo_ok:
+                    raise RuntimeError(periodo_msg)
                 result["relatorio_cupons"] = relatorio_cupons
 
         result, was_cancelled = self._run_loading_worker(
@@ -4686,6 +4729,25 @@ class MainWindow(QtWidgets.QMainWindow):
             relatorio_pix,
             scope_mode=scope_mode,
         )
+
+    def _scope_unavailable_message(self, scope_mode: str | None, company_label: str) -> str | None:
+        scope_norm = str(scope_mode or "").strip()
+        if scope_norm == "morning":
+            return f"O fechamento completo da {company_label} ainda não está disponível para separar a manhã."
+        if scope_norm == "afternoon":
+            return f"O fechamento completo da {company_label} ainda não está disponível para separar a tarde."
+        return None
+
+    def _closing_scope_available(self, scope_mode: str | None, relatorio_fechamento: dict | None) -> bool:
+        scope_norm = str(scope_mode or "").strip()
+        if scope_norm in {"", "daily"}:
+            return True
+        scope_info = describe_closing_scope(relatorio_fechamento)
+        if scope_norm == "morning":
+            return bool(scope_info.get("has_full_day") or scope_info.get("has_morning_only"))
+        if scope_norm == "afternoon":
+            return bool(scope_info.get("has_full_day") or scope_info.get("has_afternoon_only"))
+        return True
 
     def _mark_mva_pending_scope(self, scope_mode: str, data_br: str, message: str) -> None:
         self._mva_pending_runs[scope_mode] = {
@@ -4796,11 +4858,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return None, None, [], resumo_msg
         if relatorio_cupons.get("quantidade_nfce", 0) <= 0:
             return None, None, [], "Nenhum cupom foi encontrado no Fechamento de Caixa da MVA."
-        scope_info = describe_closing_scope(relatorio_cupons)
-        if scope_mode == "afternoon" and not (
-            scope_info.get("has_full_day") or scope_info.get("has_afternoon_only")
-        ):
-            aviso = "O fechamento completo da MVA ainda não está disponível para separar a tarde."
+        if not self._closing_scope_available(scope_mode, relatorio_cupons):
+            aviso = self._scope_unavailable_message(scope_mode, "MVA") or "O fechamento da MVA ainda não está disponível para o escopo solicitado."
             self._mark_mva_pending_scope(scope_mode, data_br, aviso)
             return None, None, [], aviso
 
@@ -4881,11 +4940,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None, None, None, [], resumo_msg
             if relatorio_nfce.get("quantidade_nfce", 0) <= 0:
                 return None, None, None, [], "Nenhuma NFC-e foi encontrada no Fechamento de caixa do Zweb."
-            scope_info = describe_closing_scope(relatorio_nfce)
-            if scope_mode == "afternoon" and not (
-                scope_info.get("has_full_day") or scope_info.get("has_afternoon_only")
-            ):
-                return None, None, None, [], "O fechamento completo da EH ainda não está disponível para separar a tarde."
+            if not self._closing_scope_available(scope_mode, relatorio_nfce):
+                return None, None, None, [], (
+                    self._scope_unavailable_message(scope_mode, "EH")
+                    or "O fechamento da EH ainda não está disponível para o escopo solicitado."
+                )
 
             periodo_ok, periodo_msg = validar_periodo_relatorios_caixa(
                 relatorio,
@@ -5287,7 +5346,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if print_error:
                     errors.append(print_error)
         except Exception as exc:
-            errors.append(str(exc))
+            error_message = _format_exception_message(exc, "Falha inesperada durante a automação.")
+            if error_message:
+                errors.append(error_message)
         finally:
             self._automation_running = False
             self.btn_automation_power.setEnabled(True)
@@ -5421,6 +5482,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not continuar_sem_cupons:
                     return
 
+            allow_cielo_fallback = True
+            if path_cupons:
+                allow_cielo_fallback = messagebox.askyesno(
+                    "Cielo",
+                    "Usar Cielo?",
+                )
+
             selected_scope_mode: str | None = None
             selected_opening_date: str | None = None
             if path_cupons and self._mva_special_scope_enabled:
@@ -5447,6 +5515,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 path_orcamentos,
                 path_cupons,
                 force_refresh_payments=False,
+                allow_cielo_fallback=allow_cielo_fallback,
                 scope_mode=selected_scope_mode,
                 filter_opening_date_br=selected_opening_date,
             )
@@ -5518,6 +5587,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
                 scope_mode = selected_scope_mode or self._resolve_manual_closing_scope(relatorio_cupons, "MVA")
                 if scope_mode is None:
+                    return
+                if not self._closing_scope_available(scope_mode, relatorio_cupons):
+                    messagebox.showwarning(
+                        "Escopo indisponível",
+                        self._scope_unavailable_message(scope_mode, "MVA")
+                        or "O fechamento da MVA ainda não está disponível para o escopo solicitado.",
+                    )
                     return
                 relatorio, relatorio_cupons, _ = self._apply_scope_to_reports(
                     relatorio,
@@ -5616,6 +5692,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             scope_mode = selected_scope_mode or self._resolve_manual_closing_scope(relatorio_nfce, "EH")
             if scope_mode is None:
+                return
+            if not self._closing_scope_available(scope_mode, relatorio_nfce):
+                messagebox.showwarning(
+                    "Escopo indisponível",
+                    self._scope_unavailable_message(scope_mode, "EH")
+                    or "O fechamento da EH ainda não está disponível para o escopo solicitado.",
+                )
                 return
             relatorio, relatorio_nfce, relatorio_pix = self._apply_scope_to_reports(
                 relatorio,
@@ -6164,37 +6247,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _confirm_generated_auto_reports_cleanup(self) -> bool:
-        auto_reports = list_generated_auto_reports()
-        if not auto_reports:
-            return True
-
-        dlg = QtWidgets.QMessageBox(self)
-        dlg.setWindowTitle("Relatórios automáticos")
-        dlg.setText(
-            "Foram encontrados relatórios automáticos da Azulzinha/Zweb no workspace.\n"
-            "Deseja manter esses arquivos após fechar o aplicativo?"
-        )
-        dlg.setInformativeText(
-            f"Arquivos encontrados: {len(auto_reports)}.\n"
-            "Escolha 'Manter' para preservar os relatórios ou 'Excluir' para limpá-los ao fechar."
-        )
-        dlg.setIcon(QtWidgets.QMessageBox.Question)
-        btn_keep = dlg.addButton("Manter", QtWidgets.QMessageBox.AcceptRole)
-        btn_delete = dlg.addButton("Excluir", QtWidgets.QMessageBox.DestructiveRole)
-        btn_cancel = dlg.addButton("Cancelar", QtWidgets.QMessageBox.RejectRole)
-        dlg.setDefaultButton(btn_keep)
-        _center_message_box_buttons(dlg)
-        dlg.exec()
-
-        clicked = dlg.clickedButton()
-        if clicked == btn_keep:
-            return True
-        if clicked == btn_delete:
-            cleanup_generated_auto_reports()
-            return True
-        if clicked == btn_cancel:
-            return False
-        return False
+        cleanup_generated_auto_reports()
+        return True
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._edit_mode or self._table_dirty:
@@ -6250,7 +6304,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def run_app() -> None:
+    atexit.register(cleanup_generated_auto_reports)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.aboutToQuit.connect(cleanup_generated_auto_reports)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    try:
+        sys.exit(app.exec())
+    finally:
+        cleanup_generated_auto_reports()

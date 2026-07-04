@@ -38,9 +38,221 @@ def test_parse_number():
     assert parse_number("1,500.20") == 1500.20
     assert parse_number("20,50") == 20.50
     assert parse_number("100.00") == 100.00
+
+
+def test_cleanup_generated_auto_reports_removes_runtime_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(utils, "CIELO_DEBUG_LOGS_ENABLED", False)
+    should_delete = [
+        "body_email.txt",
+        "debug_zweb.html",
+        "azulzinha_login_wait_state.json",
+        "azulzinha_export_debug_pix.html",
+        "cielo_mva_debug_26052026_120000.log",
+        "cielo_snapshot_26052026_login.html",
+        "Relatorio_de_Vendas_Pix_26-05-2026_eh_auto.csv",
+        "Historico_Simplificado_de_vendas_26-05-2026_mva_auto.xlsx",
+        "Pedidos_importados_26-05-2026_eh_zweb_auto.html",
+    ]
+    should_keep = [
+        "credenciais.txt",
+        "gmail_oauth_token.json",
+        "relatorio_final_usuario.pdf",
+    ]
+    for name in should_delete + should_keep:
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    for dirname in ("azulzinha_browser", "cielo_browser"):
+        (tmp_path / dirname / "run_x").mkdir(parents=True)
+
+    utils.cleanup_generated_auto_reports(tmp_path)
+
+    assert all(not (tmp_path / name).exists() for name in should_delete)
+    assert all((tmp_path / name).exists() for name in should_keep)
+    assert not (tmp_path / "azulzinha_browser").exists()
+    assert not (tmp_path / "cielo_browser").exists()
+
+
+def test_cleanup_generated_auto_reports_preserves_cielo_debug_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(utils, "CIELO_DEBUG_LOGS_ENABLED", True)
+    debug_log = tmp_path / "cielo_mva_debug_26052026_120000.log"
+    snapshot = tmp_path / "cielo_snapshot_26052026_login.html"
+    debug_log.write_text("x", encoding="utf-8")
+    snapshot.write_text("x", encoding="utf-8")
+
+    utils.cleanup_generated_auto_reports(tmp_path)
+
+    assert debug_log.exists()
+    assert not snapshot.exists()
+
+
+def test_wait_for_downloaded_report_also_checks_active_report_dir(tmp_path, monkeypatch):
+    browser_dir = tmp_path / "browser_downloads"
+    active_dir = tmp_path / "app"
+    browser_dir.mkdir()
+    active_dir.mkdir()
+    report = active_dir / "Historico_Simplificado_de_vendas_26-05-2026_eh_auto.csv"
+    report.write_text(
+        "\n".join(
+            [
+                "Data da venda;Produto;Status;Valor bruto",
+                "26/05/2026 as 08:10;Credito;Aprovada;100,00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(utils, "_active_report_dir", lambda: str(active_dir))
+
+    found = utils._wait_for_downloaded_report(
+        str(browser_dir),
+        "26/05/2026",
+        "cartoes",
+        report.stat().st_mtime - 1,
+        timeout=0.0,
+    )
+
+    assert found == str(report)
+
+
+def test_wait_for_downloaded_report_ignores_mtime_skew_in_primary_download_dir(tmp_path):
+    browser_dir = tmp_path / "browser_downloads"
+    browser_dir.mkdir()
+    report = browser_dir / "Relatorio_Simplificado_de_Vendas_Historico_de_Vendas_26-05-2026_0930.xlsx"
+    report.write_text(
+        "\n".join(
+            [
+                "Relatório de vendas_Histórico de vendas",
+                "Período de Venda:  25/05/2026 à 25/05/2026",
+                "Data da venda;Cód. de autorização;Produto;Parcelas;Bandeira;Valor bruto;Status",
+                "25/05/2026 08:10:00;ABC123;Crédito à vista;-;Mastercard;100,00;Aprovada",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    found = utils._wait_for_downloaded_report(
+        str(browser_dir),
+        "25/05/2026",
+        "cartoes",
+        report.stat().st_mtime + 600,
+        timeout=0.0,
+    )
+
+    assert found == str(report)
+
+
+def test_wait_for_downloaded_report_does_not_accept_pix_as_card(tmp_path):
+    browser_dir = tmp_path / "browser_downloads"
+    browser_dir.mkdir()
+    pix = browser_dir / "Relatorio_de_Vendas_Pix_26-05-2026_0930.xlsx"
+    pix.write_text(
+        "\n".join(
+            [
+                "Relatório de Vendas Pix",
+                "Período de Venda:  25/05/2026 à 25/05/2026",
+                "Data da venda;Cód. de autorização;Valor bruto;Terminal;Status",
+                "25/05/2026 às 08:10;SE001;100,00;APT36A49;Aprovada",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    found = utils._wait_for_downloaded_report(
+        str(browser_dir),
+        "25/05/2026",
+        "cartoes",
+        pix.stat().st_mtime - 1,
+        timeout=0.0,
+    )
+
+    assert found is None
+
+
+def test_extract_local_report_date_prefers_sales_period_over_emission_date():
+    text = "\n".join(
+        [
+            "Relatorio de Vendas Pix",
+            "Emitido em: 26/05/2026 09:33:10",
+            "Periodo de Venda: 25/05/2026 ate 25/05/2026",
+            "Valor total de vendas finalizadas: R$ 1.234,56",
+        ]
+    )
+
+    assert utils._extract_local_report_date_br(text) == "25/05/2026"
+
+
+def test_wait_for_downloaded_report_accepts_pix_xlsx_named_by_download_date(tmp_path):
+    pd = pytest.importorskip("pandas")
+    browser_dir = tmp_path / "browser_downloads"
+    browser_dir.mkdir()
+    report = browser_dir / "Relatorio_de_Vendas_Pix_26-05-2026_0933.xlsx"
+    pd.DataFrame(
+        [
+            ["Relatorio de Vendas Pix"],
+            ["Emitido em: 26/05/2026 09:33:10"],
+            ["Periodo de Venda: 25/05/2026 ate 25/05/2026"],
+            ["Valor total de vendas finalizadas: R$ 1.234,56"],
+        ]
+    ).to_excel(report, index=False, header=False)
+
+    found = utils._wait_for_downloaded_report(str(browser_dir), "25/05/2026", "pix", time.time() - 5, timeout=0.1)
+
+    assert found is not None
+    assert Path(found).suffix == ".csv"
+
+
+def test_caixa_card_report_reads_xls_tabular_text(tmp_path):
+    report = tmp_path / "Historico_Simplificado_de_vendas_26-05-2026_eh_auto.xls"
+    report.write_text(
+        "\n".join(
+            [
+                "Data da venda;Cód. de autorização;Produto;Status;Valor bruto",
+                "26/05/2026 às 08:10;ABC123;Crédito;Aprovada;100,00",
+                "26/05/2026 às 08:12;DEF456;Débito;Autorizada;50,00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = utils._build_card_reports_from_caixa(str(report), "26/05/2026")
+
+    assert result["cartao_credito_caixa"]["total_autorizado"] == 100.0
+    assert result["cartao_debito_caixa"]["total_autorizado"] == 50.0
     assert parse_number(15.5) == 15.5
     assert parse_number(None) == 0.0
     assert parse_number(" ") == 0.0
+
+
+def test_caixa_card_report_deduplicates_same_authorization_across_establishments(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    report = tmp_path / "Historico_Simplificado_de_vendas_08-06-2026_mva_auto.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "Data da venda",
+            "Cód. de autorização",
+            "Comprovante da venda",
+            "Produto",
+            "Parcelado",
+            "Bandeira",
+            "Canal",
+            "Terminal",
+            "Valor bruto",
+            "Status",
+            "Número do estabelecimento",
+        ]
+    )
+    sheet.append(["08/06/2026 às 08:25", "ABC123", "ABC123", "Crédito", "-", "", "", "", 100.0, "Autorizada", "91111977"])
+    sheet.append(["08/06/2026 às 08:25", "ABC123", "ABC123", "Crédito", "-", "", "", "", 100.0, "Autorizada", "91119212"])
+    sheet.append(["08/06/2026 às 08:30", "DEF456", "DEF456", "Débito", "-", "", "", "", 50.0, "Autorizada", "91111977"])
+    workbook.save(report)
+
+    result = utils._build_card_reports_from_caixa(str(report), "08/06/2026")
+
+    assert result["cartao_credito_caixa"]["quantidade_autorizados"] == 1
+    assert result["cartao_credito_caixa"]["total_autorizado"] == 100.0
+    assert result["cartao_debito_caixa"]["quantidade_autorizados"] == 1
+    assert result["cartao_debito_caixa"]["total_autorizado"] == 50.0
+
 
 def test_format_number_br():
     assert format_number_br(1500.2) == "1.500,20"
@@ -100,12 +312,152 @@ def test_gmail_oauth_status_reports_missing_token(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("GMAIL_OAUTH_CLIENT_ID", "")
     monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRET", "")
+    monkeypatch.setattr(utils, "_canonical_runtime_dir", lambda: tmp_path)
     monkeypatch.setattr(utils, "_runtime_user_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(utils, "_active_report_dir", lambda: str(tmp_path))
 
     status = get_gmail_oauth_status()
 
     assert status["needs_auth"] is True
     assert status["status"] == "missing_token"
+
+
+def test_gmail_oauth_status_finds_client_in_canonical_runtime_dir(tmp_path, monkeypatch):
+    canonical_dir = tmp_path / "pdfReader"
+    app_dir = canonical_dir / "dist" / "Relatorio de Clientes"
+    canonical_dir.mkdir()
+    app_dir.mkdir(parents=True)
+    (canonical_dir / "gmail_oauth_client.json").write_text(
+        json.dumps({"installed": {"client_id": "client", "client_secret": "secret"}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_ID", "")
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRET", "")
+    monkeypatch.setattr(utils, "_canonical_runtime_dir", lambda: canonical_dir)
+    monkeypatch.setattr(utils, "_runtime_user_dir", lambda: str(app_dir))
+    monkeypatch.setattr(utils, "_active_report_dir", lambda: str(app_dir))
+
+    status = get_gmail_oauth_status()
+
+    assert status["needs_auth"] is True
+    assert status["status"] == "missing_token"
+    assert status["client_path"] == str(canonical_dir / "gmail_oauth_client.json")
+    assert status["token_path"] == str(canonical_dir / "gmail_oauth_token.json")
+
+
+def test_cielo_gmail_token_uses_recent_fallback_when_timestamp_filter_misses(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    class FakeSession:
+        def get(self, url, params=None, timeout=None):
+            if url.endswith("/messages"):
+                return FakeResponse({"messages": [{"id": "msg_new"}, {"id": "msg_old"}]})
+            msg_id = url.rsplit("/", 1)[-1]
+            fmt = (params or {}).get("format")
+            if fmt == "metadata":
+                internal_date = "100000" if msg_id == "msg_new" else "90000"
+                return FakeResponse(
+                    {
+                        "id": msg_id,
+                        "internalDate": internal_date,
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": "Cielo | Confirmação de e-mail"},
+                                {"name": "From", "value": "Cielo <cielo@comunica.cielo.com.br>"},
+                            ]
+                        },
+                    }
+                )
+            token = "903863" if msg_id == "msg_new" else "751036"
+            return FakeResponse(
+                {
+                    "id": msg_id,
+                    "internalDate": "100000" if msg_id == "msg_new" else "90000",
+                    "payload": {},
+                    "snippet": f"Para sua segurança, use o código de verificação abaixo: {token}",
+                }
+            )
+
+    monkeypatch.setattr(utils, "_cielo_gmail_session", lambda **_kwargs: FakeSession())
+    debug_info = {}
+
+    token = utils._fetch_cielo_token_from_gmail(
+        timeout=0.1,
+        min_internal_ts=100.5,
+        debug_info=debug_info,
+    )
+
+    assert token == "903863"
+    assert debug_info["candidate_count"] == 0
+    assert debug_info["fallback_candidate_count"] == 2
+    assert debug_info["selected_lookup_mode"] == "latest_recent"
+
+
+def test_cielo_gmail_token_does_not_use_stale_fallback(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    class FakeSession:
+        def get(self, url, params=None, timeout=None):
+            if url.endswith("/messages"):
+                return FakeResponse({"messages": [{"id": "msg_old"}]})
+            msg_id = url.rsplit("/", 1)[-1]
+            fmt = (params or {}).get("format")
+            if fmt == "metadata":
+                return FakeResponse(
+                    {
+                        "id": msg_id,
+                        "internalDate": "100000",
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": "Cielo | Confirmação de e-mail"},
+                                {"name": "From", "value": "Cielo <cielo@comunica.cielo.com.br>"},
+                            ]
+                        },
+                    }
+                )
+            return FakeResponse(
+                {
+                    "id": msg_id,
+                    "internalDate": "100000",
+                    "payload": {},
+                    "snippet": "Para sua segurança, use o código de verificação abaixo: 903863",
+                }
+            )
+
+    monkeypatch.setattr(utils, "_cielo_gmail_session", lambda **_kwargs: FakeSession())
+    monkeypatch.setattr(utils, "_sleep_with_cancel", lambda *_args, **_kwargs: None)
+    debug_info = {}
+
+    token = utils._fetch_cielo_token_from_gmail(
+        timeout=0.1,
+        min_internal_ts=500.0,
+        debug_info=debug_info,
+    )
+
+    assert token is None
+    assert debug_info["candidate_count"] == 0
+    assert debug_info["fallback_candidate_count"] == 0
 
 
 def test_build_card_reports_from_cielo_csv(tmp_path):
@@ -130,6 +482,37 @@ def test_build_card_reports_from_cielo_csv(tmp_path):
     assert reports["cartao_credito_caixa"]["total_autorizado"] == 100.50
     assert reports["cartao_debito_caixa"]["quantidade_autorizados"] == 1
     assert reports["cartao_debito_caixa"]["total_autorizado"] == 50.00
+
+
+def test_mva_cielo_fallback_can_be_disabled(monkeypatch):
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Cielo should not be consulted")
+
+    monkeypatch.setattr(utils, "_find_local_cielo_card_report", fail_if_called)
+    monkeypatch.setattr(utils, "baixar_relatorio_cielo_mva", fail_if_called)
+
+    fechamento = {
+        "relatorios_pagamento": {
+            "cartao_credito": {
+                "total_autorizado": 100.0,
+                "itens_autorizados": [{"valor_bruto": 100.0}],
+            },
+            "cartao_credito_caixa": {
+                "total_autorizado": 0.0,
+                "itens_autorizados": [],
+            },
+        }
+    }
+
+    result, avisos = utils._integrate_cielo_card_reports_if_needed(
+        fechamento,
+        "09/06/2026",
+        auto_download_missing=True,
+        allow_cielo_fallback=False,
+    )
+
+    assert result is fechamento
+    assert avisos == []
 
 
 def test_empty_mva_budget_report_combines_without_changing_davs():
@@ -227,6 +610,46 @@ def test_wait_for_cielo_downloaded_report_accepts_detailed_when_required(tmp_pat
     found = _wait_for_cielo_downloaded_report(str(tmp_path), "30/04/2026", time.time() - 5, timeout=0.1, require_detailed=True)
 
     assert found == str(detalhado)
+
+
+def test_wait_for_cielo_downloaded_report_rejects_non_exact_cielo_range(tmp_path):
+    detalhado = tmp_path / "Vendas_cielo_hoje_detalhe-20260618-20260619-1-1-csv.csv"
+    detalhado.write_text(
+        "\n".join(
+            [
+                "Detalhado de vendas Cielo",
+                "Data da venda: 18/06/2026 a 19/06/2026",
+                "Data da venda;Hora da venda;Forma de pagamento;Status da venda;Valor bruto;Codigo de autorizacao",
+                "19/06/2026;14:20;Credito a vista;Aprovada;90,00;123456",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    found = _wait_for_cielo_downloaded_report(str(tmp_path), "19/06/2026", time.time() - 5, timeout=0.1, require_detailed=True)
+
+    assert found is None
+
+
+def test_find_local_cielo_card_report_rejects_non_exact_range(tmp_path, monkeypatch):
+    detalhado = tmp_path / "cielo_cartoes_19062026_mva_auto.csv"
+    detalhado.write_text(
+        "\n".join(
+            [
+                "Detalhado de vendas Cielo",
+                "Data da venda: 18/06/2026 a 19/06/2026",
+                "Data da venda;Hora da venda;Forma de pagamento;Status da venda;Valor bruto;Codigo de autorizacao",
+                "19/06/2026;14:20;Credito a vista;Aprovada;90,00;123456",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(utils, "_candidate_local_report_dirs", lambda: [tmp_path])
+
+    found = utils._find_local_cielo_card_report("19/06/2026", company="MVA")
+
+    assert found["cartoes"] is None
+    assert any("intervalo" in aviso for aviso in found["avisos"])
 
 
 def _write_caixa_pix_xlsx_with_invalid_styles(path: Path) -> None:
@@ -386,6 +809,27 @@ def test_find_local_payment_reports_prefers_consolidated_company_card_xlsx(tmp_p
     assert found["cartoes"] == str(consolidated)
 
 
+def test_find_local_payment_reports_ignores_cielo_files(tmp_path, monkeypatch):
+    cielo = tmp_path / "cielo_cartoes_05062026_mva_auto.csv"
+    cielo.write_text(
+        "\n".join(
+            [
+                "Detalhado de vendas Cielo",
+                "Data da venda;Hora da venda;Forma de pagamento;Status da venda;Valor bruto;Codigo de autorizacao",
+                "05/06/2026;10:20;Credito a vista;Aprovada;100,00;123456",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(utils, "_candidate_local_report_dirs", lambda: [tmp_path])
+
+    found = _find_eh_local_payment_reports("05/06/2026", company="MVA")
+
+    assert found["pix"] is None
+    assert found["cartoes"] is None
+    assert found["avisos"] == []
+
+
 def test_mva_cielo_gap_and_merge_card_machine_report():
     fechamento = {
         "relatorios_pagamento": {
@@ -416,6 +860,45 @@ def test_mva_cielo_gap_and_merge_card_machine_report():
     assert merged["total_autorizado"] == 150.0
     assert merged["quantidade_autorizados"] == 2
     assert merged["origem"] == "caixa_cielo_cartoes"
+
+
+def test_mva_cielo_merge_only_closing_gap():
+    relatorios = {
+        "cartao_credito": {
+            "total_autorizado": 150.0,
+            "itens_autorizados": [
+                {"valor_bruto": 100.0},
+                {"valor_bruto": 50.0},
+            ],
+        },
+        "cartao_credito_caixa": {
+            "categoria": "cartao_credito_caixa",
+            "arquivo": "caixa.xlsx",
+            "caminho": "caixa.xlsx",
+            "total_autorizado": 100.0,
+            "itens_autorizados": [
+                {"numero": "1", "data_venda": "05/05/2026 as 10:00", "valor_bruto": 100.0},
+            ],
+        },
+    }
+    cielo_reports = {
+        "cartao_credito_caixa": {
+            "categoria": "cartao_credito_caixa",
+            "arquivo": "cielo.csv",
+            "caminho": "cielo.csv",
+            "itens_autorizados": [
+                {"numero": "2", "data_venda": "05/05/2026 as 11:00", "valor_bruto": 50.0},
+                {"numero": "3", "data_venda": "05/05/2026 as 12:00", "valor_bruto": 70.0},
+            ],
+        }
+    }
+
+    assert utils._merge_cielo_reports_into_payment_reports(relatorios, cielo_reports) is True
+
+    merged = relatorios["cartao_credito_caixa"]
+    assert merged["total_autorizado"] == 150.0
+    assert merged["quantidade_autorizados"] == 2
+    assert [item["valor_bruto"] for item in merged["itens_autorizados"]] == [100.0, 50.0]
 
 
 def test_mva_cielo_pending_card_count_uses_unmatched_closing_items():
@@ -485,6 +968,7 @@ def test_mva_cielo_local_report_skips_download(tmp_path, monkeypatch):
     local_cielo.write_text(
         "\n".join(
             [
+                "Data da venda: 09/05/2026 a 09/05/2026",
                 "Data da venda;Hora da venda;Produto;Status;Valor bruto;Codigo de autorizacao",
                 "09/05/2026;10:15;Credito;Aprovada;100,00;ABC123",
             ]
@@ -639,6 +1123,85 @@ def test_mva_clipp_scope_is_applied_before_payment_refresh(monkeypatch):
     assert download_calls == []
 
 
+def test_mva_afternoon_scope_ignores_short_operational_opening_window():
+    relatorio_caixa = {
+        "caixa_modelo": "MVA",
+        "periodo": "05/06/2026 - 05/06/2026",
+        "itens_caixa": [
+            {"pedido": "000001", "valor": 10.0, "ordem": "2026-06-05 08:00:00"},
+            {"pedido": "000002", "valor": 20.0, "ordem": "2026-06-05 14:00:00"},
+        ],
+        "itens_excluidos": [],
+    }
+    fechamento = {
+        "caixa_modelo": "MVA",
+        "periodo": "05/06/2026 - 05/06/2026",
+        "fechamento_janelas": [
+            {"abertura": "05/06/2026 07:52:16", "fechamento": "05/06/2026 07:52:44"},
+            {"abertura": "05/06/2026 07:53:18", "fechamento": "05/06/2026 13:26:12"},
+            {"abertura": "05/06/2026 13:26:53", "fechamento": "05/06/2026 17:31:14"},
+        ],
+        "nfces": [
+            {
+                "numero": "000001",
+                "data_venda": "05/06/2026 08:00:00",
+                "valor": 10.0,
+            },
+            {
+                "numero": "000002",
+                "data_venda": "05/06/2026 14:00:00",
+                "valor": 20.0,
+            },
+        ],
+        "relatorios_pagamento": {
+            "dinheiro": {
+                "categoria": "dinheiro",
+                "total_autorizado": 30.0,
+                "quantidade_autorizados": 2,
+                "itens_autorizados": [
+                    {"numero": "000001", "data_venda": "05/06/2026 08:00:00", "valor_bruto": 10.0},
+                    {"numero": "000002", "data_venda": "05/06/2026 14:00:00", "valor_bruto": 20.0},
+                ],
+            }
+        },
+    }
+
+    relatorio_tarde, fechamento_tarde, _ = aplicar_escopo_relatorio_caixa(
+        relatorio_caixa,
+        fechamento,
+        None,
+        scope_mode="afternoon",
+    )
+
+    assert [item["pedido"] for item in relatorio_tarde["itens_caixa"]] == ["000002"]
+    assert [item["numero"] for item in fechamento_tarde["nfces"]] == ["000002"]
+    assert fechamento_tarde["relatorios_pagamento"]["dinheiro"]["total_autorizado"] == 20.0
+    assert fechamento_tarde["fechamento_janelas"] == [
+        {"abertura": "05/06/2026 13:26:53", "fechamento": "05/06/2026 17:31:14"}
+    ]
+
+    relatorio_manha, fechamento_manha, _ = aplicar_escopo_relatorio_caixa(
+        relatorio_caixa,
+        fechamento,
+        None,
+        scope_mode="morning",
+    )
+
+    assert [item["pedido"] for item in relatorio_manha["itens_caixa"]] == ["000001"]
+    assert [item["numero"] for item in fechamento_manha["nfces"]] == ["000001"]
+    assert fechamento_manha["relatorios_pagamento"]["dinheiro"]["total_autorizado"] == 10.0
+    assert fechamento_manha["fechamento_janelas"] == [
+        {"abertura": "05/06/2026 07:53:18", "fechamento": "05/06/2026 13:26:12"}
+    ]
+
+
+def test_morning_scope_does_not_reuse_afternoon_only_window():
+    windows = [{"abertura": "05/06/2026 13:26:53", "fechamento": "05/06/2026 17:31:14"}]
+
+    assert utils._scope_windows_for_mode(windows, "morning") == []
+    assert utils._scope_windows_for_mode(windows, "afternoon") == windows
+
+
 def test_mva_next_day_closing_filter_keeps_target_opening_date(monkeypatch):
     texto = """
     MVA COMERCIO
@@ -758,6 +1321,16 @@ def test_eh_next_day_closing_filter_keeps_target_sales_and_afternoon_scope():
 
     assert [item["pedido"] for item in relatorio_tarde["itens_caixa"]] == ["000002"]
     assert [item["numero"] for item in fechamento_tarde["nfces"]] == ["000002"]
+
+    relatorio_manha, fechamento_manha, _ = aplicar_escopo_relatorio_caixa(
+        relatorio_caixa,
+        filtrado,
+        None,
+        scope_mode="morning",
+    )
+
+    assert [item["pedido"] for item in relatorio_manha["itens_caixa"]] == ["000001"]
+    assert [item["numero"] for item in fechamento_manha["nfces"]] == ["000001"]
 
     somente_tarde = _filter_zweb_fechamento_to_sales_date(
         {**fechamento, "nfces": [fechamento["nfces"][1]], "relatorios_pagamento": {}},
@@ -899,6 +1472,71 @@ def test_eh_scope_filter_recalculates_cancelled_coupon_totals():
     assert filtrado["pedidos_excluidos_cancelados"] == 1
     assert filtrado["total_excluido_cancelados"] == 50.0
     assert [item["pedido"] for item in filtrado["itens_excluidos"]] == ["000103230"]
+
+
+def test_eh_conciliation_report_exists_when_everything_matches():
+    fechamento = utils.comparar_caixa_resumo_nfce(
+        {
+            "caixa_modelo": "EH",
+            "periodo": "19/06/2026 - 19/06/2026",
+            "total_caixa": 300.0,
+            "itens_caixa": [
+                {"pedido": "000103230", "cliente": "CLIENTE BALCAO", "valor": 100.0},
+                {"pedido": "000103231", "cliente": "CLIENTE BALCAO", "valor": 200.0},
+            ],
+            "itens_excluidos": [],
+        },
+        {
+            "resumo_modelo": "EH",
+            "periodo": "19/06/2026 - 19/06/2026",
+            "total_nfce": 300.0,
+            "nfces": [
+                {"numero": "000103230", "numero_exibicao": "103230", "valor": 100.0},
+                {"numero": "000103231", "numero_exibicao": "103231", "valor": 200.0},
+            ],
+            "relatorios_pagamento": {
+                "pix_fechamento": {
+                    "categoria": "pix_fechamento",
+                    "total_autorizado": 100.0,
+                    "itens_autorizados": [
+                        {"numero": "000103230", "numero_exibicao": "103230", "valor_bruto": 100.0},
+                    ],
+                },
+                "pix_caixa": {
+                    "categoria": "pix_caixa",
+                    "total_autorizado": 100.0,
+                    "itens_autorizados": [
+                        {"data_venda": "19/06/2026 14:00:00", "valor_bruto": 100.0},
+                    ],
+                },
+                "cartao_credito": {
+                    "categoria": "cartao_credito",
+                    "total_autorizado": 200.0,
+                    "itens_autorizados": [
+                        {"numero": "000103231", "numero_exibicao": "103231", "valor_bruto": 200.0},
+                    ],
+                },
+                "cartao_credito_caixa": {
+                    "categoria": "cartao_credito_caixa",
+                    "total_autorizado": 200.0,
+                    "itens_autorizados": [
+                        {"data_venda": "19/06/2026 14:05:00", "valor_bruto": 200.0},
+                    ],
+                },
+            },
+        },
+    )
+
+    alertas = fechamento["relatorios_pagamento"]["alertas_eh"]
+
+    assert fechamento["status"] == "Confere"
+    assert fechamento["alertas_count"] == 0
+    assert alertas["hidden_in_menu"] is True
+    assert alertas["correlacao_rows"] == [
+        ("Dinheiro", "R$ 0,00", "-", "Interno"),
+        ("PIX", "R$ 100,00", "R$ 100,00", "Finalizado"),
+        ("Cartão Crédito", "R$ 200,00", "R$ 200,00", "Finalizado"),
+    ]
 
 
 def test_mva_clipp_cancelled_cash_coupons_are_visible(monkeypatch):
